@@ -46,12 +46,16 @@ document.addEventListener('DOMContentLoaded', () => {
     // State
     let dataHighConf = [];
     let dataCognitive = [];
+    let cognitiveView = [];
+    let activeModalItem = null;
     let savedApiKey = localStorage.getItem('gemini_api_key') || '';
     let tokensUsed = parseInt(localStorage.getItem('gemini_tokens_used')) || 0;
 
     // Fetch models if connected
     function loadModels(key) {
         if (!key) return;
+        
+        const preferredModel = localStorage.getItem('gemini_selected_model');
         modelSelect.innerHTML = '<option>Loading models...</option>';
         fetch('/api/models', {
             method: 'POST',
@@ -63,7 +67,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 d.models.forEach(m => {
                     const opt = document.createElement('option');
                     opt.value = m.id; opt.textContent = m.name;
-                    if (m.id === 'gemini-1.5-flash' || m.id === 'gemini-2.0-flash-exp') opt.selected = true;
+                    
+                    if (preferredModel && m.id === preferredModel) {
+                        opt.selected = true;
+                    } else if (!preferredModel && (m.id === 'gemini-1.5-flash' || m.id === 'gemini-2.0-flash-exp')) {
+                        opt.selected = true;
+                    }
+                    
                     modelSelect.appendChild(opt);
                 });
             } else {
@@ -73,6 +83,10 @@ document.addEventListener('DOMContentLoaded', () => {
             modelSelect.innerHTML = '<option>Failed to load models</option>';
         });
     }
+
+    modelSelect.addEventListener('change', (e) => {
+        localStorage.setItem('gemini_selected_model', e.target.value);
+    });
 
     // Init Logic
     if (savedApiKey) {
@@ -280,16 +294,17 @@ document.addEventListener('DOMContentLoaded', () => {
     // Render Logic
     function renderData(apiData) {
         if (apiData.highConfidence) {
-            dataHighConf = apiData.highConfidence;
+            dataHighConf = apiData.highConfidence.map((item, index) => ({...item, OrigIdx: index, _isHighConf: true}));
         } else {
             dataHighConf = [];
         }
 
         if (apiData.cognitiveQueue) {
-            dataCognitive = apiData.cognitiveQueue;
+            dataCognitive = apiData.cognitiveQueue.map((item, index) => ({...item, OrigIdx: index}));
         } else {
             dataCognitive = [];
         }
+        cognitiveView = [...dataCognitive];
 
         countHighConf.textContent = dataHighConf.length;
         countCognitive.textContent = dataCognitive.length;
@@ -310,9 +325,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         renderBlock.forEach((item, index) => {
             const div = document.createElement('div');
-            // Give it an ID to update dynamically later
             div.className = 'lead-item';
-            if (isCognitive) div.id = `cog-item-${index}`;
+            if (isCognitive) {
+                div.id = `cog-item-${item.OrigIdx}`;
+            } else {
+                div.id = `high-item-${item.OrigIdx}`;
+            }
             
             const severityClass = item.Severity ? item.Severity.toLowerCase() : 'medium';
             const displaySeverity = isCognitive && item.Severity ? item.Severity : isCognitive ? 'Cognitive Target' : item.Severity;
@@ -358,6 +376,18 @@ document.addEventListener('DOMContentLoaded', () => {
             ? `<strong>Agent Hint:</strong> ${item.Hint}` 
             : `<strong>Rule Matched:</strong> ${item.DetailedReason}`;
 
+        const singleAnalyzeBtn = document.getElementById('singleAnalyzeBtn');
+        if (
+            (isCognitive && (!item.Severity || item.Severity === 'Cognitive Target' || !item.Severity.length)) ||
+            (!isCognitive) 
+        ) {
+            singleAnalyzeBtn.classList.remove('hidden');
+            activeModalItem = item;
+        } else {
+            singleAnalyzeBtn.classList.add('hidden');
+            activeModalItem = null;
+        }
+
         modal.classList.remove('hidden');
     }
 
@@ -377,13 +407,33 @@ document.addEventListener('DOMContentLoaded', () => {
         renderList(highConfList, filtered, false);
     });
 
+    const searchStatsCog = document.getElementById('searchStatsCog');
+    const clearSearchCog = document.getElementById('clearSearchCog');
+
     searchCognitive.addEventListener('input', (e) => {
         const query = e.target.value.toLowerCase();
-        const filtered = dataCognitive.filter(d => 
+        cognitiveView = dataCognitive.filter(d => 
             (d.Path || "").toLowerCase().includes(query) || 
             (d.Processes || "").toLowerCase().includes(query)
         );
-        renderList(cognitiveList, filtered, true);
+        renderList(cognitiveList, cognitiveView, true);
+        
+        if (query.trim().length > 0) {
+            searchStatsCog.style.display = 'inline';
+            clearSearchCog.classList.remove('hidden');
+            searchStatsCog.textContent = `Showing ${cognitiveView.length} / ${dataCognitive.length} Results`;
+        } else {
+            searchStatsCog.style.display = 'none';
+            clearSearchCog.classList.add('hidden');
+        }
+    });
+
+    clearSearchCog.addEventListener('click', () => {
+        searchCognitive.value = '';
+        cognitiveView = [...dataCognitive];
+        renderList(cognitiveList, cognitiveView, true);
+        searchStatsCog.style.display = 'none';
+        clearSearchCog.classList.add('hidden');
     });
 
     // API MODALS & SAVING
@@ -415,40 +465,60 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // AI STREAMING ORCHESTRATION
+    let aiAnalysisQueue = [];
+
     triggerAIBtn.addEventListener('click', () => {
         if (!savedApiKey) {
             alert("You must configure your Gemini API Key in the settings first!");
-            apiBtn.click();
+            document.getElementById('openSettingsBtn').click();
             return;
         }
 
-        const count = dataCognitive.length;
+        aiAnalysisQueue = [...cognitiveView]; // Use filtered items
+        const count = aiAnalysisQueue.length;
         if (count > 0) {
-            warnCount.textContent = count.toLocaleString();
-            // Estimating ~80 tokens per input blob and ~60 tokens per output.
+            document.getElementById('warnCount').textContent = count.toLocaleString();
             const estTokens = count * 140;
-            warnTokens.textContent = "~ " + estTokens.toLocaleString();
-            tokenWarnModal.classList.remove('hidden');
+            document.getElementById('warnTokens').textContent = "~ " + estTokens.toLocaleString();
+            document.getElementById('tokenWarnModal').classList.remove('hidden');
+        }
+    });
+
+    document.getElementById('singleAnalyzeBtn').addEventListener('click', () => {
+        if (!savedApiKey) {
+            alert("You must configure your Gemini API Key in the settings first!");
+            document.getElementById('openSettingsBtn').click();
+            return;
+        }
+        if (activeModalItem) {
+            aiAnalysisQueue = [activeModalItem];
+            document.getElementById('detailsModal').classList.add('hidden');
+            document.getElementById('warnCount').textContent = "1";
+            document.getElementById('warnTokens').textContent = "~ 140";
+            document.getElementById('tokenWarnModal').classList.remove('hidden');
         }
     });
 
     document.getElementById('closeWarnModal').addEventListener('click', () => {
-        tokenWarnModal.classList.add('hidden');
+        document.getElementById('tokenWarnModal').classList.add('hidden');
     });
 
-    proceedAiBtn.addEventListener('click', async () => {
-        tokenWarnModal.classList.add('hidden');
+    document.getElementById('proceedAiBtn').addEventListener('click', async () => {
+        document.getElementById('tokenWarnModal').classList.add('hidden');
         triggerAIBtn.classList.add('hidden'); // hide while processing
 
-        // Change UI of all cognitive elements to scanning
-        const items = cognitiveList.querySelectorAll('.lead-item');
-        items.forEach(el => {
-            el.style.borderLeft = "3px solid var(--accent)";
-            el.innerHTML = `<div class="spinner" style="width:14px; height:14px; margin:0; border-width:2px; display:inline-block;"></div> <span style="font-size:0.85rem; color:var(--text-muted);">Analyzing via Gemini...</span>`;
+        // Change UI of all elements in the targeted queue to scanning
+        aiAnalysisQueue.forEach(item => {
+            const prefix = item._isHighConf ? 'high-item-' : 'cog-item-';
+            const el = document.getElementById(prefix + item.OrigIdx);
+            if (el) {
+                el.style.borderLeft = "3px solid var(--accent)";
+                el.innerHTML = `<div class="spinner" style="width:14px; height:14px; margin:0; border-width:2px; display:inline-block;"></div> <span style="font-size:0.85rem; color:var(--text-muted);">Analyzing via Gemini...</span>`;
+            }
         });
 
+        const loadingMsg = document.getElementById('loadingMsg');
         loadingMsg.textContent = "Establishing AI Data Stream...";
-        // loadingOverlay.classList.remove('hidden'); // don't block the UI!
 
         try {
             const response = await fetch('/api/analyze-stream', {
@@ -456,8 +526,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ 
                     apiKey: savedApiKey, 
-                    modelId: modelSelect.value,
-                    queue: dataCognitive 
+                    modelId: document.getElementById('modelSelect').value,
+                    queue: aiAnalysisQueue 
                 })
             });
 
@@ -490,10 +560,24 @@ document.addEventListener('DOMContentLoaded', () => {
                             
                             for (let i = 0; i < payload.items.length; i++) {
                                 const resolvedItem = payload.items[i];
-                                dataCognitive[domIndex] = resolvedItem; // override memory array
+                                
+                                // Guaranteed deterministic mapping back to original memory slot
+                                const targetIdx = aiAnalysisQueue[domIndex].OrigIdx;
+                                const isHighConfTarget = aiAnalysisQueue[domIndex]._isHighConf;
+                                
+                                resolvedItem.OrigIdx = targetIdx; 
+                                resolvedItem._isHighConf = isHighConfTarget;
+                                
+                                let targetDiv;
+                                if (isHighConfTarget) {
+                                    dataHighConf[targetIdx] = resolvedItem; // override HighConf memory array
+                                    targetDiv = document.getElementById('high-item-' + targetIdx);
+                                } else {
+                                    dataCognitive[targetIdx] = resolvedItem; // override Cognitive memory array
+                                    targetDiv = document.getElementById('cog-item-' + targetIdx);
+                                }
                                 
                                 // visually update the specific card in real-time
-                                const targetDiv = document.getElementById('cog-item-' + domIndex);
                                 if (targetDiv) {
                                     targetDiv.style.background = "rgba(94, 106, 210, 0.1)";
                                     targetDiv.style.borderLeft = "3px solid #50fa7b";
@@ -520,6 +604,9 @@ document.addEventListener('DOMContentLoaded', () => {
                             curTokens += payload.currentTokensUsed; 
                         } else if (payload.type === 'error') {
                             console.error("Stream Error:", payload.message);
+                            alert("AI Stream Error: " + payload.message + "\n\nPlease check DevTools console for raw details.");
+                            const loadingMsg = document.getElementById('loadingMsg');
+                            if(loadingMsg) loadingMsg.textContent = "Stream interrupted by API Error.";
                         } else if (payload.type === 'done') {
                             let oldTotal = parseInt(localStorage.getItem('gemini_tokens_used')) || 0;
                             let newTotal = oldTotal + payload.finalTokens;

@@ -218,9 +218,9 @@ app.post('/api/analyze-stream', async (req, res) => {
         const genAI = new GoogleGenerativeAI(apiKey);
         const model = genAI.getGenerativeModel({ model: modelId || "gemini-1.5-flash" });
 
-        // Chunking the queue into groups of 20 to prevent context limit errors and stream nicely
+        // Chunking the queue into larger groups of 150 to heavily preserve rate limits (15 RPM free tier)
         let tokensUsed = 0;
-        const chunkSize = 20;
+        const chunkSize = 150;
 
         for (let i = 0; i < queue.length; i += chunkSize) {
             const chunk = queue.slice(i, i + chunkSize);
@@ -232,27 +232,41 @@ ${JSON.stringify(chunk)}
 
 Return a raw JSON array of objects with the exact same fields as input, but replace the "Hint" field with your advanced deductive analysis. Do NOT use markdown codeblock wrappers (\`\`\`json). Return STRICTLY JSON.`;
             
-            try {
-                const result = await model.generateContent(prompt);
-                let responseText = result.response.text().trim();
-                
-                let tokensForThisChunk = 0;
-                if (result.response.usageMetadata && result.response.usageMetadata.totalTokenCount) {
-                    tokensForThisChunk = result.response.usageMetadata.totalTokenCount;
-                } else {
-                    tokensForThisChunk = 150; // fallback arbitrary guess
-                }
-                tokensUsed += tokensForThisChunk;
-                if (responseText.startsWith('```json')) {
-                    responseText = responseText.replace(/^```json\n/, '').replace(/\n```$/, '');
-                }
+            let retries = 0;
+            let success = false;
+            
+            while (!success && retries < 3) {
+                try {
+                    const result = await model.generateContent(prompt);
+                    let responseText = result.response.text().trim();
+                    
+                    let tokensForThisChunk = 0;
+                    if (result.response.usageMetadata && result.response.usageMetadata.totalTokenCount) {
+                        tokensForThisChunk = result.response.usageMetadata.totalTokenCount;
+                    } else {
+                        tokensForThisChunk = 150; // fallback arbitrary guess
+                    }
+                    tokensUsed += tokensForThisChunk;
+                    if (responseText.startsWith('```json')) {
+                        responseText = responseText.replace(/^```json\n/, '').replace(/\n```$/, '');
+                    }
 
-                const jsonArray = JSON.parse(responseText);
+                    const jsonArray = JSON.parse(responseText);
 
-                // Send the chunk update
-                res.write(`data: ${JSON.stringify({ type: 'chunk', items: jsonArray, currentTokensUsed: tokensUsed })}\n\n`);
-            } catch (err) {
-                 res.write(`data: ${JSON.stringify({ type: 'error', message: "Failed segment: " + err.message })}\n\n`);
+                    // Send the chunk update
+                    res.write(`data: ${JSON.stringify({ type: 'chunk', items: jsonArray, currentTokensUsed: tokensUsed })}\n\n`);
+                    success = true; // Loop break indicator
+                } catch (err) {
+                    // Check explicitly for Free Tier RPM 429
+                    if ((err.status === 429 || err.message.includes('429')) && retries < 2) {
+                        res.write(`data: ${JSON.stringify({ type: 'error', message: "[QUOTA REACHED] Going to sleep for 60 seconds natively to reset Free Tier limits..." })}\n\n`);
+                        await new Promise(resolve => setTimeout(resolve, 61000));
+                        retries++;
+                    } else {
+                        res.write(`data: ${JSON.stringify({ type: 'error', message: "Failed segment: " + err.message })}\n\n`);
+                        break;
+                    }
+                }
             }
         }
 

@@ -87,8 +87,10 @@
 
                 <!-- Cognitive Panel -->
                 <div class="list-panel" id="cognitivePanel">
-                     <div class="controls-bar" style="display:flex; gap:10px;">
-                        <input type="text" id="searchCognitive" class="search-box" placeholder="Search cognitive tasks...">
+                     <div class="controls-bar" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                        <input type="text" id="searchCognitive" class="search-box" style="flex:1;" placeholder="Search cognitive tasks...">
+                        <span id="searchStatsCog" style="font-size:0.85rem; color:var(--text-muted); display:none;">Showing X / Y Results</span>
+                        <button id="clearSearchCog" class="hidden" style="background:transparent; color:var(--text-muted); border:1px solid var(--border); padding:5px 10px; border-radius:4px; font-size:0.8rem; cursor:pointer;">Clear Filter</button>
                         <button id="triggerAIBtn" class="ai-btn hidden" style="background:var(--accent); color:#fff; border:none; padding:10px 15px; border-radius:6px; font-weight:600; cursor:pointer;">Analyze using Gemini</button>
                     </div>
                     <div class="items-list" id="cognitiveList">
@@ -119,6 +121,9 @@
             <div class="detail-group highlight-box">
                 <label>Analytical Deduction</label>
                 <p id="modalReason">Reasoning</p>
+                <button id="singleAnalyzeBtn" class="hidden" style="margin-top:15px; background:var(--accent); color:#fff; border:none; padding:8px 15px; border-radius:6px; font-weight:600; cursor:pointer; width:100%;">
+                    Analyze Specifically
+                </button>
             </div>
         </div>
     </div>
@@ -172,6 +177,6 @@
         </div>
     </div>
 
-    <script src="app.js?v=9"></script>
+    <script src="app.js?v=12"></script>
 </body>
 </html>
