@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Friends & Security Procmon Trace Analyzer</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css?v=2">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar / Header -->
+        <header class="sidebar">
+            <div class="logo">
+                <img src="logo.png?v=2" alt="Logo" style="height: 48px; object-fit: contain;">
+                <h2 style="font-size: 1.05rem;">Friends & Security Procmon Trace Analyzer</h2>
+            </div>
+            
+            <div class="metrics">
+                <div class="metric-card">
+                    <span class="label">High Confidence</span>
+                    <span class="value critical-text" id="highConfCount">0</span>
+                </div>
+                <div class="metric-card">
+                    <span class="label">Cognitive Queue</span>
+                    <span class="value warning-text" id="cognitiveCount">0</span>
+                </div>
+            </div>
+
+            <!-- API Configuration -->
+            <div class="api-card" id="openSettingsBtn" style="cursor:pointer; background: var(--bg-card); padding: 1rem; border-radius: 8px; border: 1px dashed var(--accent); margin-top: 10px; display:flex; justify-content: space-between; align-items: center; transition: all 0.2s;">
+                <div>
+                    <span class="label" style="font-size:0.8rem; color:var(--text-muted); display:block;">Gemini AI</span>
+                    <span class="value" id="apiStatus" style="font-weight:600; font-size: 0.9rem; color:#f03e3e;">Missing Key</span>
+                </div>
+                <svg width="24" height="24" fill="none" stroke="var(--text-muted)" viewBox="0 0 24 24"><path d="M12 15a3 3 0 100-6 3 3 0 000 6z"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+            </div>
+
+            <!-- Project Selector -->
+            <div class="project-card" style="background: var(--bg-card); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); margin-top: 10px; display:flex; flex-direction:column; gap:8px;">
+                <label style="font-size:0.8rem; color:var(--text-muted);">Active Workspace</label>
+                <select id="projectSelect" style="width:100%; background:#000; border:1px solid #222; color:#fff; padding:8px; border-radius:6px; cursor:pointer;">
+                    <option value="Default_Project">Default_Project</option>
+                </select>
+                <button type="button" id="newProjectBtn" style="background:rgba(255,255,255,0.05); color:var(--text-main); border:1px solid var(--border); padding:6px; border-radius:4px; font-size:0.8rem; cursor:pointer; width:100%;">+ New Project</button>
+            </div>
+
+            <!-- Drag and Drop Zone -->
+            <div class="upload-zone" id="dropZone">
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
+                <p>Drag JSON or CSV Trace</p>
+                <span class="subtext">Supports .CSV, .JSON grids, and Raw .PML</span>
+                <input type="file" id="fileInput" accept=".csv,.json,.pml" hidden/>
+            </div>
+            
+            <div id="loadingOverlay" class="loading hidden">
+                <div class="spinner"></div>
+                <p id="loadingMsg">Running Offline Analysis Engine...</p>
+                
+                <!-- Progress Stream Container -->
+                <div id="progressContainer" class="hidden" style="margin-top: 15px; width: 100%; max-width: 320px; text-align: center;">
+                    <div style="width: 100%; background: #222; border-radius: 4px; height: 10px; overflow: hidden; margin-bottom: 8px;">
+                        <div id="progressBar" style="width: 0%; height: 100%; background: var(--accent); transition: width 0.3s ease;"></div>
+                    </div>
+                    <p id="progressText" style="color: var(--text-muted); font-size: 0.85rem; margin: 0; word-break: break-word;"></p>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="content">
+            <div class="tab-controls">
+                <button class="tab active" data-target="highConfPanel">High Confidence Leads</button>
+                <button class="tab" data-target="cognitivePanel">Cognitive Review Queue</button>
+            </div>
+
+            <div class="panel-container">
+                <!-- High Confidence Panel -->
+                <div class="list-panel active" id="highConfPanel">
+                    <div class="controls-bar">
+                        <input type="text" id="searchHighConf" class="search-box" placeholder="Search paths, processes, or types...">
+                    </div>
+                    <div class="items-list" id="highConfList">
+                        <div class="empty-state">No high confidence leads loaded.</div>
+                    </div>
+                </div>
+
+                <!-- Cognitive Panel -->
+                <div class="list-panel" id="cognitivePanel">
+                     <div class="controls-bar" style="display:flex; gap:10px;">
+                        <input type="text" id="searchCognitive" class="search-box" placeholder="Search cognitive tasks...">
+                        <button id="triggerAIBtn" class="ai-btn hidden" style="background:var(--accent); color:#fff; border:none; padding:10px 15px; border-radius:6px; font-weight:600; cursor:pointer;">Analyze using Gemini</button>
+                    </div>
+                    <div class="items-list" id="cognitiveList">
+                        <div class="empty-state">No cognitive queue tasks loaded.</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Details Modal -->
+    <div class="modal-overlay hidden" id="detailsModal">
+        <div class="modal-content">
+            <button class="close-btn" id="closeModal">&times;</button>
+            <h3 id="modalType" class="modal-title">Type</h3>
+            <div class="badge" id="modalSeverity">Severity</div>
+            
+            <div class="detail-group">
+                <label>Vulnerable Path</label>
+                <code id="modalPath" class="code-block">C:\Path\</code>
+            </div>
+            
+            <div class="detail-group">
+                <label>Related Processes / LOLBins</label>
+                <div id="modalProcesses" class="process-tags"></div>
+            </div>
+            
+            <div class="detail-group highlight-box">
+                <label>Analytical Deduction</label>
+                <p id="modalReason">Reasoning</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- API Settings Modal -->
+    <div class="modal-overlay hidden" id="apiModal">
+        <div class="modal-content">
+            <button class="close-btn" id="closeApiModal">&times;</button>
+            <h3 class="modal-title">Gemini API Settings</h3>
+            <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 20px;">
+                Get your free API Key from <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--accent);">Google AI Studio</a>.
+            </p>
+            
+            <div class="detail-group">
+                <label>API Key</label>
+                <input type="password" id="apiKeyInput" style="width:100%; appearance:none; background: #000; border: 1px solid #222; color: #fff; padding: 10px; border-radius: 6px; font-family: monospace;" placeholder="AIzaSy...">
+            </div>
+
+            <div class="detail-group" style="margin-top:20px;">
+                <label>Select Architecture</label>
+                <select id="modelSelect" style="width:100%; height:40px; background: #000; border: 1px solid #222; color: #fff; padding: 0 10px; border-radius: 6px; cursor:pointer;">
+                    <option value="gemini-1.5-flash">Loading available models...</option>
+                </select>
+            </div>
+
+            <div class="detail-group highlight-box" style="margin-top:20px;">
+                <label>Usage Analytics</label>
+                <p>Tokens Used (Local Est.): <strong id="tokensUsedStat" style="color:#50fa7b;">0</strong><br>
+                <em>Note: Google API does not dynamically broadcast remaining quota mid-flight.</em></p>
+            </div>
+            
+            <button id="saveApiBtn" style="margin-top: 25px; width: 100%; background: var(--accent); color: white; border: none; padding: 12px; border-radius: 6px; font-weight: 600; cursor: pointer;">Save Securely in Browser</button>
+        </div>
+    </div>
+
+    <!-- Pre-Analysis Token Warn Modal -->
+    <div class="modal-overlay hidden" id="tokenWarnModal">
+        <div class="modal-content">
+            <button class="close-btn" id="closeWarnModal">&times;</button>
+            <h3 class="modal-title" style="color:var(--high);">Massive AI Operation Detected</h3>
+            <p style="font-size: 0.95rem; color: var(--text-main); margin-bottom: 20px;">
+                You are about to cognitively analyze <strong id="warnCount">0</strong> paths using Gemini 1.5. 
+            </p>
+            
+            <div class="detail-group highlight-box" style="border-left-color: var(--high);">
+                <label>Billing / Quota Estimate</label>
+                <p>Estimated processing tokens required: <strong id="warnTokens" style="color:#f59f00; font-size:1.1rem;">~0</strong></p>
+            </div>
+            
+            <button id="proceedAiBtn" style="margin-top: 25px; width: 100%; background: var(--high); color: #000; border: none; padding: 12px; border-radius: 6px; font-weight: 700; cursor: pointer;">Acknowledge & Start Stream</button>
+        </div>
+    </div>
+
+    <script src="app.js?v=9"></script>
+</body>
+</html>
