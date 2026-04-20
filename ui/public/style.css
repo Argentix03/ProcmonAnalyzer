@@ -783,3 +783,52 @@ body {
 .layout-btn:hover { background: rgba(94,106,210,0.12); border-color: rgba(94,106,210,0.3); color: var(--text-main); }
 .layout-btn.active { background: rgba(94,106,210,0.22); border-color: var(--accent); color: #fff; }
 .layout-btn svg { flex-shrink: 0; }
+
+/* ===== FIELD CHIP ROW ===== */
+.field-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    align-items: center;
+    max-width: 640px;
+}
+
+.field-chip {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 5px 10px;
+    border-radius: 20px;
+    font-family: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+    user-select: none;
+}
+.field-chip:hover {
+    border-color: var(--chip-color, var(--accent));
+    color: var(--text-main);
+    background: rgba(255,255,255,0.07);
+}
+.field-chip.active {
+    background: color-mix(in srgb, var(--chip-color, var(--accent)) 18%, transparent);
+    border-color: var(--chip-color, var(--accent));
+    color: #fff;
+    box-shadow: 0 0 8px color-mix(in srgb, var(--chip-color, var(--accent)) 30%, transparent);
+}
+.field-chip svg { flex-shrink: 0; }
+
+.chip-sep {
+    font-size: 0.7rem;
+    color: #555a70;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0 2px;
+    align-self: center;
+}
