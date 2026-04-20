@@ -19,8 +19,9 @@ Write-Host "Total lines to process: $totalLines" -ForegroundColor Cyan
 
 Write-Host "Streaming CSV to extract paths and mapping to processes using TextFieldParser..." -ForegroundColor Cyan
 
-# Dictionary: Key = Path (String), Value = Unique Process Names (HashSet)
-$pathProcessMap = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Generic.HashSet[string]]' ([System.StringComparer]::OrdinalIgnoreCase)
+# Dictionary: Key = Path (String), Value = Hashtable with Processes and FirstEvent metadata
+$pathProcessMap = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Hashtable]' ([System.StringComparer]::OrdinalIgnoreCase)
+$script:skippedErrors = New-Object System.Collections.Generic.List[PSCustomObject]
 
 Add-Type -AssemblyName Microsoft.VisualBasic
 $parser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($CsvPath)
@@ -28,10 +29,24 @@ $parser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
 $parser.SetDelimiters(",")
 $parser.HasFieldsEnclosedInQuotes = $true
 
-# Read header
+# Read header dynamically
+$headerMap = @{}
 if (-not $parser.EndOfData) {
-    [void]$parser.ReadFields()
+    $headers = $parser.ReadFields()
+    for ($i = 0; $i -lt $headers.Length; $i++) {
+        $headerMap[$headers[$i].Trim().ToLower()] = $i
+    }
 }
+
+$idxTime = if ($headerMap.ContainsKey("time of day")) { $headerMap["time of day"] } else { 0 }
+$idxProc = if ($headerMap.ContainsKey("process name")) { $headerMap["process name"] } else { 1 }
+$idxOp   = if ($headerMap.ContainsKey("operation")) { $headerMap["operation"] } else { 3 }
+$idxPath = if ($headerMap.ContainsKey("path")) { $headerMap["path"] } else { 4 }
+$idxRes  = if ($headerMap.ContainsKey("result")) { $headerMap["result"] } else { 5 }
+$idxDet  = if ($headerMap.ContainsKey("detail")) { $headerMap["detail"] } else { 6 }
+$idxInt  = if ($headerMap.ContainsKey("integrity")) { $headerMap["integrity"] } else { -1 }
+
+$traceFileName = Split-Path $CsvPath -Leaf
 
 $lineCount = 0
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -41,30 +56,44 @@ while (-not $parser.EndOfData) {
         $fields = $parser.ReadFields()
         $lineCount++
         
-        # Procmon exact mapping: Time(0), Process Name(1), PID(2), Operation(3), Path(4), Result(5), Detail(6)
+        # Procmon exact mapping dynamically
         if ($fields.Length -ge 5) {
-            $processName = $fields[1]
-            $path = $fields[4]
+            $processName = if ($idxProc -lt $fields.Length) { $fields[$idxProc] } else { "" }
+            $path = if ($idxPath -lt $fields.Length) { $fields[$idxPath] } else { "" }
             
             # Simple check for file system path (filters out Registry keys like HKLM\...)
             if (-not [string]::IsNullOrWhiteSpace($path) -and ($path -match "^[a-zA-Z]:\\" -or $path -match "^\\\\")) {
                 if (-not $pathProcessMap.ContainsKey($path)) {
-                    $pathProcessMap[$path] = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+                    $firstEvt = [PSCustomObject]@{
+                        Time = if ($idxTime -lt $fields.Length) { $fields[$idxTime] } else { "" }
+                        Operation = if ($idxOp -lt $fields.Length) { $fields[$idxOp] } else { "" }
+                        Result = if ($idxRes -lt $fields.Length) { $fields[$idxRes] } else { "" }
+                        Detail = if ($idxDet -lt $fields.Length) { $fields[$idxDet] } else { "" }
+                        Integrity = if ($idxInt -ge 0 -and $idxInt -lt $fields.Length) { $fields[$idxInt] } else { "Unknown" }
+                    }
+                    
+                    $pathProcessMap[$path] = @{
+                        Processes = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+                        FirstEvent = $firstEvt
+                    }
                 }
-                [void]$pathProcessMap[$path].Add($processName)
+                [void]$pathProcessMap[$path].Processes.Add($processName)
             }
         }
     } catch [Microsoft.VisualBasic.FileIO.MalformedLineException] {
         # The parser throws this on bad quotes but does NOT advance the line automatically.
         # We must call ReadLine() to force it forward and prevent an infinite loop.
         $null = $parser.ReadLine()
+        $script:skippedErrors.Add([PSCustomObject]@{ Type = "Parser Error"; Error = "Malformed CSV Line"; Details = $_.Exception.Message })
     } catch {
         # Ignore other badly formatted rows gracefully but try to advance
         $null = $parser.ReadLine()
+        $script:skippedErrors.Add([PSCustomObject]@{ Type = "Parser Error"; Error = "Unhandled CSV Row Error"; Details = $_.Exception.Message })
     }
 
-    if ($lineCount % 20000 -eq 0) {
-        Write-Host "[PROGRESS] $lineCount / $totalLines"
+    $thresh = if ($totalLines -gt 0 -and $totalLines -lt 20000) { 100 } else { 20000 }
+    if ($lineCount % $thresh -eq 0) {
+        Write-Output "[PROGRESS] $lineCount / $totalLines Extracting Target Vectors..."
     }
 }
 $parser.Close()
@@ -143,6 +172,7 @@ function Test-SafeWritePermission {
 
         return $false
     } catch {
+        $script:skippedErrors.Add([PSCustomObject]@{ Type = "Permission Evaluation Error"; Path = $TargetPath; Error = $_.Exception.Message })
         return $false
     }
 }
@@ -159,16 +189,24 @@ $activePrincipal = New-Object System.Security.Principal.WindowsPrincipal($active
 foreach ($path in $uniquePaths) {
     if ($counter % 100 -eq 0 -or $counter -eq $totalCount) { 
         Write-Progress -Activity "Testing Permissions" -Status "Testing: $path" -PercentComplete (($counter / $totalCount) * 100)
+        Write-Output "[PROGRESS] $counter / $totalCount Evaluating File/ACL Permissions..."
     }
     $counter++
 
     if (Test-SafeWritePermission -TargetPath $path -CurrentUser $activeIdentity -Principal $activePrincipal) {
-        $relatedProcesses = $pathProcessMap[$path] -join ", "
+        $relatedProcesses = $pathProcessMap[$path].Processes -join ", "
+        $evt = $pathProcessMap[$path].FirstEvent
 
         $results.Add([PSCustomObject]@{
             Path             = $path
             FileExists       = ([System.IO.Directory]::Exists($path) -or [System.IO.File]::Exists($path))
             RelatedProcesses = $relatedProcesses
+            TraceFile        = $traceFileName
+            Timestamp        = $evt.Time
+            Operation        = $evt.Operation
+            Result           = $evt.Result
+            Detail           = $evt.Detail
+            Integrity        = $evt.Integrity
         })
     }
 }
@@ -186,6 +224,15 @@ if ($results.Count -gt 0) {
     $jsonPath = Join-Path $outFolder "writable_paths.json"
     $results | ConvertTo-Json -Depth 3 | Out-File $jsonPath -Encoding UTF8
     Write-Host "Exported RAW results to $jsonPath" -ForegroundColor Green
+
+    if ($script:skippedErrors.Count -gt 0) {
+        $errJsonPath = Join-Path $outFolder "parsing_errors.json"
+        
+        # Deduplicate error messages to avoid massive JSON blooms if the same error hits thousands of times
+        $uniqueErrors = $script:skippedErrors | Group-Object Error | Select-Object Name, Count, @{Name="SampleDetails"; Expression={$_.Group[0].Details}}, @{Name="SamplePath"; Expression={$_.Group[0].Path}}, @{Name="Type"; Expression={$_.Group[0].Type}}
+        $uniqueErrors | ConvertTo-Json -Depth 3 | Out-File $errJsonPath -Encoding UTF8
+        Write-Host "[!] Logged $($script:skippedErrors.Count) unhandled errors (grouped to $($uniqueErrors.Count) unique patterns) to $errJsonPath" -ForegroundColor Yellow
+    }
 
     # Show raw gridview to user as well
     if (-not $Silent) {

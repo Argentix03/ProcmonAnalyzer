@@ -22,4 +22,15 @@ This skill dictates how to process ProcMon path dumps using a hybrid Script + Ag
    - You do NOT need to ingest the entire queue if it's massive. Read up to 500 lines or split it, but do your best to categorize the findings.
 
 4. **Formulate the Report:**
-   After completing your cognitive review, combine the `high_confidence_leads.json` results and your manually detected anomalies into a final markdown file called `Execution_Leads_Report.md`. Be precise, categorize by Severity, and include detailed descriptions for your cognitive hits.
+   After completing your cognitive review, combine the `high_confidence_leads.json` results and your manually detected anomalies into a final markdown file called `Execution_Leads_Report.md`. 
+   
+   **CRITICAL REPORT STRUCTURE REQUIREMENTS:**
+   Every individual finding MUST be formatted natively as an unchecked Markdown task list item so the Web UI can parse it. You MUST include the raw analytical fields from the JSON natively under the list item.
+   
+   Example strict format:
+   - [ ] [Critical] **Path:** `C:\Program Files\App\Core.dll`
+     - **Processes:** svchost.exe
+     - **Trace Source:** BootLog.csv | **Time:** 12:44:01 
+     - **Event Context:** Operation: CreateFile | Result: NAME NOT FOUND | Integrity: System
+     - **Detail:** Access: Read/Write
+     - **Analysis:** Direct hijacking of an executable component inside a historically privileged hierarchy.

@@ -26,7 +26,8 @@ $lolBins = @(
     "msbuild.exe", "installutil.exe", "regasm.exe", "regsvcs.exe", "csc.exe", "certutil.exe", 
     "powershell.exe", "pwsh.exe", "wmic.exe", "mshta.exe", "rundll32.exe", "regsvr32.exe", 
     "cmstp.exe", "cscript.exe", "wscript.exe", "bginfo.exe", "bash.exe", "pcalua.exe", 
-    "forfiles.exe", "control.exe", "schtasks.exe"
+    "forfiles.exe", "control.exe", "schtasks.exe", "vssadmin.exe", "bitsadmin.exe", 
+    "mavinject.exe", "wuauclt.exe", "netsh.exe", "certreq.exe", "esentutl.exe"
 )
 
 # Lists for the orchestration layer
@@ -52,7 +53,7 @@ foreach ($entry in $rawData) {
     }
     
     # 2. Binary Planting / Service Execution
-    if ($path -match "\.(exe|dll|sys|cpl|ocx|efi|scr)$") {
+    if ($path -match "\.(exe|dll|sys|cpl|ocx|efi|scr|msi|msp|msc|com|hta|jar|xll|wll|xla)$") {
         if ($path -match "(System32|SysWOW64|Program Files|ProgramData\\[^\\]+\\)") {
             $severity = "Critical"
             $type = "Binary Planting (High Priv Dir)"
@@ -65,8 +66,40 @@ foreach ($entry in $rawData) {
         $isDirectLead = $true
     }
     
+    # 2.1 Side-by-Side (SxS) / DotLocal Hijacking
+    if ($path -match "\.(manifest|local)$") {
+        $severity = "Critical"
+        $type = "SxS / DotLocal Manifest Poisoning"
+        $reason = "Dropping a .local directory or .manifest file allows an attacker to hijack the DLL load order of legitimate applications directly."
+        $isDirectLead = $true
+    }
+
+    # 2.2 Package and Dependency Hijacking
+    if ($path -match "(node_modules|site-packages)") {
+        $severity = "Critical"
+        $type = "Dependency / Package Subversion"
+        $reason = "Writable dependency folders typically mean any library requested by an application or script can be transparently hijacked by an attacker."
+        $isDirectLead = $true
+    }
+
+    # 2.3 Web Service Planting / Unauthenticated RCE
+    if ($path -match "(inetpub\\wwwroot|xampp\\htdocs|tomcat\\webapps)" -and $path -match "\.(aspx|php|jsp|asmx|html)$") {
+        $severity = "Critical"
+        $type = "Web Shell Proxy / Server Planting"
+        $reason = "Writing scripts into a webroot directory immediately establishes a web shell primitive if the server processes it."
+        $isDirectLead = $true
+    }
+
+    # 2.4 LNK Shortcut Poisoning
+    if ($path -match "\.lnk$") {
+        $severity = "High"
+        $type = "LNK Shortcut Hijacking"
+        $reason = "Modifying desktop or start menu shortcuts is a stealthy vector to achieve execution by piggybacking off normal user intent."
+        $isDirectLead = $true
+    }
+    
     # 3. Known Scripting & Persistence locations
-    if ($path -match "\.(bat|ps1|vbs|vbe|cmd|wsf)$" -or $path -match "(Startup|Run|Services)") {
+    if ($path -match "\.(bat|ps1|vbs|vbe|cmd|wsf)$" -or $path -match "(Startup|Run|Services|Tasks\\|wbem\\mof)") {
         $severity = "High"
         $type = "AutoRun / Script Persistence"
         $reason = "Writable script file or persistence folder hook. Highly likely to be executed seamlessly."
@@ -99,12 +132,24 @@ foreach ($entry in $rawData) {
                 Path = $path
                 Processes = $procs
                 Hint = "Requires semantic analysis: Is this application vulnerable to insecure deserialization, arbitrary assembly load via XML, or config redirection?"
+                TraceFile = $entry.TraceFile
+                Timestamp = $entry.Timestamp
+                Operation = $entry.Operation
+                Result = $entry.Result
+                Detail = $entry.Detail
+                Integrity = $entry.Integrity
             })
         } elseif ($path -match "(System32|Program Files|Windows)") {
              $cognitiveQueue.Add([PSCustomObject]@{
                 Path = $path
                 Processes = $procs
                 Hint = "Highly privileged base directory. Investigate if the accessed file maps to an environmental override or proxy execution."
+                TraceFile = $entry.TraceFile
+                Timestamp = $entry.Timestamp
+                Operation = $entry.Operation
+                Result = $entry.Result
+                Detail = $entry.Detail
+                Integrity = $entry.Integrity
             })
         }
     } else {
@@ -115,6 +160,12 @@ foreach ($entry in $rawData) {
             Path = $path
             Processes = $procs
             DetailedReason = $reason
+            TraceFile = $entry.TraceFile
+            Timestamp = $entry.Timestamp
+            Operation = $entry.Operation
+            Result = $entry.Result
+            Detail = $entry.Detail
+            Integrity = $entry.Integrity
         })
     }
 }
@@ -123,7 +174,11 @@ foreach ($entry in $rawData) {
 $hardcodedJsonPath = Join-Path $feedDir "high_confidence_leads.json"
 $cognitiveJsonPath = Join-Path $feedDir "cognitive_review_queue.json"
 
-$hardcodedLeads | ConvertTo-Json -Depth 3 | Out-File $hardcodedJsonPath -Encoding UTF8
+# Sort Hardcoded leads by severity
+$severityOrder = @{ "Critical" = 1; "High" = 2; "Medium" = 3; "Low" = 4; "Unknown" = 5 }
+$sortedLeads = $hardcodedLeads | Sort-Object { $severityOrder[$_.Severity] }
+
+$sortedLeads | ConvertTo-Json -Depth 3 | Out-File $hardcodedJsonPath -Encoding UTF8
 $cognitiveQueue | ConvertTo-Json -Depth 3 | Out-File $cognitiveJsonPath -Encoding UTF8
 
 Write-Host "[+] Heuristic Analysis Complete." -ForegroundColor Green

@@ -26,6 +26,8 @@ body {
     overflow: hidden;
 }
 
+.hidden { display: none !important; }
+
 /* Glassmorphism utility */
 .glass {
     background: var(--bg-panel);
@@ -187,7 +189,10 @@ body {
 
 .search-box:focus { border-color: var(--accent); }
 
-/* List Items */
+/* Scrollbars */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
 .items-list {
     flex: 1;
     overflow-y: auto;
@@ -196,9 +201,6 @@ body {
     gap: 10px;
     padding-right: 10px;
 }
-
-.items-list::-webkit-scrollbar { width: 6px; }
-.items-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
 .lead-item {
     background: var(--bg-card);
@@ -250,7 +252,10 @@ body {
     background: var(--bg-dark);
     border: 1px solid var(--accent);
     box-shadow: 0 10px 40px rgba(0,0,0,0.5), 0 0 20px rgba(94, 106, 210, 0.2);
-    width: 600px; max-width: 90%;
+    width: 750px; 
+    max-width: 95%;
+    max-height: 90vh;
+    overflow-y: auto;
     border-radius: 12px;
     padding: 2rem;
     position: relative;

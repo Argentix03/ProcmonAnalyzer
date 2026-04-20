@@ -24,6 +24,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const modal = document.getElementById('detailsModal');
     const closeModal = document.getElementById('closeModal');
 
+    // Report Management Elements
+    const reportsList = document.getElementById('reportsList');
+    const uploadReportBtn = document.getElementById('uploadReportBtn');
+    const reportFileInput = document.getElementById('reportFileInput');
+
     // New AI Elements
     const apiBtn = document.getElementById('openSettingsBtn');
     const apiModal = document.getElementById('apiModal');
@@ -128,6 +133,7 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(res => res.json())
         .then(data => {
             if (data.success) renderData(data);
+            if (typeof loadReports === 'function') loadReports();
         });
     }
 
@@ -148,6 +154,29 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
     });
+
+    const deleteProjectBtn = document.getElementById('deleteProjectBtn');
+    if (deleteProjectBtn) {
+        deleteProjectBtn.addEventListener('click', () => {
+            const currentProj = projectSelect.value;
+            if (currentProj.toLowerCase() === 'default_project') {
+                return alert("The Default_Project workspace acts as the master fallback frame and cannot be permanently deleted.");
+            }
+            if (confirm(`Permanently destroy workspace '${currentProj}' and all its extracted leads / AI reports?`)) {
+                fetch('/api/projects', {
+                    method: 'DELETE',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name: currentProj })
+                }).then(res => res.json()).then(data => {
+                    if (data.success) {
+                        loadProjects().then(() => loadProjectData());
+                    } else if (data.error) {
+                        alert("Error: " + data.error);
+                    }
+                });
+            }
+        });
+    }
 
     // Tab Switching
     tabs.forEach(tab => {
@@ -197,73 +226,85 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         loadingOverlay.classList.remove('hidden');
+        dropZone.classList.add('hidden'); // Hide drag box so loading UI natively slots into view
         if (isCsv) {
             loadingMsg.textContent = "Running Offline Analysis Engine...";
             progressContainer.classList.remove('hidden');
             progressBar.style.width = '0%';
             progressText.textContent = 'Initializing engine...';
             
-            fetch('/api/upload', {
-                method: 'POST',
-                body: formData
-            }).then(async res => {
-                const reader = res.body.getReader();
-                const decoder = new TextDecoder("utf-8");
-                let buffer = "";
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/upload', true);
 
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    
-                    buffer += decoder.decode(value, { stream: true });
-                    let lines = buffer.split('\n');
-                    buffer = lines.pop(); // keep last incomplete string in buffer
-
-                    for (const line of lines) {
-                        try {
-                            const payload = JSON.parse(line.trim());
-                            if (payload.type === 'progress') {
-                                const pct = (payload.current / payload.total) * 100;
-                                progressBar.style.width = pct + '%';
-                                progressText.textContent = `Parsed ${payload.current.toLocaleString()} / ${payload.total.toLocaleString()} lines...`;
-                            }
-                            else if (payload.success) {
-                                // Final payload received!
-                                loadingOverlay.classList.add('hidden');
-                                progressContainer.classList.add('hidden');
-                                renderData(payload);
-                            }
-                            else if (payload.status) {
-                                // Status event
-                                progressText.textContent = payload.message;
-                            }
-                            else if (payload.error) {
-                                loadingOverlay.classList.add('hidden');
-                                alert("Error: " + payload.error);
-                            }
-                        } catch(e) {} // ignore split malforms
-                    }
+            // 1. Physical Trace File Upload Progress
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                    const pct = (e.loaded / e.total) * 100;
+                    progressBar.style.width = pct + '%';
+                    const mbLoaded = (e.loaded / (1024*1024)).toFixed(1);
+                    const mbTotal  = (e.total / (1024*1024)).toFixed(1);
+                    progressText.textContent = `Uploading Trace: ${mbLoaded} MB / ${mbTotal} MB...`;
                 }
+            };
+
+            let buffer = "";
+            let processedLength = 0;
+
+            // 2. Server-Sent Events from NodeJS execution stream
+            const processChunkStream = (isFinalFlush) => {
+                const chunk = xhr.responseText.substring(processedLength);
+                processedLength = xhr.responseText.length;
                 
-                // Flush remaining buffer
-                if (buffer.trim()) {
+                buffer += chunk;
+                let lines = buffer.split('\n');
+                
+                if (!isFinalFlush) {
+                    buffer = lines.pop(); // keep last incomplete string in buffer if still streaming
+                } else {
+                    buffer = ""; // flush entirely
+                }
+
+                for (const line of lines) {
+                    if (!line.trim()) continue;
                     try {
-                        const payload = JSON.parse(buffer.trim());
-                        if (payload.success) {
+                        const payload = JSON.parse(line.trim());
+                        if (payload.type === 'progress') {
+                            const pct = (payload.current / payload.total) * 100;
+                            progressBar.style.width = pct + '%';
+                            progressText.textContent = payload.label 
+                                ? `${payload.label} ${payload.current.toLocaleString()} / ${payload.total.toLocaleString()}...`
+                                : `Parsed ${payload.current.toLocaleString()} / ${payload.total.toLocaleString()} lines...`;
+                        }
+                        else if (payload.success) {
+                            // Final payload received!
                             loadingOverlay.classList.add('hidden');
+                            dropZone.classList.remove('hidden');
                             progressContainer.classList.add('hidden');
                             renderData(payload);
-                        } else if (payload.error) {
+                        }
+                        else if (payload.status) {
+                            // Status event
+                            progressText.textContent = payload.message;
+                        }
+                        else if (payload.error) {
                             loadingOverlay.classList.add('hidden');
+                            dropZone.classList.remove('hidden');
                             alert("Error: " + payload.error);
                         }
-                    } catch(e) {}
+                    } catch(e) {} // ignore split malforms
                 }
-            }).catch(err => {
+            };
+
+            xhr.onprogress = () => processChunkStream(false);
+            xhr.onload     = () => processChunkStream(true);
+
+            xhr.onerror = () => {
                 loadingOverlay.classList.add('hidden');
-                console.error(err);
+                dropZone.classList.remove('hidden');
                 alert("Error processing upload");
-            });
+            };
+
+            xhr.send(formData);
 
         } else {
             loadingMsg.textContent = "Injecting JSON Feed...";
@@ -276,6 +317,7 @@ document.addEventListener('DOMContentLoaded', () => {
             .then(res => res.json())
             .then(data => {
                 loadingOverlay.classList.add('hidden');
+                dropZone.classList.remove('hidden');
                 if (data.error) return alert(data.error);
                 if (data.isRawJson) {
                     if (data.data.length && data.data[0].DetailedReason) renderData({ highConfidence: data.data, cognitiveQueue: [] });
@@ -286,6 +328,7 @@ document.addEventListener('DOMContentLoaded', () => {
             })
             .catch(err => {
                 loadingOverlay.classList.add('hidden');
+                dropZone.classList.remove('hidden');
                 alert("Error processing upload");
             });
         }
@@ -320,8 +363,8 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Limit to 200 items max for frontend performance
-        const renderBlock = data.slice(0, 200);
+        // Limit to 10000 items max for frontend performance (safely renders huge lists without truncating Gemini animation hooks)
+        const renderBlock = data.slice(0, 10000);
 
         renderBlock.forEach((item, index) => {
             const div = document.createElement('div');
@@ -375,6 +418,18 @@ document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('modalReason').innerHTML = isCognitive 
             ? `<strong>Agent Hint:</strong> ${item.Hint}` 
             : `<strong>Rule Matched:</strong> ${item.DetailedReason}`;
+
+        if (item.Timestamp || item.TraceFile || item.Operation) {
+            document.getElementById('modalMetadataGroup').style.display = 'block';
+            document.getElementById('modalTrace').textContent = item.TraceFile || 'N/A';
+            document.getElementById('modalTime').textContent = item.Timestamp || 'N/A';
+            document.getElementById('modalOp').textContent = item.Operation || 'N/A';
+            document.getElementById('modalResult').textContent = item.Result || 'N/A';
+            document.getElementById('modalIntegrity').textContent = item.Integrity || 'Unknown';
+            document.getElementById('modalDetail').textContent = item.Detail || 'None';
+        } else {
+            document.getElementById('modalMetadataGroup').style.display = 'none';
+        }
 
         const singleAnalyzeBtn = document.getElementById('singleAnalyzeBtn');
         if (
@@ -436,6 +491,110 @@ document.addEventListener('DOMContentLoaded', () => {
         clearSearchCog.classList.add('hidden');
     });
 
+    // --- REPORTS MANAGEMENT ---
+    function loadReports() {
+        fetch('/api/reports', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ project: projectSelect.value })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (!data.success || data.reports.length === 0) {
+                reportsList.innerHTML = '<div class="empty-state">No .md reports loaded for this workspace.</div>';
+                return;
+            }
+            reportsList.innerHTML = '';
+            data.reports.forEach(r => {
+                const rcard = document.createElement('div');
+                rcard.style.background = 'var(--bg-card)';
+                rcard.style.padding = '15px';
+                rcard.style.borderRadius = '8px';
+                rcard.style.border = '1px solid var(--border)';
+                
+                const title = document.createElement('h4');
+                title.textContent = r.file;
+                title.style.margin = '0 0 12px 0';
+                title.style.color = 'var(--text-main)';
+                
+                const findingsDiv = document.createElement('div');
+                findingsDiv.style.display = 'flex';
+                findingsDiv.style.flexDirection = 'column';
+                findingsDiv.style.gap = '8px';
+                
+                r.findings.forEach(find => {
+                    const frow = document.createElement('div');
+                    frow.style.display = 'flex';
+                    frow.style.alignItems = 'flex-start';
+                    frow.style.gap = '10px';
+                    frow.style.padding = '10px';
+                    frow.style.borderRadius = '4px';
+                    frow.style.background = find.checked ? 'rgba(80, 250, 123, 0.05)' : 'rgba(0,0,0,0.2)';
+                    frow.style.borderLeft = find.checked ? '3px solid #50fa7b' : '3px solid var(--border)';
+                    
+                    const chk = document.createElement('input');
+                    chk.type = 'checkbox';
+                    chk.checked = find.checked;
+                    chk.style.marginTop = '4px';
+                    chk.style.cursor = 'pointer';
+                    
+                    const txtBlock = document.createElement('div');
+                    const pMain = document.createElement('div');
+                    pMain.style.fontWeight = '600';
+                    pMain.style.fontSize = '0.9rem';
+                    // Strip the raw markdown syntax so it renders gracefully
+                    pMain.innerHTML = find.text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">$1</code>');
+                    
+                    const pSub = document.createElement('div');
+                    pSub.style.fontSize = '0.8rem';
+                    pSub.style.color = 'var(--text-muted)';
+                    pSub.style.marginTop = '5px';
+                    pSub.innerHTML = find.details.join('<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">$1</code>');
+                    
+                    txtBlock.appendChild(pMain);
+                    if (find.details.length > 0) txtBlock.appendChild(pSub);
+                    
+                    chk.addEventListener('change', () => {
+                       fetch('/api/toggle-report', {
+                           method: 'POST',
+                           headers: { 'Content-Type': 'application/json' },
+                           body: JSON.stringify({
+                               project: projectSelect.value,
+                               file: r.file,
+                               lineIndex: find.id,
+                               checkState: chk.checked
+                           })
+                       }).then(() => loadReports());
+                    });
+                    
+                    frow.appendChild(chk);
+                    frow.appendChild(txtBlock);
+                    findingsDiv.appendChild(frow);
+                });
+                
+                rcard.appendChild(title);
+                rcard.appendChild(findingsDiv);
+                reportsList.appendChild(rcard);
+            });
+        });
+    }
+
+    uploadReportBtn.addEventListener('click', () => reportFileInput.click());
+    reportFileInput.addEventListener('change', (e) => {
+        if (e.target.files.length) {
+            const formData = new FormData();
+            formData.append('reportFile', e.target.files[0]);
+            formData.append('project', projectSelect.value);
+            
+            fetch('/api/upload-report', { method: 'POST', body: formData })
+            .then(r => r.json())
+            .then(d => {
+                if (d.success) loadReports();
+                else alert(d.error);
+            });
+        }
+    });
+
     // API MODALS & SAVING
     apiBtn.addEventListener('click', () => {
         apiKeyInput.value = savedApiKey;
@@ -478,6 +637,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const count = aiAnalysisQueue.length;
         if (count > 0) {
             document.getElementById('warnCount').textContent = count.toLocaleString();
+            
+            const selEl = document.getElementById('modelSelect');
+            const modelName = selEl.options[selEl.selectedIndex] ? selEl.options[selEl.selectedIndex].text : 'Gemini AI';
+            document.getElementById('warnModelName').textContent = modelName;
+            
             const estTokens = count * 140;
             document.getElementById('warnTokens').textContent = "~ " + estTokens.toLocaleString();
             document.getElementById('tokenWarnModal').classList.remove('hidden');
@@ -493,6 +657,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (activeModalItem) {
             aiAnalysisQueue = [activeModalItem];
             document.getElementById('detailsModal').classList.add('hidden');
+            
+            const selEl = document.getElementById('modelSelect');
+            const modelName = selEl.options[selEl.selectedIndex] ? selEl.options[selEl.selectedIndex].text : 'Gemini AI';
+            document.getElementById('warnModelName').textContent = modelName;
+            
             document.getElementById('warnCount').textContent = "1";
             document.getElementById('warnTokens').textContent = "~ 140";
             document.getElementById('tokenWarnModal').classList.remove('hidden');
@@ -612,8 +781,18 @@ document.addEventListener('DOMContentLoaded', () => {
                             let newTotal = oldTotal + payload.finalTokens;
                             localStorage.setItem('gemini_tokens_used', newTotal);
                             tokensUsedStat.textContent = newTotal.toLocaleString();
-                            // renderList(cognitiveList, dataCognitive, true); // Optionally re-render flat array
                             triggerAIBtn.classList.remove('hidden');
+                            
+                            // Synchronize newly analyzed state back to disk
+                            fetch('/api/save-state', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    project: projectSelect.value,
+                                    highConfidence: dataHighConf,
+                                    cognitiveQueue: dataCognitive
+                                })
+                            }).catch(e => console.error("Could not persist AI response:", e));
                         }
                     }
                 }

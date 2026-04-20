@@ -18,3 +18,4 @@ projects/
 !ui/package.json
 !ui/package-lock.json
 *.log
+Execution_Leads_Report.md
