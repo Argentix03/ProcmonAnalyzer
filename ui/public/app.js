@@ -44,6 +44,28 @@ document.addEventListener('DOMContentLoaded', () => {
     const warnTokens = document.getElementById('warnTokens');
     const proceedAiBtn = document.getElementById('proceedAiBtn');
 
+    // Script UI Elements
+    const scriptModal = document.getElementById('scriptModal');
+    const downloadScriptBtn = document.getElementById('downloadScriptBtn');
+    const closeScriptModal = document.getElementById('closeScriptModal');
+
+    if (downloadScriptBtn) {
+        downloadScriptBtn.addEventListener('click', () => {
+            scriptModal.classList.remove('hidden');
+        });
+    }
+
+    if (closeScriptModal) {
+        closeScriptModal.addEventListener('click', () => {
+            scriptModal.classList.add('hidden');
+        });
+    }
+    
+    // Auto-close modal when clicking outside
+    scriptModal.addEventListener('click', (e) => {
+        if(e.target === scriptModal) scriptModal.classList.add('hidden');
+    });
+
     // Projects
     const projectSelect = document.getElementById('projectSelect');
     const newProjectBtn = document.getElementById('newProjectBtn');

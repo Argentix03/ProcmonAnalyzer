@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Friends & Security Procmon Trace Analyzer</title>
+    <link rel="icon" type="image/png" href="logo.png">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css?v=2">
 </head>
@@ -61,6 +62,16 @@
                         style="flex: 1; background:rgba(240, 62, 62, 0.15); color:var(--crit); border:1px solid rgba(240, 62, 62, 0.3); padding:6px; border-radius:4px; font-size:0.8rem; cursor:pointer;"
                         title="Delete Active Workspace">&times; Del</button>
                 </div>
+            </div>
+
+            <!-- Download Script Zone -->
+            <div style="margin-bottom: 12px; padding: 0 10px;">
+                <button type="button" id="downloadScriptBtn" style="width: 100%; background: var(--accent); color: white; border: none; padding: 10px; border-radius: 6px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                    </svg>
+                    Download ETW Trace Script
+                </button>
             </div>
 
             <!-- Drag and Drop Zone -->
@@ -254,7 +265,39 @@
         </div>
     </div>
 
-    <script src="app.js?v=12"></script>
+    <!-- Script Info Modal -->
+    <div class="modal-overlay hidden" id="scriptModal">
+        <div class="modal-content">
+            <button class="close-btn" id="closeScriptModal">&times;</button>
+            <h3 class="modal-title">Native ETW Trace Script</h3>
+            <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 20px;">
+                Use this PowerShell script to capture native ETW file tracing natively, replacing Procmon entirely.
+            </p>
+
+            <div class="detail-group highlight-box">
+                <label>Instructions</label>
+                <ol style="margin-top: 10px; margin-left: 20px; font-size: 0.9rem; line-height: 1.5; color: var(--text-main);">
+                    <li>Download the script below.</li>
+                    <li>Open an <strong style="color:var(--high);">Administrator PowerShell</strong>.</li>
+                    <li>Start the trace: <code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">.\NativeTrace.ps1 -Start</code></li>
+                    <li>Run your red team actions.</li>
+                    <li>Stop the trace: <code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">.\NativeTrace.ps1 -Stop</code></li>
+                    <li>Upload the generated <code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">NativeWritablePaths.csv</code> file (located in the same directory as the script) into the UI below!</li>
+                </ol>
+            </div>
+
+            <a href="NativeTrace.ps1" download style="text-decoration: none; display: block; margin-top: 25px;">
+                <button style="width: 100%; background: #50fa7b; color: #000; border: none; padding: 12px; border-radius: 6px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
+                    </svg>
+                    Download NativeTrace.ps1
+                </button>
+            </a>
+        </div>
+    </div>
+
+    <script src="app.js?v=cw"></script>
 </body>
 
 </html>
