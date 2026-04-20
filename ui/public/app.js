@@ -66,6 +66,27 @@ document.addEventListener('DOMContentLoaded', () => {
         if(e.target === scriptModal) scriptModal.classList.add('hidden');
     });
 
+    // Global Info Elements
+    const globalInfoModal = document.getElementById('globalInfoModal');
+    const infoIconBtn = document.getElementById('infoIconBtn');
+    const closeGlobalInfoModal = document.getElementById('closeGlobalInfoModal');
+
+    if (infoIconBtn) {
+        infoIconBtn.addEventListener('click', () => {
+            globalInfoModal.classList.remove('hidden');
+        });
+    }
+
+    if (closeGlobalInfoModal) {
+        closeGlobalInfoModal.addEventListener('click', () => {
+            globalInfoModal.classList.add('hidden');
+        });
+    }
+    
+    globalInfoModal.addEventListener('click', (e) => {
+        if(e.target === globalInfoModal) globalInfoModal.classList.add('hidden');
+    });
+
     // Projects
     const projectSelect = document.getElementById('projectSelect');
     const newProjectBtn = document.getElementById('newProjectBtn');
