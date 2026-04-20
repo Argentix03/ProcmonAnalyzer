@@ -7,7 +7,8 @@
     <title>Friends & Security Procmon Trace Analyzer</title>
     <link rel="icon" type="image/png" href="logo.png">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css?v=2">
+    <link rel="stylesheet" href="style.css?v=3">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
 </head>
 
 <body>
@@ -116,6 +117,10 @@
                 <button class="tab active" data-target="highConfPanel">High Confidence Leads</button>
                 <button class="tab" data-target="cognitivePanel">Cognitive Review Queue</button>
                 <button class="tab" data-target="reportsPanel">Analyzed Reports</button>
+                <button class="tab" data-target="analyticsPanel" id="analyticsTabBtn">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="vertical-align:middle; margin-right:5px;"><rect x="3" y="12" width="4" height="9"/><rect x="10" y="6" width="4" height="15"/><rect x="17" y="2" width="4" height="19"/></svg>
+                    Analytics
+                </button>
             </div>
 
             <div class="panel-container">
@@ -163,6 +168,93 @@
                     <div class="reports-container" id="reportsList"
                         style="display:flex; flex-direction:column; gap:10px; margin-top:15px; max-height:calc(100vh - 200px); overflow-y:auto;">
                         <div class="empty-state">No reports loaded.</div>
+                    </div>
+                </div>
+                <!-- Analytics Panel -->
+                <div class="list-panel" id="analyticsPanel">
+                    <div class="analytics-header">
+                        <span class="analytics-title">Telemetry Intelligence Dashboard</span>
+                        <span class="analytics-subtitle" id="analyticsSubtitle">Load a trace file to populate charts</span>
+                    </div>
+
+                    <!-- Summary Stat Strip -->
+                    <div class="analytics-stat-strip" id="analyticsStatStrip">
+                        <div class="analytics-stat">
+                            <span class="astat-label">Total Findings</span>
+                            <span class="astat-value" id="astatTotal">0</span>
+                        </div>
+                        <div class="analytics-stat">
+                            <span class="astat-label">Critical</span>
+                            <span class="astat-value" style="color:var(--crit)" id="astatCritical">0</span>
+                        </div>
+                        <div class="analytics-stat">
+                            <span class="astat-label">High</span>
+                            <span class="astat-value" style="color:var(--high)" id="astatHigh">0</span>
+                        </div>
+                        <div class="analytics-stat">
+                            <span class="astat-label">Medium</span>
+                            <span class="astat-value" style="color:var(--accent)" id="astatMedium">0</span>
+                        </div>
+                        <div class="analytics-stat">
+                            <span class="astat-label">Unique Processes</span>
+                            <span class="astat-value" id="astatProcesses">0</span>
+                        </div>
+                        <div class="analytics-stat">
+                            <span class="astat-label">Unique Types</span>
+                            <span class="astat-value" id="astatTypes">0</span>
+                        </div>
+                    </div>
+
+                    <!-- Charts Grid -->
+                    <div class="analytics-grid" id="analyticsGrid">
+                        <div class="chart-card">
+                            <div class="chart-card-header">
+                                <span class="chart-card-title">Severity Distribution</span>
+                                <span class="chart-card-tag">High Conf + Cognitive</span>
+                            </div>
+                            <div class="chart-wrap">
+                                <canvas id="chartSeverity"></canvas>
+                            </div>
+                        </div>
+
+                        <div class="chart-card">
+                            <div class="chart-card-header">
+                                <span class="chart-card-title">Finding Type Breakdown</span>
+                                <span class="chart-card-tag">By Category</span>
+                            </div>
+                            <div class="chart-wrap">
+                                <canvas id="chartTypes"></canvas>
+                            </div>
+                        </div>
+
+                        <div class="chart-card chart-card--wide">
+                            <div class="chart-card-header">
+                                <span class="chart-card-title">Top 15 Processes by Lead Count</span>
+                                <span class="chart-card-tag">Ranked</span>
+                            </div>
+                            <div class="chart-wrap chart-wrap--tall">
+                                <canvas id="chartProcesses"></canvas>
+                            </div>
+                        </div>
+
+                        <div class="chart-card chart-card--wide">
+                            <div class="chart-card-header">
+                                <span class="chart-card-title">Integrity Level Distribution</span>
+                                <span class="chart-card-tag">Process Privilege</span>
+                            </div>
+                            <div class="chart-wrap">
+                                <canvas id="chartIntegrity"></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Empty state -->
+                    <div class="analytics-empty" id="analyticsEmpty">
+                        <svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.4">
+                            <rect x="3" y="12" width="4" height="9"/><rect x="10" y="6" width="4" height="15"/><rect x="17" y="2" width="4" height="19"/>
+                        </svg>
+                        <p>No telemetry loaded yet.</p>
+                        <span>Upload a CSV or JSON trace to generate analytics.</span>
                     </div>
                 </div>
             </div>
@@ -343,7 +435,8 @@
         </div>
     </div>
 
-    <script src="app.js?v=cw"></script>
+    <script src="app.js?v=cw2"></script>
+    <script src="analytics.js?v=1"></script>
 </body>
 
 </html>

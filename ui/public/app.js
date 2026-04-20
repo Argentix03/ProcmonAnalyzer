@@ -397,6 +397,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
         renderList(highConfList, dataHighConf, false);
         renderList(cognitiveList, dataCognitive, true);
+
+        // Notify analytics panel
+        document.dispatchEvent(new CustomEvent('analyticsDataReady', {
+            detail: { hc: dataHighConf, cog: dataCognitive }
+        }));
     }
 
     function renderList(container, data, isCognitive) {
