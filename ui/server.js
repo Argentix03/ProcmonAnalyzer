@@ -343,11 +343,20 @@ Return a raw JSON array of objects with the exact same fields as input, but repl
                         tokensForThisChunk = 150; // fallback arbitrary guess
                     }
                     tokensUsed += tokensForThisChunk;
-                    if (responseText.startsWith('```json')) {
-                        responseText = responseText.replace(/^```json\n/, '').replace(/\n```$/, '');
+                    let jsonStr = responseText;
+                    
+                    // Fallback to strip markdown if present
+                    if (jsonStr.startsWith('```json')) {
+                        jsonStr = jsonStr.replace(/^```json\n/, '').replace(/\n```$/, '');
                     }
 
-                    const jsonArray = JSON.parse(responseText);
+                    // Systematically yank out the JSON array ignoring all conversational filler
+                    const arrayMatch = jsonStr.match(/\[\s*\{[\s\S]*\}\s*\]/);
+                    if (arrayMatch) {
+                        jsonStr = arrayMatch[0];
+                    }
+
+                    const jsonArray = JSON.parse(jsonStr);
 
                     // Send the chunk update
                     res.write(`data: ${JSON.stringify({ type: 'chunk', items: jsonArray, currentTokensUsed: tokensUsed })}\n\n`);
