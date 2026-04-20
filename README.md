@@ -30,6 +30,17 @@ node server.js
 4. Insert API Key and select your Agent / 
 
 # Usage
+
+### 1. Using the Web UI
 1. Record a session with Procmon focusing mainly on file access operations.
-2. Save as CSV.
-3. Start AntiGravity and ask it to run a full analysis on your procmon trace / Open the UI and drop the file in for analysis. You can also drop analysis result files (.json) into the UI while using the analysis itself without UI.
+2. Save as `.CSV`.
+3. Open the UI (`http://localhost:3000`) and drop the file in for fully automated pipeline analysis and Gemini streaming resolution. You can also drop your processed analysis result files (`.json`) into the UI for offline review.
+
+### 2. Agent-Driven Local Workflow (Without UI)
+If you prefer to bypass the UI/Gemini API and use a local terminal-based agent (like Antigravity or Claude Code) to perform the cognitive analysis autonomously, follow these steps:
+
+1. **Record & Export**: Save your Procmon trace as a `.CSV`.
+2. **Spawn the Agent**: Point your terminal agent natively to the initial parsing skill. The repository is designed for full agent autonomy. For example, simply ask:
+   > *"Read `skills\Parse-ProcmonWriteables\SKILL.md` and run the pipeline on `C:\Path\To\trace.csv`."*
+   
+   The agent will automatically execute the parsing script, adhere to the shell-output instructions to recursively trigger the `Analyze-ExecutionLeads` triage phase, semantically review the cognitive queue itself, and output the final `Execution_Leads_Report.md`.

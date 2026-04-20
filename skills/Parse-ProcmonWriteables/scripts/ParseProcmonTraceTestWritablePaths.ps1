@@ -54,8 +54,13 @@ while (-not $parser.EndOfData) {
                 [void]$pathProcessMap[$path].Add($processName)
             }
         }
+    } catch [Microsoft.VisualBasic.FileIO.MalformedLineException] {
+        # The parser throws this on bad quotes but does NOT advance the line automatically.
+        # We must call ReadLine() to force it forward and prevent an infinite loop.
+        $null = $parser.ReadLine()
     } catch {
-        # Ignore badly formatted rows gracefully
+        # Ignore other badly formatted rows gracefully but try to advance
+        $null = $parser.ReadLine()
     }
 
     if ($lineCount % 20000 -eq 0) {
@@ -72,7 +77,14 @@ Write-Host "Starting safe permission tests..." -ForegroundColor Cyan
 
 # 3. 100% SAFE Testing Function (No data destruction)
 function Test-SafeWritePermission {
-    param([string]$TargetPath)
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$TargetPath,
+        [Parameter(Mandatory=$true)]
+        [System.Security.Principal.WindowsIdentity]$CurrentUser,
+        [Parameter(Mandatory=$true)]
+        [System.Security.Principal.WindowsPrincipal]$Principal
+    )
 
     try {
         if ([System.IO.File]::Exists($TargetPath)) {
@@ -107,8 +119,6 @@ function Test-SafeWritePermission {
 
         if ([System.IO.Directory]::Exists($directoryToTest)) {
             $acl = [System.IO.DirectoryInfo]::new($directoryToTest).GetAccessControl()
-            $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-            $principal = New-Object System.Security.Principal.WindowsPrincipal($currentUser)
             $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
             
             $hasWrite = $false
@@ -116,7 +126,7 @@ function Test-SafeWritePermission {
 
             foreach ($rule in $rules) {
                 # Check if rule Identity matches current principal
-                if ($currentUser.User.Equals($rule.IdentityReference) -or $principal.IsInRole($rule.IdentityReference)) {
+                if ($CurrentUser.User.Equals($rule.IdentityReference) -or $Principal.IsInRole($rule.IdentityReference)) {
                     $hasWriteData = ($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::WriteData) -eq [System.Security.AccessControl.FileSystemRights]::WriteData
                     
                     if ($hasWriteData) {
@@ -142,13 +152,17 @@ $counter = 0
 $results = New-Object System.Collections.Generic.List[PSCustomObject]
 $swTest = [System.Diagnostics.Stopwatch]::StartNew()
 
+# Pre-fetch security contexts once for massive performance gains
+$activeIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$activePrincipal = New-Object System.Security.Principal.WindowsPrincipal($activeIdentity)
+
 foreach ($path in $uniquePaths) {
     if ($counter % 100 -eq 0 -or $counter -eq $totalCount) { 
         Write-Progress -Activity "Testing Permissions" -Status "Testing: $path" -PercentComplete (($counter / $totalCount) * 100)
     }
     $counter++
 
-    if (Test-SafeWritePermission -TargetPath $path) {
+    if (Test-SafeWritePermission -TargetPath $path -CurrentUser $activeIdentity -Principal $activePrincipal) {
         $relatedProcesses = $pathProcessMap[$path] -join ", "
 
         $results.Add([PSCustomObject]@{
