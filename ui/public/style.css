@@ -46,7 +46,7 @@ body {
 }
 
 .sidebar {
-    width: 340px;
+    width: 420px;
     padding: 2rem;
     display: flex;
     flex-direction: column;
@@ -144,6 +144,15 @@ body {
     border-bottom: 2px solid transparent;
     transition: all 0.2s;
     font-family: inherit;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.tab svg {
+    flex-shrink: 0;
+    vertical-align: unset;
+    margin: 0;
 }
 
 .tab.active {
@@ -748,3 +757,29 @@ body {
 .g-node { cursor: pointer; }
 .g-node.dimmed { opacity: 0.15; }
 .g-node text { pointer-events: none; user-select: none; }
+
+/* Layout picker (Network mode only) */
+.layout-picker {
+    display: flex;
+    gap: 3px;
+}
+
+.layout-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 5px 9px;
+    border-radius: 5px;
+    font-family: inherit;
+    font-size: 0.77rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+.layout-btn:hover { background: rgba(94,106,210,0.12); border-color: rgba(94,106,210,0.3); color: var(--text-main); }
+.layout-btn.active { background: rgba(94,106,210,0.22); border-color: var(--accent); color: #fff; }
+.layout-btn svg { flex-shrink: 0; }
