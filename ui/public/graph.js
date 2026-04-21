@@ -14,14 +14,15 @@
 
     // Field metadata: base color + display label
     var FIELD_META = {
-        Type:      { color: '#5e6ad2', label: 'Finding Type' },
-        Processes: { color: '#50fa7b', label: 'Process'       },
-        Severity:  { color: '#f59f00', label: 'Severity'      },
-        Integrity: { color: '#f03e3e', label: 'Integrity'     },
-        Operation: { color: '#bd93f9', label: 'Operation'     },
-        PathFile:  { color: '#ffb86c', label: 'Filename'      },
-        PathExt:   { color: '#08bdbd', label: 'Extension'     },
-        PathDir:   { color: '#ff79c6', label: 'Directory'     }
+        Type:             { color: '#5e6ad2', label: 'Finding Type'      },
+        Processes:        { color: '#50fa7b', label: 'Process'           },
+        Severity:         { color: '#f59f00', label: 'Severity'          },
+        Integrity:        { color: '#f03e3e', label: 'Integrity'         },
+        Operation:        { color: '#bd93f9', label: 'Operation'         },
+        PathFile:         { color: '#ffb86c', label: 'Filename'          },
+        PathExt:          { color: '#08bdbd', label: 'Extension'         },
+        PathDir:          { color: '#ff79c6', label: 'Directory'         },
+        ExploitPrimitive: { color: '#f03e3e', label: 'Exploit Primitive' }
     };
 
     var SEV_COLOR   = { critical:'#f03e3e', high:'#f59f00', medium:'#5e6ad2', low:'#50fa7b', unknown:'#444860' };
@@ -67,18 +68,29 @@
         }
         if (field === 'PathDir') {
             var pp = (item.Path||'').replace(/\\/g,'/').split('/');
-            pp.pop(); // remove filename
-            // Take last 2 directory segments for readability
+            pp.pop();
             var dir = pp.slice(-2).filter(Boolean).join('\\') || '(root)';
             return [dir.toLowerCase()];
+        }
+        if (field === 'ExploitPrimitive') {
+            return [(item.ExploitPrimitive || 'Unknown').trim()];
         }
         return ['Unknown'];
     }
 
     // ── Color for a node ─────────────────────────────────────────────────────
+    var PRIMITIVE_COLOR = {
+        'smb_coercion':'#f03e3e', 'oplock_arbitrarywrite':'#ff6b6b', 'pipe_plant_redirect':'#e64980',
+        'pipe_hijack':'#d6336c', 'binary_plant_highpriv':'#f59f00', 'binary_plant_userspace':'#fcc419',
+        'config_poison':'#bd93f9', 'cert_plant':'#08bdbd', 'autorun_persistence':'#50fa7b',
+        'dependency_hijack':'#ff79c6', 'sxs_dotlocal':'#ffb86c', 'webshell_plant':'#e599f7',
+        'lnk_hijack':'#74c0fc', 'lolbin_proxy':'#69db7c'
+    };
+
     function getNodeColor(field, value) {
         if (field === 'Severity')  return SEV_COLOR[(value||'').toLowerCase()]  || FIELD_META.Severity.color;
         if (field === 'Integrity') return INTEG_COLOR[(value||'').toLowerCase()] || FIELD_META.Integrity.color;
+        if (field === 'ExploitPrimitive') return PRIMITIVE_COLOR[(value||'').toLowerCase()] || '#f03e3e';
         return (FIELD_META[field] || {color:'#5e6ad2'}).color;
     }
 

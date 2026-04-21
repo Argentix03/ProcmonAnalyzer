@@ -832,3 +832,35 @@ body {
     padding: 0 2px;
     align-self: center;
 }
+
+/* ===== EXPLOIT PRIMITIVE BADGE ===== */
+.primitive-badge {
+    background: rgba(94,106,210,0.15) !important;
+    color: #8b9cf7 !important;
+    border: 1px solid rgba(94,106,210,0.3) !important;
+    font-size: 0.68rem !important;
+    font-family: 'JetBrains Mono', 'Consolas', monospace !important;
+    letter-spacing: 0.02em;
+    padding: 2px 8px !important;
+}
+.modal-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 0;
+    font-size: 0.82rem;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+.modal-row span { color: var(--text-muted); }
+.modal-row strong { color: #8b9cf7; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+
+/* Field Chip Separator */
+.chip-sep {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    font-weight: 800;
+    margin: 0 4px;
+    opacity: 0.6;
+    letter-spacing: 0.05em;
+}

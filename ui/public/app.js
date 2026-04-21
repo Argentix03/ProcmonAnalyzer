@@ -471,10 +471,24 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('modalMetadataGroup').style.display = 'block';
             document.getElementById('modalTrace').textContent = item.TraceFile || 'N/A';
             document.getElementById('modalTime').textContent = item.Timestamp || 'N/A';
-            document.getElementById('modalOp').textContent = item.Operation || 'N/A';
+            document.getElementById('modalOp').textContent = (item.Operation || 'N/A') + (item.OperationDirection ? ' (' + item.OperationDirection + ')' : '');
             document.getElementById('modalResult').textContent = item.Result || 'N/A';
             document.getElementById('modalIntegrity').textContent = item.Integrity || 'Unknown';
             document.getElementById('modalDetail').textContent = item.Detail || 'None';
+            
+            // New exploit context fields
+            var extraCtx = document.getElementById('modalExploitContext');
+            if (extraCtx) {
+                if (item.ExploitPrimitive || item.SqosLevel) {
+                    extraCtx.style.display = 'block';
+                    extraCtx.innerHTML = '';
+                    if (item.ExploitPrimitive) extraCtx.innerHTML += '<div class="modal-row"><span>Exploit Primitive</span><strong>' + item.ExploitPrimitive + '</strong></div>';
+                    if (item.SqosLevel) extraCtx.innerHTML += '<div class="modal-row"><span>SQOS Level</span><strong>' + item.SqosLevel + '</strong></div>';
+                    if (item.OperationDirection) extraCtx.innerHTML += '<div class="modal-row"><span>Operation Direction</span><strong>' + item.OperationDirection + '</strong></div>';
+                } else {
+                    extraCtx.style.display = 'none';
+                }
+            }
         } else {
             document.getElementById('modalMetadataGroup').style.display = 'none';
         }
@@ -505,7 +519,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const filtered = dataHighConf.filter(d => 
             (d.Path || "").toLowerCase().includes(query) || 
             (d.Processes || "").toLowerCase().includes(query) ||
-            (d.Type || "").toLowerCase().includes(query)
+            (d.Type || "").toLowerCase().includes(query) ||
+            (d.ExploitPrimitive || "").toLowerCase().includes(query)
         );
         renderList(highConfList, filtered, false);
     });

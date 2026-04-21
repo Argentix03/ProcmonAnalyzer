@@ -313,6 +313,11 @@
                                     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                                     Directory
                                 </button>
+                                <div class="chip-sep">Attack ›</div>
+                                <button class="field-chip" data-field="ExploitPrimitive" style="--chip-color:#f03e3e">
+                                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                                    Exploit Primitive
+                                </button>
                             </div>
                         </div>
 
@@ -452,6 +457,7 @@
                 </div>
                 <div style="font-size:0.85rem; margin-top:8px;"><span style="color:var(--text-muted);">Detail:</span>
                     <span id="modalDetail" style="word-break:break-all;"></span></div>
+                <div id="modalExploitContext" style="display:none; margin-top:10px; padding:8px; background:rgba(94,106,210,0.08); border-radius:5px; border:1px solid rgba(94,106,210,0.2);"></div>
             </div>
 
             <div class="detail-group">
@@ -600,9 +606,9 @@
         </div>
     </div>
 
-    <script src="app.js?v=cw2"></script>
+    <script src="app.js?v=cw4"></script>
     <script src="analytics.js?v=1"></script>
-    <script src="graph.js?v=4"></script>
+    <script src="graph.js?v=5"></script>
 </body>
 
 </html>
