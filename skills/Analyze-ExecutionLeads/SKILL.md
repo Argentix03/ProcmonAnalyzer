@@ -105,7 +105,7 @@ All analysis assumes the attacker is a **standard local user** with:
 - **Attack:** Replace any package with trojanized version
 - **Privileges needed:** NONE
 
-#### 6.5. Registry Path Coercion (`Registry_Coercion`)
+#### 7. Registry Path Coercion (`Registry_Coercion`)
 - **Trigger:** High-integrity process opens/creates a key in `HKCU` or `HKU\<SID>` without `REG_OPTION_OPEN_LINK`.
 - **Attack:** Plant a `REG_LINK` (registry symbolic link) to redirect the registry access to a different, attacker-controlled key within the user's hive.
 - **Result:** Context-dependent. Can result in privileged config poisoning, CLSID (COM) hijacking, or arbitrary registry write via TOCTOU.
@@ -115,7 +115,7 @@ All analysis assumes the attacker is a **standard local user** with:
 
 ### WRITE-PATH Primitives (privileged process WRITES to writable path)
 
-#### 7. Arbitrary Write via Oplock + Junction (`Oplock_ArbitraryWrite`)
+#### 8. Arbitrary Write via Oplock + Junction (`Oplock_ArbitraryWrite`)
 - **Trigger:** High-integrity process WRITES to user-writable path
 - **Attack:** Set oplock on target file → oplock fires when process opens file → attacker swaps NTFS junction → write lands in arbitrary privileged location (System32, drivers, etc.)
 - **Result:** Arbitrary file write as SYSTEM. Can drop DLLs into System32, modify hosts file, plant scheduled tasks.
@@ -126,25 +126,25 @@ All analysis assumes the attacker is a **standard local user** with:
 
 ### EXECUTION Primitives (no privileged process required)
 
-#### 8. AutoRun / Script Persistence (`AutoRun_Persistence`)
+#### 9. AutoRun / Script Persistence (`AutoRun_Persistence`)
 - **Trigger:** Writable `.bat`/`.ps1`/`.vbs`/`.cmd` or Startup/Tasks directories
 - **Privileges needed:** NONE
 
-#### 9. Web Shell Planting (`WebShell_Plant`)
+#### 10. Web Shell Planting (`WebShell_Plant`)
 - **Trigger:** Writable webroot + script extension
 - **Privileges needed:** NONE
 
-#### 10. LNK Shortcut Hijacking (`LNK_Hijack`)
+#### 11. LNK Shortcut Hijacking (`LNK_Hijack`)
 - **Trigger:** Writable `.lnk` shortcuts
 - **Attack:** Modify target field to redirect execution
 - **Privileges needed:** NONE
 
-#### 11. Certificate Store Planting (`Cert_Plant`)
+#### 12. Certificate Store Planting (`Cert_Plant`)
 - **Trigger:** Writable cert files (`.cer`/`.pfx`/`.p12`) or crypto store directories
 - **Attack:** Inject trusted root CA for MitM, or code-signing cert to bypass signature verification
 - **Privileges needed:** NONE to write; system impact depends on cert store location
 
-#### 12. LOLBin Proxy (`LOLBin_Proxy`)
+#### 13. LOLBin Proxy (`LOLBin_Proxy`)
 - **Trigger:** File accessed by a Living-off-the-Land binary
 - **Attack:** Depends on specific LOLBin parsing behavior
 - **Privileges needed:** NONE
