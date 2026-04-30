@@ -321,7 +321,8 @@ CRITICAL INSTRUCTIONS:
 2. CALL OUT FALSE POSITIVES: Do not be afraid to be deeply skeptical. High-privileged processes (e.g. MsMpEng.exe, SearchIndexer.exe, svchost.exe) routinely map or read user files purely for scanning, indexing, or telemetry. Just because an EDR maps a DLL does NOT mean it executes it. If it looks like a benign operation or a typical AV scan, explicitly declare it a False Positive and explain why.
 3. CRITICAL INTEGRITY RULE: Verify the 'Integrity' value mathematically strictly! If the Integrity is 'Low', 'Medium', 'Medium Plus', or 'AppContainer', it mathematically CANNOT be a Local Privilege Escalation (LPE) because the executing agent holds zero system elevation! It may be a valid unprivileged code execution/hijacking vulnerability, but you must explicitly state it is NOT an LPE. Only 'High' or 'System' Integrity processes result in Privilege Escalation.
 4. PROVIDE A CONFIDENCE VERDICT: Prefix the beginning of your 'Hint' string with an explicit confidence verdict tag (e.g., "[VERDICT: HIGH CONFIDENCE LPE]", "[VERDICT: HIGH CONFIDENCE HIJACKING]", "[VERDICT: LIKELY FALSE POSITIVE]", or "[VERDICT: AMBIGUOUS - NEEDS REVERSING]").
-5. DEEP CONTEXT: Use the 'Operation' and 'Detail' fields to prove your verdict (e.g., 'CreateFileMapping' with only READ access is likely a scan).
+5. IMPERSONATION CONTEXT: Use the 'Impersonating' field to determine the true caller context. If a SYSTEM process is NOT impersonating, it is acting with full privileges. If it IS impersonating, it may be acting with the rights of the impersonated user (e.g. standard user), which significantly changes the LPE risk profile.
+6. DEEP CONTEXT: Use the 'Operation' and 'Detail' fields to prove your verdict (e.g., 'CreateFileMapping' with only READ access is likely a scan).
 
 Input JSON:
 ${JSON.stringify(chunk)}

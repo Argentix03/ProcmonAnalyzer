@@ -474,6 +474,7 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('modalOp').textContent = (item.Operation || 'N/A') + (item.OperationDirection ? ' (' + item.OperationDirection + ')' : '');
             document.getElementById('modalResult').textContent = item.Result || 'N/A';
             document.getElementById('modalIntegrity').textContent = item.Integrity || 'Unknown';
+            document.getElementById('modalImpersonation').textContent = item.Impersonating || 'Unknown';
             document.getElementById('modalDetail').textContent = item.Detail || 'None';
             
             // New exploit context fields

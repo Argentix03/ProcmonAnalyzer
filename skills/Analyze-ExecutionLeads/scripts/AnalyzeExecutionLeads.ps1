@@ -102,6 +102,7 @@ foreach ($entry in $rawData) {
     $result    = if ($entry.Result)    { $entry.Result }    else { "" }
     $detail    = if ($entry.Detail)    { $entry.Detail }    else { "" }
     $integrity = if ($entry.Integrity) { $entry.Integrity } else { "Unknown" }
+    $impersonating = if ($entry.Impersonating) { $entry.Impersonating } else { "Unknown" }
 
     $isDirectLead    = $false
     $severity        = "Low"
@@ -375,6 +376,7 @@ foreach ($entry in $rawData) {
                 Result = $entry.Result
                 Detail = $entry.Detail
                 Integrity = $entry.Integrity
+                Impersonating = $impersonating
                 OperationDirection = $opDirection
                 SqosLevel = $sqos
             })
@@ -389,6 +391,7 @@ foreach ($entry in $rawData) {
                 Result = $entry.Result
                 Detail = $entry.Detail
                 Integrity = $entry.Integrity
+                Impersonating = $impersonating
                 OperationDirection = $opDirection
                 SqosLevel = $sqos
             })
@@ -409,6 +412,7 @@ foreach ($entry in $rawData) {
             Result = $entry.Result
             Detail = $entry.Detail
             Integrity = $entry.Integrity
+            Impersonating = $impersonating
             SqosLevel = $sqos
         })
     }

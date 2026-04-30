@@ -45,6 +45,7 @@ $idxPath = if ($headerMap.ContainsKey("path")) { $headerMap["path"] } else { 4 }
 $idxRes  = if ($headerMap.ContainsKey("result")) { $headerMap["result"] } else { 5 }
 $idxDet  = if ($headerMap.ContainsKey("detail")) { $headerMap["detail"] } else { 6 }
 $idxInt  = if ($headerMap.ContainsKey("integrity")) { $headerMap["integrity"] } else { -1 }
+$idxImp  = if ($headerMap.ContainsKey("impersonating")) { $headerMap["impersonating"] } else { -1 }
 
 $traceFileName = Split-Path $CsvPath -Leaf
 
@@ -70,6 +71,7 @@ while (-not $parser.EndOfData) {
                         Result = if ($idxRes -lt $fields.Length) { $fields[$idxRes] } else { "" }
                         Detail = if ($idxDet -lt $fields.Length) { $fields[$idxDet] } else { "" }
                         Integrity = if ($idxInt -ge 0 -and $idxInt -lt $fields.Length) { $fields[$idxInt] } else { "Unknown" }
+                        Impersonating = if ($idxImp -ge 0 -and $idxImp -lt $fields.Length) { $fields[$idxImp] } else { "Unknown" }
                     }
                     
                     $pathProcessMap[$path] = @{
@@ -207,6 +209,7 @@ foreach ($path in $uniquePaths) {
             Result           = $evt.Result
             Detail           = $evt.Detail
             Integrity        = $evt.Integrity
+            Impersonating    = $evt.Impersonating
         })
     }
 }

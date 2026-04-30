@@ -118,6 +118,7 @@ if ($SimRead) {
                 "Path"         = $RawPath
                 "Result"       = "SUCCESS"
                 "Detail"       = "Integrity: $MappedIntegrity | Native File IO"
+                "Impersonating" = "Unknown"
             }
             $ProcmonEvents.Add($obj)
             $MatchCount++
