@@ -86,13 +86,12 @@ if ($SimRead) {
     while ($null -ne ($line = $reader.ReadLine())) {
         $LineCount++
         
-        # Fast filter: only care about Kernel File telemetry
-        if (-not $line.StartsWith("Microsoft-Windows-Kernel-File")) { continue }
+        # Fast filter: care about Kernel File and Kernel Registry telemetry
+        if (-not $line.StartsWith("Microsoft-Windows-Kernel-File") -and -not $line.StartsWith("Microsoft-Windows-Kernel-Registry")) { continue }
         
         # Heuristic fast-path extraction:
-        # We are looking for any logged line containing a physical drive path
-        # (Procmon/ETW paths are often formatted with Device\HarddiskVolume or literal C:\)
-        if ($line -match "\\Device\\HarddiskVolume\d+\\([\w\.\-\\]+)" -or $line -match "([A-Z]:\\[\w\.\-\\]+)") {
+        # We are looking for any logged line containing a physical drive path or registry path
+        if ($line -match "\\Device\\HarddiskVolume\d+\\([\w\.\-\\]+)" -or $line -match "([A-Z]:\\[\w\.\-\\]+)" -or $line -match "\\REGISTRY\\[\w\.\-\\]+") {
             
             $RawPath = $matches[0]
             if ($RawPath.StartsWith("\Device")) {
@@ -110,14 +109,19 @@ if ($SimRead) {
             $MappedName = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].ProcessName } else { "Unknown.exe" }
             $MappedIntegrity = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].Integrity } else { "Unknown" }
 
+            $SimOp = "ReadFile"
+            if ($line.StartsWith("Microsoft-Windows-Kernel-Registry")) {
+                $SimOp = "RegOpenKey"
+            }
+
             $obj = [PSCustomObject]@{
                 "Time of Day"  = (Get-Date).ToString("hh:mm:ss.fffffff AM") # Simplification for demo
                 "Process Name" = $MappedName
                 "PID"          = $TestPID
-                "Operation"    = "ReadFile" # Generalized
+                "Operation"    = $SimOp
                 "Path"         = $RawPath
                 "Result"       = "SUCCESS"
-                "Detail"       = "Integrity: $MappedIntegrity | Native File IO"
+                "Detail"       = "Integrity: $MappedIntegrity | Native IO"
                 "Impersonating" = "Unknown"
             }
             $ProcmonEvents.Add($obj)

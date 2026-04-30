@@ -45,7 +45,7 @@ function Get-OperationDirection {
                   "WriteConfig", "RegSetValue", "SetSecurityFile")
     $readOps  = @("CreateFile", "ReadFile", "QueryDirectory", "QueryBasicInformationFile",
                   "QueryStandardInformationFile", "QueryNameInformationFile", "Load Image",
-                  "QueryOpen", "RegQueryValue", "CreateFileMapping")
+                  "QueryOpen", "RegQueryValue", "CreateFileMapping", "RegOpenKey", "RegCreateKey")
     if ($writeOps -contains $op) { return "Write" }
     if ($readOps -contains $op)  { return "Read" }
     # Heuristic fallback
@@ -314,6 +314,23 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
+    # RULE 10: Registry Path Coercion via REG_LINK  ** NEW **
+    # A privileged process accesses a key in HKCU or HKU without REG_OPTION_OPEN_LINK.
+    # Attacker can plant a REG_LINK (Registry Symbolic Link) to redirect the 
+    # access elsewhere in the hive.
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and ($path -match "^HKCU" -or $path -match "^HKEY_CURRENT_USER" -or $path -match "^HKU" -or $path -match "^HKEY_USERS")) {
+        $hasOpenLink = ($detail -match "(?i)Open Link")
+        if (-not $hasOpenLink) {
+            $severity = "Critical"
+            $type = "Registry Path Coercion Candidate"
+            $exploitPrimitive = "Registry_Coercion"
+            $reason = "PRIVILEGED PROCESS ($integrity) accesses a user-writable registry key ($path) without REG_OPTION_OPEN_LINK. Plant a REG_LINK (Registry Symbolic Link) to redirect this access to an attacker-controlled key. NO SPECIAL PRIVILEGES REQUIRED. Often chains into config poisoning, COM hijacking, or TOCTOU races."
+            $isDirectLead = $true
+        }
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
     # RULE 9: Certificate / Crypto Store Planting  ** NEW **
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and ($path -match "\.(cer|crt|pfx|p12|pem|key|p7b)$" -or
@@ -353,12 +370,12 @@ foreach ($entry in $rawData) {
     # COGNITIVE QUEUE — for items that need agent semantic analysis
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead) {
-        if ($path -match "\.(config|xml|ini|json|yml|yaml|txt|log|db|dat|reg|inf|pol)$") {
+        if ($path -match "\.(config|xml|ini|json|yml|yaml|txt|log|db|dat|reg|inf|pol)$" -or $path -match "^HK") {
             $hint = "Requires semantic analysis. "
             if ($isPrivileged) {
                 $hint += "HIGH-VALUE: Consumed by $integrity-integrity process. "
                 $hint += "Check for: (1) Assembly binding redirects in .NET configs, (2) XXE in XML files, (3) Deserialization sinks, "
-                $hint += "(4) SMB coercion via config values pointing to UNC paths, (5) Credential material in plaintext."
+                $hint += "(4) SMB coercion via config values pointing to UNC paths, (5) Credential material in plaintext, (6) For registry paths, check for REG_LINK TOCTOU or missing REG_OPTION_OPEN_LINK."
             } else {
                 $hint += "Standard-priv context. Check for: deserialization sinks, config-driven code loading, credential harvesting."
             }

@@ -62,8 +62,8 @@ while (-not $parser.EndOfData) {
             $processName = if ($idxProc -lt $fields.Length) { $fields[$idxProc] } else { "" }
             $path = if ($idxPath -lt $fields.Length) { $fields[$idxPath] } else { "" }
             
-            # Simple check for file system path (filters out Registry keys like HKLM\...)
-            if (-not [string]::IsNullOrWhiteSpace($path) -and ($path -match "^[a-zA-Z]:\\" -or $path -match "^\\\\")) {
+            # Check for file system paths and user-writable registry paths
+            if (-not [string]::IsNullOrWhiteSpace($path) -and ($path -match "^[a-zA-Z]:\\" -or $path -match "^\\\\" -or $path -match "^HKCU" -or $path -match "^HKEY_CURRENT_USER" -or $path -match "^HKU" -or $path -match "^HKEY_USERS")) {
                 if (-not $pathProcessMap.ContainsKey($path)) {
                     $firstEvt = [PSCustomObject]@{
                         Time = if ($idxTime -lt $fields.Length) { $fields[$idxTime] } else { "" }
@@ -118,6 +118,12 @@ function Test-SafeWritePermission {
     )
 
     try {
+        if ($TargetPath -match "^HKCU" -or $TargetPath -match "^HKEY_CURRENT_USER" -or $TargetPath -match "^HKU\\" -or $TargetPath -match "^HKEY_USERS\\") {
+            # Low-priv users generally have write access to their own HKCU/HKU\<SID> tree.
+            # For the heuristic pipeline we consider any path under HKCU/HKU as inherently writable by the user.
+            return $true
+        }
+
         if ([System.IO.File]::Exists($TargetPath)) {
             # For files, Attempting Write handle is accurate, but we must catch sharing conflicts correctly!
             try {

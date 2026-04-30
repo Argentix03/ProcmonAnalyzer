@@ -105,6 +105,14 @@ All analysis assumes the attacker is a **standard local user** with:
 - **Attack:** Replace any package with trojanized version
 - **Privileges needed:** NONE
 
+#### 6.5. Registry Path Coercion (`Registry_Coercion`)
+- **Trigger:** High-integrity process opens/creates a key in `HKCU` or `HKU\<SID>` without `REG_OPTION_OPEN_LINK`.
+- **Attack:** Plant a `REG_LINK` (registry symbolic link) to redirect the registry access to a different, attacker-controlled key within the user's hive.
+- **Result:** Context-dependent. Can result in privileged config poisoning, CLSID (COM) hijacking, or arbitrary registry write via TOCTOU.
+- **Privileges needed:** NONE. A standard medium-IL user can create `REG_LINK`s.
+- **Severity:** Critical
+- **Look for in cognitive review:** Any `RegOpenKey`, `RegCreateKey`, or `RegQueryValue` by a SYSTEM process against `HKCU` or `HKEY_USERS\<SID>`. Ensure `Open Link` is missing from the Options/Detail fields.
+
 ### WRITE-PATH Primitives (privileged process WRITES to writable path)
 
 #### 7. Arbitrary Write via Oplock + Junction (`Oplock_ArbitraryWrite`)

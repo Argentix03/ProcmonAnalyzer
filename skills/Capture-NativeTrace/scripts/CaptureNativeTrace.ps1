@@ -32,6 +32,7 @@ if ($Start) {
         "Microsoft-Windows-Kernel-File 0xffffffffffffffff 0xff"
         "Microsoft-Windows-Kernel-Process 0xffffffffffffffff 0xff"
         "Microsoft-Windows-Security-Auditing 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-Kernel-Registry 0xffffffffffffffff 0xff"
     )
     $Providers | Out-File $ManifestPath -Encoding ascii
 

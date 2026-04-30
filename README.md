@@ -32,7 +32,7 @@ node server.js
 # Usage
 
 ### 1. Using the Web UI
-1. Record a session with Procmon focusing mainly on file access operations.
+1. Record a session with Procmon focusing on file and registry access operations (ensure "Show Registry Activity" is enabled in Procmon). Make sure to include the `Options`, `Detail`, and `Impersonating` columns in your export.
 2. Save as `.CSV`.
 3. Open the UI (`http://localhost:3000`) and drop the file in for fully automated pipeline analysis and Gemini streaming resolution. You can also drop your processed analysis result files (`.json`) into the UI for offline review.
 
