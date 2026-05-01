@@ -426,10 +426,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const severityClass = item.Severity ? item.Severity.toLowerCase() : 'medium';
             const displaySeverity = isCognitive && item.Severity ? item.Severity : isCognitive ? 'Cognitive Target' : item.Severity;
 
+            const catBadge = item.EscalationCategory
+                ? `<span style="background:rgba(245,159,0,0.15); color:#f59f00; padding:1px 7px; border-radius:3px; font-size:0.7rem; font-family:monospace; margin-left:6px;">${item.EscalationCategory}</span>`
+                : '';
             div.innerHTML = `
                 <div class="badge ${severityClass}">${displaySeverity}</div>
                 <div class="item-details">
-                    <span class="item-type">${item.Type || 'Ambiguous Signature'}</span>
+                    <span class="item-type">${item.Type || 'Ambiguous Signature'}${catBadge}</span>
                     <span class="item-path">${item.Path}</span>
                 </div>
             `;
@@ -506,6 +509,27 @@ document.addEventListener('DOMContentLoaded', () => {
                     extraCtx.style.display = 'none';
                 }
             }
+
+            // Escalation-category context (rev 3)
+            var escCtx = document.getElementById('modalEscalationContext');
+            if (escCtx) {
+                if (item.EscalationCategory || item.WritableFrom) {
+                    escCtx.style.display = 'block';
+                    escCtx.innerHTML = '';
+                    if (item.EscalationCategory) escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Escalation Category</span><strong>' + item.EscalationCategory + '</strong></div>';
+                    if (item.WritableFrom)       escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Writable From</span><strong>' + item.WritableFrom + '</strong></div>';
+                    if (item.IntegrityLabel)     escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Integrity Label</span><strong>' + item.IntegrityLabel + '</strong></div>';
+                    if (typeof item.WritableByLowPriv !== 'undefined' || typeof item.WritableByMediumILAdmin !== 'undefined' || typeof item.WritableByHighILAdmin !== 'undefined') {
+                        var marks = [];
+                        if (item.WritableByLowPriv)        marks.push('Low');
+                        if (item.WritableByMediumILAdmin)  marks.push('MedIL Admin');
+                        if (item.WritableByHighILAdmin)    marks.push('HighIL Admin');
+                        escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Writable by</span><strong>' + (marks.join(', ') || 'none') + '</strong></div>';
+                    }
+                } else {
+                    escCtx.style.display = 'none';
+                }
+            }
         } else {
             document.getElementById('modalMetadataGroup').style.display = 'none';
         }
@@ -530,17 +554,30 @@ document.addEventListener('DOMContentLoaded', () => {
         if(e.target === modal) modal.classList.add('hidden');
     });
 
-    // Simple Search logic
-    searchHighConf.addEventListener('input', (e) => {
-        const query = e.target.value.toLowerCase();
-        const filtered = dataHighConf.filter(d => 
-            (d.Path || "").toLowerCase().includes(query) || 
-            (d.Processes || "").toLowerCase().includes(query) ||
-            (d.Type || "").toLowerCase().includes(query) ||
-            (d.ExploitPrimitive || "").toLowerCase().includes(query)
-        );
+    // Search + filter logic for the high-confidence panel.
+    const categoryFilter    = document.getElementById('categoryFilter');
+    const perspectiveFilter = document.getElementById('perspectiveFilter');
+
+    function applyHighConfFilters() {
+        const query = (searchHighConf.value || '').toLowerCase();
+        const cat   = (categoryFilter && categoryFilter.value)    || '';
+        const persp = (perspectiveFilter && perspectiveFilter.value) || '';
+        const filtered = dataHighConf.filter(d => {
+            const matchesQuery = !query || (
+                (d.Path || "").toLowerCase().includes(query) ||
+                (d.Processes || "").toLowerCase().includes(query) ||
+                (d.Type || "").toLowerCase().includes(query) ||
+                (d.ExploitPrimitive || "").toLowerCase().includes(query)
+            );
+            const matchesCat   = !cat   || d.EscalationCategory === cat;
+            const matchesPersp = !persp || d.WritableFrom === persp;
+            return matchesQuery && matchesCat && matchesPersp;
+        });
         renderList(highConfList, filtered, false);
-    });
+    }
+    searchHighConf.addEventListener('input', applyHighConfFilters);
+    if (categoryFilter)    categoryFilter.addEventListener('change', applyHighConfFilters);
+    if (perspectiveFilter) perspectiveFilter.addEventListener('change', applyHighConfFilters);
 
     const searchStatsCog = document.getElementById('searchStatsCog');
     const clearSearchCog = document.getElementById('clearSearchCog');

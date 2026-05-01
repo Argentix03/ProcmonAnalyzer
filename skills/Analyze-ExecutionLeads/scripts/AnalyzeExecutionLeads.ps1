@@ -107,6 +107,70 @@ function Test-PrivilegedIntegrity {
     return ($i -eq "system" -or $i -eq "high" -or $i -eq "protected process")
 }
 
+# Compute the escalation category for a lead. Used to map leads to the right
+# research prompt and decide severity adjustments.
+#
+# Inputs:
+#   $writableFrom        : "LowPriv" | "MediumILAdmin" | "HighILAdmin" | "None"
+#                          (lowest perspective at which the path is writable)
+#   $consumerIntegrity   : process integrity of the privileged consumer ("System","High","Medium",...)
+#   $primitive           : the matched ExploitPrimitive string
+#   $anyImpersonating    : whether the consumer impersonates the user at any point
+#
+# Categories:
+#   LPE             — low-priv user can plant; consumer at High/System
+#   UAC_Bypass      — only medium-IL admin can plant; consumer at High (auto-elevating)
+#   Admin_To_System — only high-IL admin can plant; consumer is System / TI
+#   RCE_Lateral     — primitive is a coercion / web / cert family
+#   Proxy_Execution — primitive is a LOLBin / autorun family
+#   Same_Level      — writability and consumer at the same effective IL; no escalation
+#   Unknown         — cannot determine
+function Get-EscalationCategory {
+    param(
+        [string]$writableFrom,
+        [string]$consumerIntegrity,
+        [string]$primitive,
+        [bool]$anyImpersonating = $false
+    )
+
+    # Primitive overrides — some primitives are inherently a specific category
+    # regardless of the writability perspective or the observed consumer's IL.
+    # User-scope persistence primitives (AppExecAlias squat, PowerShell profile
+    # auto-load, Electron .asar tamper) are escalation surfaces even when the
+    # only observed consumer in the trace is medium-IL: the plant lies in wait
+    # for whichever account next invokes the binary, including admin RunAs,
+    # scheduled tasks running as the user from elevated context, etc.
+    if ($primitive -in @('COM_Hijack_HKCU','Env_Hijack_HKCU')) { return 'UAC_Bypass' }
+    if ($primitive -in @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant')) { return 'Admin_To_System' }
+    if ($primitive -in @('URL_NTLM_Coerce','Theme_NTLM_Coerce','DesktopIni_Coerce','WebShell_Plant','LNK_Hijack','Cert_Plant')) { return 'RCE_Lateral' }
+    if ($primitive -in @('LOLBin_Proxy','AutoRun_Persistence')) { return 'Proxy_Execution' }
+    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Cert_Plant')) { return 'LPE' }
+
+    $consumerHighIL    = $consumerIntegrity -in @('High','System','Protected Process')
+    $consumerSystemTI  = $consumerIntegrity -eq 'System' -or $consumerIntegrity -eq 'Protected Process'
+
+    switch ($writableFrom) {
+        'LowPriv'        { if ($consumerHighIL)   { return 'LPE' }              else { return 'Same_Level' } }
+        'MediumILAdmin'  { if ($consumerHighIL)   { return 'UAC_Bypass' }       else { return 'Same_Level' } }
+        'HighILAdmin'    { if ($consumerSystemTI) { return 'Admin_To_System' }  else { return 'Same_Level' } }
+        default          { return 'Unknown' }
+    }
+}
+
+# Map an escalation category to the matching research-prompt id (mirror of
+# the catalog in ui/server.js and skills/Research-Lead/scripts/Get-ResearchPromptForPrimitive.ps1).
+function Get-ResearchPromptIdForCategory {
+    param([string]$category, [string]$primitive)
+    switch ($category) {
+        'LPE'              { return 'lpe' }
+        'UAC_Bypass'       { return 'uac' }
+        'Admin_To_System'  { return 'admin_kernel' }
+        'RCE_Lateral'      { return 'rce_lateral' }
+        'Proxy_Execution'  { return 'proxy' }
+        default            { return 'lpe' }   # fallback
+    }
+}
+
 # Returns the user/principal whose token actually hits the I/O. Critical for
 # credential-coercion verdicts (LPE prompt §6).
 function Get-EffectivePrincipal {
@@ -223,6 +287,24 @@ foreach ($entry in $rawData) {
     $anyOpenLink      = [bool](Get-FieldValue $entry "AnyOpenLink" $false)
     $isUserOnly       = [bool](Get-FieldValue $entry "IsUserOnlyConsumer" $false)
     $sqosFromFeed     = Get-FieldValue $entry "SqosLevel" "NotSpecified"
+
+    # Perspective-aware writability fields (rev 3 parser). Backwards compat:
+    # if the feed predates rev 3, every path defaults to LowPriv-writable
+    # (the rev-2 parser only emitted LowPriv-writable paths anyway).
+    $hasPerspectiveFields = ($null -ne (Get-FieldValue $entry "WritableFrom" $null))
+    if ($hasPerspectiveFields) {
+        $writableLow  = [bool](Get-FieldValue $entry "WritableByLowPriv" $false)
+        $writableMed  = [bool](Get-FieldValue $entry "WritableByMediumILAdmin" $false)
+        $writableHigh = [bool](Get-FieldValue $entry "WritableByHighILAdmin" $false)
+        $writableFrom = Get-FieldValue $entry "WritableFrom" "LowPriv"
+        $intLabel     = Get-FieldValue $entry "IntegrityLabel" "Default"
+    } else {
+        $writableLow  = $true
+        $writableMed  = $true
+        $writableHigh = $true
+        $writableFrom = "LowPriv"
+        $intLabel     = "Default"
+    }
 
     $isDirectLead     = $false
     $severity         = "Low"
@@ -405,29 +487,60 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 1.8: Service Binary Path / IFEO debugger surface (HKLM is normally
-    # admin-only; appearing as user-writable signals an ACL anomaly worth a
-    # critical-severity flag)
+    # RULE 1.8: Service Binary Path / IFEO debugger / AeDebug surfaces
+    #
+    # These keys are admin-only-write by default. The interpretation depends
+    # on which perspective made the path appear in the writable feed:
+    #
+    #   * LowPriv-writable      => ACL ANOMALY. A non-admin user can rewrite
+    #                              this value; that's a non-default ACL bug
+    #                              that should be flagged Critical.
+    #   * HighILAdmin-only       => Standard admin -> SYSTEM primitive. Not an
+    #                              anomaly, just the well-known elevation
+    #                              path. Still relevant for admin -> SYSTEM
+    #                              research. Tagged High severity and routed
+    #                              to AdminToSystemKernel_Research_Prompt.
+    #
+    # We keep the same ExploitPrimitive id in both cases so the prompt
+    # mapping in Research-Lead doesn't need a sub-discriminator.
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and $path -match "(?i)^HKLM\\SYSTEM\\CurrentControlSet\\Services\\.+\\(ImagePath|ServiceDll)$") {
-        $severity = "Critical"
-        $type = "Service Binary Path Hijack (ACL anomaly)"
         $exploitPrimitive = "Service_BinaryPath"
-        $reason = "Service ImagePath/ServiceDll under HKLM appearing in the user-writable feed indicates a non-default ACL — direct LPE primitive: rewrite the value, restart the service, run as the service account."
+        if ($writableLow) {
+            $severity = "Critical"
+            $type = "Service Binary Path Hijack (ACL anomaly)"
+            $reason = "Service ImagePath/ServiceDll under HKLM is writable by a NON-ADMIN user. Non-default ACL; direct LPE primitive: rewrite the value, restart the service, run as the service account."
+        } else {
+            $severity = "High"
+            $type = "Service Binary Path Hijack (admin -> SYSTEM)"
+            $reason = "Service ImagePath/ServiceDll under HKLM. Standard admin -> SYSTEM primitive: as elevated admin, rewrite the value, stop+start the service, code runs as SYSTEM (or whichever account the service is configured to run as). Not an anomaly; documented technique."
+        }
         $isDirectLead = $true
     }
     if (-not $isDirectLead -and $path -match "(?i)^HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\.+\\(Debugger|GlobalFlag)$") {
-        $severity = "Critical"
-        $type = "IFEO Debugger Hijack (ACL anomaly)"
         $exploitPrimitive = "IFEO_Debugger"
-        $reason = "Image File Execution Options Debugger value writable to the user. Plant your binary here; whenever the targeted EXE is launched, the OS spawns YOUR debugger as the parent — direct execution at the launching principal."
+        if ($writableLow) {
+            $severity = "Critical"
+            $type = "IFEO Debugger Hijack (ACL anomaly)"
+            $reason = "IFEO Debugger value writable to a NON-ADMIN user. Non-default ACL; plant your binary here; whenever the targeted EXE is launched, the OS spawns YOUR debugger as the parent."
+        } else {
+            $severity = "High"
+            $type = "IFEO Debugger Hijack (admin -> SYSTEM)"
+            $reason = "IFEO Debugger key. As admin you can plant a debugger that runs at whatever integrity the launching process eventually reaches. Standard admin -> SYSTEM persistence + execution surface."
+        }
         $isDirectLead = $true
     }
     if (-not $isDirectLead -and $path -match "(?i)^HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug\\Debugger$") {
-        $severity = "Critical"
-        $type = "AeDebug Postmortem Debugger Hijack"
         $exploitPrimitive = "AeDebug"
-        $reason = "AeDebug Debugger value writable. Any crashing process triggers your binary as the postmortem handler — runs at the crashing process's integrity (often SYSTEM for service crashes)."
+        if ($writableLow) {
+            $severity = "Critical"
+            $type = "AeDebug Postmortem Debugger Hijack (ACL anomaly)"
+            $reason = "AeDebug Debugger value writable to a NON-ADMIN user. Non-default ACL; any crashing process triggers your binary as the postmortem handler."
+        } else {
+            $severity = "High"
+            $type = "AeDebug Postmortem Debugger Hijack (admin -> SYSTEM)"
+            $reason = "AeDebug Debugger value. As admin you can install a postmortem debugger that fires on any crash, including SYSTEM service crashes; reliable admin -> SYSTEM technique."
+        }
         $isDirectLead = $true
     }
 
@@ -567,10 +680,16 @@ foreach ($entry in $rawData) {
     # RULE 4: Scheduled Task XML
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and $path -match "(?i)\\System32\\Tasks\\.+$|\\schedule\\taskcache\\tree\\") {
-        $severity = "Critical"
-        $type = "Scheduled Task Definition Hijack (ACL anomaly)"
         $exploitPrimitive = "ScheduledTask_Plant"
-        $reason = "Scheduled-task definition under '\\System32\\Tasks\\' appearing in the user-writable feed is an ACL anomaly. Default ACL is Admins/SYSTEM only. Rewriting the XML's '<Command>' lets you piggy-back on the trigger and run as whichever principal the task is configured to run as."
+        if ($writableLow) {
+            $severity = "Critical"
+            $type = "Scheduled Task Definition Hijack (ACL anomaly)"
+            $reason = "Scheduled-task definition writable by a NON-ADMIN user. Default ACL is Admins/SYSTEM only. Non-default ACL; rewriting the XML's '<Command>' lets you piggy-back on the trigger and run as whichever principal the task is configured to run as."
+        } else {
+            $severity = "High"
+            $type = "Scheduled Task Definition Hijack (admin -> SYSTEM)"
+            $reason = "Scheduled-task definition. As admin you can rewrite the XML's '<Command>' to run as the task's principal (often SYSTEM). Standard admin -> SYSTEM persistence + execution surface; not an anomaly."
+        }
         $isDirectLead = $true
     }
 
@@ -787,10 +906,47 @@ foreach ($entry in $rawData) {
             $reason += " [Race window — privileged READ and WRITE on same path]"
         }
 
+        # Compute escalation category from the writability perspective and the
+        # consumer integrity. Drives downstream research-prompt routing.
+        $escalationCategory = Get-EscalationCategory `
+            -writableFrom $writableFrom `
+            -consumerIntegrity $integrity `
+            -primitive $exploitPrimitive `
+            -anyImpersonating $anyImpersonating
+        $promptId = Get-ResearchPromptIdForCategory -category $escalationCategory -primitive $exploitPrimitive
+
+        # Same_Level: writability and consumer at the same effective IL —
+        # not an escalation primitive, drop to cognitive queue with hint.
+        if ($escalationCategory -eq 'Same_Level') {
+            $cognitiveQueue.Add([PSCustomObject]@{
+                Path = $path
+                Processes = $procs
+                Operations = $operations
+                Hint = "[Same-level — no escalation] Path is writable by '$writableFrom' and the observed consumer is at the same effective IL. Useful only as a sanity-check or for chained primitives; not a standalone escalation lead."
+                TraceFile = (Get-FieldValue $entry "TraceFile")
+                Timestamp = (Get-FieldValue $entry "Timestamp")
+                Operation = $operation
+                Result = $result
+                Detail = $detail
+                Integrity = $integrity
+                Impersonating = $impersonating
+                OperationDirection = $opDirection
+                SqosLevel = $sqos
+                EffectivePrincipal = $effectivePrincipal
+                WritableFrom = $writableFrom
+                IntegrityLabel = $intLabel
+                EscalationCategory = $escalationCategory
+                FilterReason = "Same_Level"
+            })
+            continue
+        }
+
         $hardcodedLeads.Add([PSCustomObject]@{
             Severity = $severity
             Type = $type
             ExploitPrimitive = $exploitPrimitive
+            EscalationCategory = $escalationCategory
+            ResearchPromptId = $promptId
             Path = $path
             Processes = $procs
             Operations = $operations
@@ -810,6 +966,12 @@ foreach ($entry in $rawData) {
             AnyPrivRead  = $anyPrivRead
             AnyPrivWrite = $anyPrivWrite
             AnyImpersonating = $anyImpersonating
+            # Perspective-aware (rev 3)
+            WritableByLowPriv       = $writableLow
+            WritableByMediumILAdmin = $writableMed
+            WritableByHighILAdmin   = $writableHigh
+            WritableFrom            = $writableFrom
+            IntegrityLabel          = $intLabel
         })
     }
 }
@@ -828,6 +990,9 @@ $sortedLeads | ConvertTo-Json -Depth 4 | Out-File $hardcodedJsonPath -Encoding U
 $cognitiveQueue | ConvertTo-Json -Depth 4 | Out-File $cognitiveJsonPath -Encoding UTF8
 
 $primitiveStats = $hardcodedLeads | Group-Object ExploitPrimitive | Sort-Object Count -Descending
+$categoryStats  = $hardcodedLeads | Group-Object EscalationCategory | Sort-Object Count -Descending
+$writableFromStats = $hardcodedLeads | Group-Object WritableFrom | Sort-Object Count -Descending
+
 Write-Host ""
 Write-Host "[+] Heuristic Analysis Complete." -ForegroundColor Green
 Write-Host "    -> High Confidence Leads: $($hardcodedLeads.Count)" -ForegroundColor Green
@@ -837,8 +1002,18 @@ Write-Host "    False-Positive Filters Applied:" -ForegroundColor Cyan
 Write-Host "       Paging-I/O / kernel attribution dropped: $dropPagingIO" -ForegroundColor Gray
 Write-Host "       Open Reparse Point always-set demoted:    $dropOpenReparse" -ForegroundColor Gray
 Write-Host "       REG_OPTION_OPEN_LINK always-set demoted:  $dropOpenLink"   -ForegroundColor Gray
-Write-Host "       User-only-consumer (`§9` FP) dropped:    $dropUserOnly"   -ForegroundColor Gray
+Write-Host "       User-only-consumer (LPE prompt section 9) dropped: $dropUserOnly" -ForegroundColor Gray
 Write-Host "       Benign-readers-only demoted:              $dropBenignReaderOnly" -ForegroundColor Gray
+Write-Host ""
+Write-Host "    Escalation Category Breakdown:" -ForegroundColor Cyan
+foreach ($stat in $categoryStats) {
+    Write-Host "       $($stat.Name): $($stat.Count)" -ForegroundColor White
+}
+Write-Host ""
+Write-Host "    Writable-From Perspective Breakdown:" -ForegroundColor Cyan
+foreach ($stat in $writableFromStats) {
+    Write-Host "       $($stat.Name): $($stat.Count)" -ForegroundColor White
+}
 Write-Host ""
 Write-Host "    Exploit Primitive Breakdown:" -ForegroundColor Cyan
 foreach ($stat in $primitiveStats) {

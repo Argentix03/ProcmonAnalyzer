@@ -1,6 +1,6 @@
 ---
 name: Analyze-ExecutionLeads
-description: Triages writable-path feeds via hybrid heuristic + cognitive model, covering 20+ low-privilege exploitation primitives across LPE / UAC bypass / RCE-Lateral / Proxy-Execution / Admin-to-System families, with built-in suppression for the LPE-prompt §2 / §9 false-positive classes.
+description: Triages writable-path feeds via hybrid heuristic + cognitive model, covering 20+ exploitation primitives across LPE / UAC-Bypass / RCE-Lateral / Proxy-Execution / Admin-to-System families. Each lead is tagged with an EscalationCategory derived from the lowest writability perspective (LowPriv / MediumILAdmin / HighILAdmin) and the consumer integrity, so leads route to the right research prompt. Built-in suppression for the LPE-prompt false-positive classes.
 ---
 # Analyze-ExecutionLeads
 
@@ -46,6 +46,26 @@ All analysis assumes the attacker is a **standard local user** with:
 - ✅ Can set oplocks on files they own
 - ✅ Can run a named-pipe server, local SMB/HTTP listener, Responder
 - ✅ Can crack captured Net-NTLMv2 hashes offline (hashcat -m 5600)
+
+---
+
+## EscalationCategory (rev 3)
+
+Every high-confidence lead now carries an `EscalationCategory` field that names the threat boundary it crosses. The category is computed from `WritableFrom` (the lowest perspective at which the path is writable) plus the privileged consumer's integrity, with primitive-specific overrides for cases where the primitive itself fixes the category regardless of perspective.
+
+| Category | When it fires | Maps to research prompt |
+|---|---|---|
+| `LPE` | LowPriv-writable + High/System consumer (low-priv → SYSTEM) | `LPE_Research_Prompt.md` |
+| `UAC_Bypass` | MediumIL-admin-writable + High consumer; or any `COM_Hijack_HKCU` / `Env_Hijack_HKCU` (auto-elevation surface) | `UAC_Bypass_Research_Prompt.md` |
+| `Admin_To_System` | HighIL-admin-only-writable + System/TI consumer; or any `Service_BinaryPath` / `IFEO_Debugger` / `AeDebug` / `ScheduledTask_Plant` | `AdminToSystemKernel_Research_Prompt.md` |
+| `RCE_Lateral` | NTLM-coercion / web-shell / cert-plant family (primitive override) | `RCE_LateralMovement_Research_Prompt.md` |
+| `Proxy_Execution` | LOLBin / autorun family (primitive override) | `ProxyExecution_LOLBin_Research_Prompt.md` |
+| `Same_Level` | Writability and consumer at the same effective IL — not an escalation; routed to cognitive queue with hint |  |
+| `Unknown` | Cannot determine (insufficient feed metadata) |  |
+
+The `ResearchPromptId` field on each lead is the prompt-catalog id that matches the category — same source of truth as the UI's `/api/research-prompts` and the Research-Lead skill's `Get-ResearchPromptForPrimitive.ps1`. The lead modal's "Suggested research prompt" row uses it.
+
+Re-tagged ACL-anomaly rules: `Service_BinaryPath`, `IFEO_Debugger`, `AeDebug`, `ScheduledTask_Plant` previously fired as `Critical` "ACL anomaly" leads whenever the path appeared in the writable feed. With perspective fields available, they now fire `Critical` only when LowPriv-writable (the genuine ACL anomaly); when only HighIL-admin-writable they downgrade to `High` and retag as the standard Admin → SYSTEM primitive (not an anomaly, just admin's documented elevation path).
 
 ---
 

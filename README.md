@@ -11,9 +11,9 @@ It is built specifically to *not* miss good leads and *not* spam you with the we
 ## Pipeline at a glance
 
 1. **Capture** — Procmon CSV (or `NativeTrace.ps1` ETW capture, included).
-2. **Parse** (`Parse-ProcmonWriteables` skill) — best-event scoring per path; capture SQOS, Open Reparse Point, Open Link, Impersonating, Operations[]; canonicalize paths; filter self-trace contamination.
-3. **Analyze** (`Analyze-ExecutionLeads` skill) — heuristic primitives + cognitive queue. Suppresses Paging-I/O / kernel attribution, demotes `Open Reparse Point`/`Open Link` always-set, drops user-only-consumer noise, gates LOLBin matches by extension.
-4. **Triage in UI** — sortable lead lists, per-lead modal showing effective principal and the matched research prompt.
+2. **Parse** (`Parse-ProcmonWriteables` skill) — best-event scoring per path; capture SQOS, Open Reparse Point, Open Link, Impersonating, Operations[]; canonicalize paths; filter self-trace contamination. **Classifies each path against three writability perspectives** (LowPriv / MediumILAdmin / HighILAdmin) so downstream rules don't conflate "low-priv can plant here" with "an admin running the parser can plant here".
+3. **Analyze** (`Analyze-ExecutionLeads` skill) — heuristic primitives + cognitive queue. Each lead carries an `EscalationCategory` (LPE / UAC_Bypass / Admin_To_System / RCE_Lateral / Proxy_Execution) computed from the writability perspective + consumer integrity. Suppresses Paging-I/O / kernel attribution, demotes `Open Reparse Point`/`Open Link` always-set, drops user-only-consumer and same-IL noise, gates LOLBin matches by extension.
+4. **Triage in UI** — sortable lead lists with category and perspective filters; per-lead modal showing effective principal, escalation category, writable-from perspective, and the matched research prompt.
 5. **Research** *(optional, gated)* — `Research-Lead` skill stages per-lead workspaces and dispatches a research subagent against the matching prompt. **Destructive**: confirmed snapshotted-VM only.
 
 ## Features
@@ -107,6 +107,6 @@ If no GUI-driver is available, the agent falls back to manual user steps for any
 
 `writable_paths.json` includes per-path: `Path`, `CanonicalPath`, `RelatedProcesses`, `Operations`, `EventCount`, `Operation` (best-event), `Result`, `Detail`, `Integrity`, `Impersonating`, `BestProcess`, `DesiredAccess`, `SqosLevel`, `IsPagingIO`, `OpenReparsePoint`, `OpenLink`, `IsKernelAttribution`, `AnyWrite`, `AnyRead`, `AnyPrivWrite`, `AnyPrivRead`, `AnyImpersonating`, `AnyOpenReparsePoint`, `AnyOpenLink`, `AnyPagingIO`, `IsUserOnlyConsumer`.
 
-`high_confidence_leads.json` includes per-lead: `Severity`, `Type`, `ExploitPrimitive`, `Path`, `Processes`, `Operations`, `DetailedReason`, `EffectivePrincipal`, `OperationDirection`, `SqosLevel`, `OpenReparsePoint`, `OpenLink`, `AnyPrivRead`, `AnyPrivWrite`, `AnyImpersonating`, plus the original `Detail`/`Integrity`/`Impersonating`/`TraceFile`/`Timestamp`/`Result`.
+`high_confidence_leads.json` includes per-lead: `Severity`, `Type`, `ExploitPrimitive`, `EscalationCategory`, `ResearchPromptId`, `WritableFrom`, `IntegrityLabel`, `WritableByLowPriv` / `WritableByMediumILAdmin` / `WritableByHighILAdmin`, `Path`, `Processes`, `Operations`, `DetailedReason`, `EffectivePrincipal`, `OperationDirection`, `SqosLevel`, `OpenReparsePoint`, `OpenLink`, `AnyPrivRead`, `AnyPrivWrite`, `AnyImpersonating`, plus the original `Detail`/`Integrity`/`Impersonating`/`TraceFile`/`Timestamp`/`Result`.
 
 `cognitive_review_queue.json` items have a `Hint` field (free-form text describing what the agent should look for) plus the same telemetry context. `FilterReason` is set when the analyzer demoted a finding (Paging-I/O, OpenReparsePoint always-set, OpenLink always-set, BenignReaderOnly).

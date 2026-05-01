@@ -1,6 +1,6 @@
 ---
 name: Parse-ProcmonWriteables
-description: Parses Procmon / ETW traces for writable paths, extracting operation context, integrity, SQOS, reparse-point and open-link flags, impersonation, and best-event scoring for downstream exploitation-primitive analysis.
+description: Parses Procmon / ETW traces for writable paths and classifies each one against three writability perspectives (LowPriv / MediumILAdmin / HighILAdmin) so downstream analysis can distinguish LPE candidates from UAC-bypass candidates from admin-to-SYSTEM candidates. Captures SQOS, reparse-point / open-link flags, impersonation, and best-event scoring.
 ---
 # Parse-ProcmonWriteables
 
@@ -20,6 +20,25 @@ For each writable path, the parser extracts:
 - **OpenReparsePoint / OpenLink** — `FILE_FLAG_OPEN_REPARSE_POINT` / `REG_OPTION_OPEN_LINK` presence on this event
 - **AnyWrite / AnyRead / AnyPrivWrite / AnyPrivRead / AnyImpersonating / AnyOpenReparsePoint / AnyOpenLink / AnyPagingIO** — aggregated across every event for the path
 - **IsUserOnlyConsumer** — if every actor on this path was the current user's own session (LPE prompt §9 "user-already-has-it" filter)
+
+### Perspective-aware writability (rev 3)
+
+Each path is classified against three hypothetical tokens, not just "the current user":
+
+- **WritableByLowPriv** — a standard-user (no Admin SID) token can plant here.
+- **WritableByMediumILAdmin** — an admin's UAC-filtered medium-IL token can plant here. Mandatory Integrity Control's NW (no-write-up) blocks writes to High-IL labeled paths even if the DACL grants Admins write.
+- **WritableByHighILAdmin** — an elevated admin token can plant here.
+- **WritableFrom** — the **lowest** perspective at which the path is writable (`LowPriv` / `MediumILAdmin` / `HighILAdmin` / `None`). Drives the analyzer's escalation-category assignment.
+- **IntegrityLabel** — `Default` / `High` / `System`. Currently a path-based heuristic (System32, Program Files, WinSxS, etc.); the SACL-derived label requires `SeSecurityPrivilege` which medium-IL admin doesn't hold.
+- **AclSource** — `exact-file` / `exact-directory` / `ancestor` / `registry-heuristic`, plus `-denied` / `-null` suffixes when DACL read failed. Tells the analyzer how trustworthy the writability verdict is.
+- **CurrentUserCanWrite** — convenience field: whether the *running* token can write right now (informational, depends on current process IL + admin-elevated state).
+- **CurrentUserSid / CurrentUserIsAdminLatent / CurrentUserIsAdminElevated / CurrentProcessIntegrity** — the user-context the parser ran under; replicated on every entry for the analyzer.
+
+Bug fixes that ride along with rev 3:
+
+- **Right-mask bug**: rev 2 used `-band [FileSystemRights]::Modify` and `-band ::FullControl` to test for write. Both are union masks containing read bits, so any `ReadAndExecute` ACE for `BUILTIN\Users` matched non-zero — false-positive across `\Windows\System32\`, `\Windows\servicing\`, `\Program Files\`. Rev 3 ANDs only against `WriteData -bor AppendData`, the pure plant bits.
+- **Sharing-violation hack**: rev 2 mapped `ERROR_SHARING_VIOLATION` (`0x80070020`) to "writable", which falsely flagged `pagefile.sys`, mapped DLLs, and any locked file. Rev 3 drops the file-handle test entirely and relies on ACL walking; if the file's own ACL can't be read, we return `false` rather than fall through to the parent's ACL.
+- **`IsInRole(Admin)` confusion**: rev 2 used `Principal.IsInRole(adminSid)` to match admin grants, but that returns true for split-token admins at medium IL because the Admin SID is in the token (just deny-only). Running the parser as an admin user thus bled admin grants into the "user-writable" verdict. Rev 3 classifies SIDs explicitly into low-priv / admin / system buckets and never relies on `IsInRole`.
 
 ## Self-Trace Filtering
 

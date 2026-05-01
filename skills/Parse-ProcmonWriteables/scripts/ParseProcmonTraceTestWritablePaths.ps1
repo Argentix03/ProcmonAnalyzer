@@ -9,28 +9,48 @@
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Parse-ProcmonWriteables (rev 2)
+#  Parse-ProcmonWriteables (rev 3 — perspective-aware)
 #
-#  Purpose: stream a Procmon CSV (or NativeTrace ETW-derived CSV), extract every
-#  path the *current standard user* can write to, and emit a structured feed for
-#  Analyze-ExecutionLeads.
+#  Purpose: stream a Procmon CSV (or NativeTrace ETW-derived CSV), classify
+#  every path against three writability perspectives, and emit a structured
+#  feed for Analyze-ExecutionLeads.
 #
-#  Design notes / hardenings vs rev 1:
-#   - Best-event selection per path: instead of keeping only the FIRST event we
-#     see for a path, score each event so writes-by-privileged with NAME-NOT-FOUND
-#     beat reads-by-medium-IL with SUCCESS. Prevents losing a SYSTEM WriteFile
-#     that happened to land after a benign Medium-IL ReadFile of the same path.
-#   - Capture telemetry-quality flags: IsPagingIO, OpenReparsePoint, OpenLink,
-#     IsKernelOrCacheManager. Surfaces the LPE-prompt §2 false-positive classes
-#     so the analyzer can drop or down-weight them.
-#   - Path canonicalization: strip trailing slashes, normalize `\??\`,
-#     `\Device\HarddiskVolume<N>\` and case for dedup. Original Path preserved
-#     for display.
-#   - Self-trace filtering: skips rows whose Path or Process match the trace
-#     pipeline itself (Procmon, tracerpt, our own NativeTrace.ps1), so the
-#     report doesn't flag its own captures.
-#   - Captures Operations[] (set) so downstream rules can detect Read+Write
-#     combos against the same path.
+#  Design notes / hardenings vs rev 2:
+#   - PERSPECTIVE-AWARE WRITABILITY: each path is now classified against three
+#     hypothetical tokens, not just "the current user":
+#       * WritableByLowPriv       — a standard-user (no admin SID) token
+#       * WritableByMediumILAdmin — an admin token at medium integrity (UAC
+#                                   filtered token; Admin SID is "deny only")
+#       * WritableByHighILAdmin   — an elevated admin token (high integrity)
+#     This lets downstream rules distinguish low-priv → SYSTEM (real LPE)
+#     from medium-IL admin → high-IL admin (UAC bypass) from high-IL admin →
+#     SYSTEM/TI (admin-to-system) primitives.
+#   - FIXED ACL RIGHT-MASK BUG: rev 2 used `-band [FileSystemRights]::Modify`
+#     and `-band ::FullControl` to test for write access. Those are UNION
+#     masks containing read bits; any ReadAndExecute ACE matched non-zero,
+#     producing dozens of false positives across the Windows tree (e.g.
+#     dbgcore.dll-style binary plant). Now we AND only against pure write
+#     bits (WriteData | AppendData), which is what 'plant a file/junction'
+#     actually requires.
+#   - DROPPED SHARING-VIOLATION HACK: rev 2 mapped ERROR_SHARING_VIOLATION
+#     (0x80070020) to "writable", which falsely flagged pagefile.sys, mapped
+#     DLLs, etc. ACL walking is the source of truth now.
+#   - CURRENT USER CONTEXT: the script computes and propagates whether the
+#     running token is admin-latent (Admin SID present, even if filtered)
+#     vs admin-elevated, and the running process integrity level. The user's
+#     own-SID grants count for whichever perspective applies.
+#   - INTEGRITY-LABEL HEURISTIC: paths under \Windows\System32, \Program Files,
+#     \WinSxS, etc. are tagged IntegrityLabel=High. MIC's NW (no-write-up)
+#     means even a medium-IL admin can't write there regardless of ACL.
+#
+#  Carried over from rev 2:
+#   - Best-event selection per path (privileged write w/ NAME-NOT-FOUND beats
+#     benign medium-IL read).
+#   - Telemetry-quality flags: IsPagingIO, OpenReparsePoint, OpenLink,
+#     IsKernelOrCacheManager.
+#   - Path canonicalization (case, trailing slash, `\??\`, `\Device\HarddiskVolumeN\`).
+#   - Self-trace filtering.
+#   - Operations[] aggregation.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 Write-Host "Calculating total size of CSV feed for progress telemetry..." -ForegroundColor Cyan
@@ -372,93 +392,258 @@ Write-Host "  - Skipped self-trace contamination rows: $script:skippedSelfTrace"
 Write-Host "  - Paging-I/O attributions detected (kept, marked): $script:skippedPagingIO" -ForegroundColor DarkGray
 Write-Host "Starting safe permission tests (no destructive writes)..." -ForegroundColor Cyan
 
-# ── PERMISSION TEST ──────────────────────────────────────────────────────────
+# ── PERSPECTIVE-AWARE WRITABILITY ────────────────────────────────────────────
+#
+# Get-PathWritability classifies one path against three writability
+# perspectives. It is the heart of the rev-3 false-positive fixes.
+#
+# Why three perspectives:
+#   * LowPriv        — a hypothetical standard-user (no Admin SID at all)
+#                      token. Models the canonical LPE attacker.
+#   * MediumILAdmin  — an admin's UAC-filtered medium-IL token. Admin SID is
+#                      "deny-only", so admin grants don't count as writable;
+#                      Mandatory Integrity Control's NW (no-write-up) flag
+#                      blocks writes to High-IL labeled paths.
+#   * HighILAdmin    — an elevated admin token. Admin grants count and MIC's
+#                      NW restriction does not apply.
+#
+# Why not just trust Principal.IsInRole(adminSid) at runtime: that returns
+# TRUE for split-token admins at medium IL because the Admin SID is present
+# in the token, just with Use=DenyOnly. Using IsInRole conflated MediumIL
+# admin with HighIL admin and produced dozens of false positives across the
+# Windows tree in rev 2.
+#
+# Why we AND only against (WriteData | AppendData) instead of also Modify
+# / FullControl: those two FileSystemRights values are UNION masks that
+# include read bits. `-band Modify` matches any ACE with the ReadAndExecute
+# bits set, which is most BUILTIN\Users grants in System32/Program Files.
+# This single bug accounted for the bulk of the 7 Binary_Plant_HighPriv +
+# 33 Windows-tree SMB_Coercion FPs in rev 2. WriteData|AppendData are pure
+# bits; FullControl ACEs already match through them because FullControl
+# sets every bit including those two.
 
-function Test-SafeWritePermission {
+# Pure plant bits — what "you can plant a file/junction/symlink here" means.
+$script:_plantBits = [int]([System.Security.AccessControl.FileSystemRights]::WriteData) -bor `
+                     [int]([System.Security.AccessControl.FileSystemRights]::AppendData)
+
+# SID classification. Names match the canonical well-known SIDs.
+$script:_lowPrivSids = @(
+    'S-1-1-0',          # Everyone
+    'S-1-5-7',          # ANONYMOUS LOGON
+    'S-1-5-11',         # Authenticated Users
+    'S-1-5-32-545',     # BUILTIN\Users
+    'S-1-5-4',          # INTERACTIVE
+    'S-1-5-2',          # NETWORK
+    'S-1-5-32-546'      # BUILTIN\Guests
+)
+$script:_adminSids = @(
+    'S-1-5-32-544',     # BUILTIN\Administrators
+    'S-1-5-32-548',     # BUILTIN\Account Operators
+    'S-1-5-32-549',     # BUILTIN\Server Operators
+    'S-1-5-32-551',     # BUILTIN\Backup Operators
+    'S-1-5-19',         # LOCAL SERVICE
+    'S-1-5-20'          # NETWORK SERVICE
+)
+# SYSTEM/TI grants reach paths that even high-IL admin can't write without
+# impersonation tricks — irrelevant to all three of our perspectives.
+$script:_systemSids = @(
+    'S-1-5-18',         # SYSTEM
+    'S-1-5-32-552',     # BUILTIN\Replicators
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'  # NT SERVICE\TrustedInstaller
+)
+# CREATOR OWNER (S-1-3-0) is special — the ACE applies to the principal who
+# eventually creates an object under this container. We do NOT count it as
+# "writable now"; whether you can plant depends on the OTHER ACEs that let
+# you create the entry first.
+
+# Heuristic: paths under these directories are protected by High mandatory
+# integrity label by default. SACL parsing requires SeSecurityPrivilege
+# which is rarely held; this path-based check is a reliable proxy.
+$script:_highILPathPatterns = @(
+    '\Windows\System32\',
+    '\Windows\SysWOW64\',
+    '\Windows\Boot\',
+    '\Windows\Fonts\',
+    '\Windows\WinSxS\',
+    '\Windows\servicing\',
+    '\Program Files\',
+    '\Program Files (x86)\'
+)
+
+function Get-PathWritability {
     param(
-        [Parameter(Mandatory=$true)]
-        [string]$TargetPath,
-        [Parameter(Mandatory=$true)]
-        [System.Security.Principal.WindowsIdentity]$CurrentUser,
-        [Parameter(Mandatory=$true)]
-        [System.Security.Principal.WindowsPrincipal]$Principal
+        [Parameter(Mandatory=$true)] [string]$TargetPath,
+        [Parameter(Mandatory=$true)] [hashtable]$UserContext
     )
 
+    $r = @{
+        WritableByLowPriv       = $false
+        WritableByMediumILAdmin = $false
+        WritableByHighILAdmin   = $false
+        IntegrityLabel          = "Default"
+        AclSource               = "none"
+    }
+
     try {
-        # Registry — heuristic: HKCU/HKU\<self-SID> is writable to the user;
-        # for HKLM/HKCR we don't claim writability (those are admin-only by default).
+        # Registry — heuristic, no SACL parsing.
         if ($TargetPath -match "^HKLM" -or $TargetPath -match "^HKEY_LOCAL_MACHINE" `
             -or $TargetPath -match "^HKCR" -or $TargetPath -match "^HKEY_CLASSES_ROOT") {
-            return $false
+            $r.WritableByHighILAdmin = $true
+            $r.IntegrityLabel = "High"
+            $r.AclSource = "registry-heuristic"
+            return $r
         }
         if ($TargetPath -match "^HKCU" -or $TargetPath -match "^HKEY_CURRENT_USER" `
             -or $TargetPath -match "^HKU\\" -or $TargetPath -match "^HKEY_USERS\\") {
-            return $true
+            $r.WritableByLowPriv = $true
+            $r.WritableByMediumILAdmin = $true
+            $r.WritableByHighILAdmin = $true
+            $r.AclSource = "registry-heuristic"
+            return $r
+        }
+        if ($TargetPath -match "^HK") {
+            # Other roots (HKCC, HKPD) — assume admin-only.
+            $r.WritableByHighILAdmin = $true
+            $r.IntegrityLabel = "High"
+            $r.AclSource = "registry-heuristic"
+            return $r
         }
 
+        # Filesystem: pick the right ACL bearer.
+        #
+        # Distinction matters: writability of an EXISTING file requires
+        # WriteData on the file itself (not on the parent). Walking up to the
+        # parent and reading its ACL produces false positives like
+        # `C:\pagefile.sys` -> "C:\ has Users:CreateDirectories so pagefile is
+        # writable". So:
+        #   * If the path exists as a file: read THAT file's ACL. If we can't
+        #     (Get-Acl denies because we lack ReadPermissions), bail with
+        #     all-false rather than fall back to the parent.
+        #   * If the path exists as a directory: read THAT directory's ACL.
+        #   * If the path does NOT exist: walk up to the existing ancestor and
+        #     use its ACL; that genuinely tells us whether we can plant a new
+        #     entry under that name.
+        $aclTarget = $null
+        $treatAsExistingFile = $false
         if ([System.IO.File]::Exists($TargetPath)) {
-            try {
-                $fs = [System.IO.File]::Open($TargetPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-                $fs.Close()
-                return $true
-            } catch [System.UnauthorizedAccessException] {
-                return $false
-            } catch [System.IO.IOException] {
-                # File-sharing violation = ACL OK, file just locked
-                if ($_.Exception.HResult -eq -2147024864) { return $true }
-                return $false
-            } catch {
-                return $false
+            $aclTarget = $TargetPath
+            $treatAsExistingFile = $true
+            $r.AclSource = "exact-file"
+        } elseif ([System.IO.Directory]::Exists($TargetPath)) {
+            $aclTarget = $TargetPath
+            $r.AclSource = "exact-directory"
+        } else {
+            $dir = [System.IO.Path]::GetDirectoryName($TargetPath)
+            while (-not [string]::IsNullOrWhiteSpace($dir) -and -not [System.IO.Directory]::Exists($dir)) {
+                $dir = [System.IO.Path]::GetDirectoryName($dir)
             }
+            if ([string]::IsNullOrWhiteSpace($dir)) { return $r }
+            $aclTarget = $dir
+            $r.AclSource = "ancestor"
         }
 
-        $directoryToTest = $TargetPath
-        if (-not [System.IO.Directory]::Exists($directoryToTest)) {
-            $directoryToTest = [System.IO.Path]::GetDirectoryName($TargetPath)
-            while (-not [string]::IsNullOrWhiteSpace($directoryToTest) -and -not [System.IO.Directory]::Exists($directoryToTest)) {
-                $directoryToTest = [System.IO.Path]::GetDirectoryName($directoryToTest)
+        # Tag integrity label by path (heuristic; SACL parsing is expensive
+        # and usually denied without SeSecurityPrivilege).
+        foreach ($pat in $script:_highILPathPatterns) {
+            if ($aclTarget -like ('*' + $pat + '*')) {
+                $r.IntegrityLabel = "High"
+                break
             }
         }
+        # \Windows root itself is High-IL even though most of \Windows\<X>\... isn't.
+        if ($r.IntegrityLabel -eq "Default" -and $aclTarget -match '(?i)\\Windows\\?$') {
+            $r.IntegrityLabel = "High"
+        }
 
-        if ([System.IO.Directory]::Exists($directoryToTest)) {
-            $acl = [System.IO.DirectoryInfo]::new($directoryToTest).GetAccessControl()
-            $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+        # Pull DACL. If we can't read it (typical for SYSTEM-only files like
+        # pagefile.sys), refuse to claim writability instead of falling
+        # through to ancestor-derived heuristics.
+        try {
+            $acl = Get-Acl -LiteralPath $aclTarget -ErrorAction Stop
+        } catch {
+            $r.AclSource = $r.AclSource + "-denied"
+            return $r
+        }
+        if ($null -eq $acl) {
+            $r.AclSource = $r.AclSource + "-null"
+            return $r
+        }
+        $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
 
-            $hasWrite = $false
-            $hasDeny  = $false
-            foreach ($rule in $rules) {
-                $matchesIdentity = $false
-                try {
-                    if ($CurrentUser.User.Equals($rule.IdentityReference)) { $matchesIdentity = $true }
-                    elseif ($Principal.IsInRole($rule.IdentityReference))   { $matchesIdentity = $true }
-                } catch { $matchesIdentity = $false }
+        $allowedLow = $false; $deniedLow = $false
+        $allowedMed = $false; $deniedMed = $false
+        $allowedHigh = $false; $deniedHigh = $false
 
-                if ($matchesIdentity) {
-                    # Use AddFile / AppendData / WriteData — any of these is enough to plant.
-                    $rights = $rule.FileSystemRights
-                    $hasPlant = (
-                        (($rights -band [System.Security.AccessControl.FileSystemRights]::WriteData) -ne 0) -or
-                        (($rights -band [System.Security.AccessControl.FileSystemRights]::AppendData) -ne 0) -or
-                        (($rights -band [System.Security.AccessControl.FileSystemRights]::CreateFiles) -ne 0) -or
-                        (($rights -band [System.Security.AccessControl.FileSystemRights]::Modify) -ne 0) -or
-                        (($rights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne 0)
-                    )
-                    if ($hasPlant) {
-                        if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny) {
-                            $hasDeny = $true
-                        } elseif ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
-                            $hasWrite = $true
-                        }
+        foreach ($rule in $rules) {
+            $sid = $rule.IdentityReference.Value
+            if ($sid -eq 'S-1-3-0') { continue }                # CREATOR OWNER — see comment above
+            if ($script:_systemSids -contains $sid) { continue } # unreachable from our perspectives
+
+            $rights = [int]$rule.FileSystemRights
+            if (($rights -band $script:_plantBits) -eq 0) { continue }   # not a plant grant
+            $isDeny = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny)
+
+            if ($script:_lowPrivSids -contains $sid) {
+                if ($isDeny) {
+                    $deniedLow = $true; $deniedMed = $true; $deniedHigh = $true
+                } else {
+                    $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
+                }
+                continue
+            }
+
+            if ($script:_adminSids -contains $sid) {
+                if ($isDeny) {
+                    $deniedMed = $true; $deniedHigh = $true
+                } else {
+                    $allowedMed = $true; $allowedHigh = $true
+                }
+                continue
+            }
+
+            # Current user's specific SID.
+            if ($sid -eq $UserContext.UserSid) {
+                if ($UserContext.IsAdminLatent) {
+                    if ($isDeny) { $deniedMed = $true; $deniedHigh = $true }
+                    else         { $allowedMed = $true; $allowedHigh = $true }
+                } else {
+                    if ($isDeny) {
+                        $deniedLow = $true; $deniedMed = $true; $deniedHigh = $true
+                    } else {
+                        $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
                     }
                 }
+                continue
             }
-            return ($hasWrite -and -not $hasDeny)
+            # Other SIDs (specific user accounts, custom groups) — leave alone.
         }
-        return $false
+
+        $r.WritableByLowPriv       = $allowedLow  -and -not $deniedLow
+        $r.WritableByMediumILAdmin = $allowedMed  -and -not $deniedMed
+        $r.WritableByHighILAdmin   = $allowedHigh -and -not $deniedHigh
+
+        # MIC NW: paths with the High mandatory label refuse writes from
+        # tokens at lower IL. LowPriv / MediumIL can't write up.
+        if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
+            $r.WritableByLowPriv       = $false
+            $r.WritableByMediumILAdmin = $false
+        }
+
+        return $r
     } catch {
         $script:skippedErrors.Add([PSCustomObject]@{ Type = "Permission Evaluation Error"; Path = $TargetPath; Error = $_.Exception.Message })
-        return $false
+        return $r
     }
+}
+
+# Return the lowest-privilege perspective at which the path is writable.
+# That value is what the analyzer maps to LPE / UAC_Bypass / Admin_To_System.
+function Get-LowestWritablePerspective {
+    param([hashtable]$Writability)
+    if ($Writability.WritableByLowPriv)       { return "LowPriv" }
+    if ($Writability.WritableByMediumILAdmin) { return "MediumILAdmin" }
+    if ($Writability.WritableByHighILAdmin)   { return "HighILAdmin" }
+    return "None"
 }
 
 # ── EXECUTION ────────────────────────────────────────────────────────────────
@@ -470,6 +655,47 @@ $swTest = [System.Diagnostics.Stopwatch]::StartNew()
 $activeIdentity  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $activePrincipal = New-Object System.Security.Principal.WindowsPrincipal($activeIdentity)
 $currentUserName = $activeIdentity.Name
+$adminSidObj     = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+
+# IsAdminLatent: admin SID is in the token's groups list, even if currently
+# filtered to deny-only. WindowsIdentity.Groups returns groups regardless of
+# Use=DenyOnly status, so iterating Groups detects split-token admins.
+$isAdminLatent = $false
+foreach ($g in $activeIdentity.Groups) {
+    if ($g.Equals($adminSidObj)) { $isAdminLatent = $true; break }
+}
+# IsAdminElevated: admin SID is currently active (Use=Allow) in the token.
+# IsInRole returns false for deny-only, true for active.
+$isAdminElevated = $activePrincipal.IsInRole($adminSidObj)
+
+# Process integrity level via whoami /groups — portable, no P/Invoke.
+$processIntegrity = "Medium"
+try {
+    $wamiOut = & whoami /groups 2>$null
+    foreach ($line in $wamiOut) {
+        if ($line -match 'Mandatory Label\\(\w+) Mandatory Level') {
+            $processIntegrity = $matches[1]
+            break
+        }
+    }
+} catch { }
+
+$userContext = @{
+    UserSid               = $activeIdentity.User.Value
+    UserName              = $currentUserName
+    IsAdminLatent         = $isAdminLatent
+    IsAdminElevated       = $isAdminElevated
+    ProcessIntegrityLevel = $processIntegrity
+}
+
+Write-Host "Current user context:" -ForegroundColor Cyan
+Write-Host "  User:                     $($userContext.UserName) ($($userContext.UserSid))" -ForegroundColor DarkGray
+Write-Host "  Process integrity level:  $($userContext.ProcessIntegrityLevel)" -ForegroundColor DarkGray
+Write-Host "  Admin SID present:        $($userContext.IsAdminLatent) (latent)" -ForegroundColor DarkGray
+Write-Host "  Admin SID active:         $($userContext.IsAdminElevated) (elevated)" -ForegroundColor DarkGray
+if ($isAdminLatent -and -not $isAdminElevated) {
+    Write-Host "  -> Split-token admin at medium IL. UAC-bypass research surface is in scope." -ForegroundColor DarkYellow
+}
 
 foreach ($canonical in $canonicalPaths) {
     if ($counter % 100 -eq 0 -or $counter -eq $totalCount) {
@@ -481,50 +707,77 @@ foreach ($canonical in $canonicalPaths) {
     $rec = $pathProcessMap[$canonical]
     $displayPath = $rec.Path
 
-    if (Test-SafeWritePermission -TargetPath $displayPath -CurrentUser $activeIdentity -Principal $activePrincipal) {
-        $relatedProcesses = ($rec.Processes -join ", ")
-        $operationsList   = ($rec.Operations -join ", ")
-        $bestEvt = $rec.BestEvent
+    $writability = Get-PathWritability -TargetPath $displayPath -UserContext $userContext
+    $lowestPersp = Get-LowestWritablePerspective -Writability $writability
 
-        # User-only-consumed filter: if EVERY observed process for this path is
-        # the current user's own medium-IL session AND there's no privileged
-        # actor, the path is "user-already-has-it" (LPE §9 false positive).
-        # We still emit it, but tag IsUserOnlyConsumer so the analyzer can
-        # downgrade severity rather than drop entirely.
-        $userOnlyConsumer = (-not $rec.AnyPrivWrite) -and (-not $rec.AnyPrivRead)
+    # Skip paths writable by NONE of our perspectives (not interesting to any
+    # of LPE / UAC bypass / admin-to-SYSTEM).
+    if ($lowestPersp -eq "None") { continue }
 
-        $results.Add([PSCustomObject]@{
-            Path                = $displayPath
-            CanonicalPath       = $canonical
-            FileExists          = ([System.IO.Directory]::Exists($displayPath) -or [System.IO.File]::Exists($displayPath))
-            RelatedProcesses    = $relatedProcesses
-            Operations          = $operationsList
-            EventCount          = $rec.EventCount
-            TraceFile           = $traceFileName
-            Timestamp           = $bestEvt.Time
-            Operation           = $bestEvt.Operation
-            Result              = $bestEvt.Result
-            Detail              = $bestEvt.Detail
-            Integrity           = $bestEvt.Integrity
-            Impersonating       = $bestEvt.Impersonating
-            BestProcess         = $bestEvt.ProcessName
-            DesiredAccess       = $bestEvt.DesiredAccess
-            SqosLevel           = $bestEvt.SqosLevel
-            IsPagingIO          = [bool]$bestEvt.IsPagingIO
-            OpenReparsePoint    = [bool]$bestEvt.OpenReparsePoint
-            OpenLink            = [bool]$bestEvt.OpenLink
-            IsKernelAttribution = [bool]$bestEvt.IsKernelOrCacheManager
-            AnyWrite            = $rec.AnyWrite
-            AnyRead             = $rec.AnyRead
-            AnyPrivWrite        = $rec.AnyPrivWrite
-            AnyPrivRead         = $rec.AnyPrivRead
-            AnyImpersonating    = $rec.AnyImpersonating
-            AnyOpenReparsePoint = $rec.AnyOpenReparsePoint
-            AnyOpenLink         = $rec.AnyOpenLink
-            AnyPagingIO         = $rec.AnyPagingIO
-            IsUserOnlyConsumer  = $userOnlyConsumer
-        })
+    # Whether the running token can ACTUALLY write (informational; depends on
+    # current process IL + admin status).
+    $currentCanWrite = $false
+    if ($processIntegrity -eq "High" -or $processIntegrity -eq "System") {
+        $currentCanWrite = $writability.WritableByHighILAdmin
+    } elseif ($isAdminLatent) {
+        $currentCanWrite = $writability.WritableByMediumILAdmin
+    } else {
+        $currentCanWrite = $writability.WritableByLowPriv
     }
+
+    $relatedProcesses = ($rec.Processes -join ", ")
+    $operationsList   = ($rec.Operations -join ", ")
+    $bestEvt = $rec.BestEvent
+
+    # User-only-consumed filter: every observed process is the current user's
+    # own session and no privileged actor touches the path. The redirect
+    # cannot reach anywhere the user couldn't reach already.
+    $userOnlyConsumer = (-not $rec.AnyPrivWrite) -and (-not $rec.AnyPrivRead)
+
+    $results.Add([PSCustomObject]@{
+        Path                    = $displayPath
+        CanonicalPath           = $canonical
+        FileExists              = ([System.IO.Directory]::Exists($displayPath) -or [System.IO.File]::Exists($displayPath))
+        RelatedProcesses        = $relatedProcesses
+        Operations              = $operationsList
+        EventCount              = $rec.EventCount
+        TraceFile               = $traceFileName
+        Timestamp               = $bestEvt.Time
+        Operation               = $bestEvt.Operation
+        Result                  = $bestEvt.Result
+        Detail                  = $bestEvt.Detail
+        Integrity               = $bestEvt.Integrity
+        Impersonating           = $bestEvt.Impersonating
+        BestProcess             = $bestEvt.ProcessName
+        DesiredAccess           = $bestEvt.DesiredAccess
+        SqosLevel               = $bestEvt.SqosLevel
+        IsPagingIO              = [bool]$bestEvt.IsPagingIO
+        OpenReparsePoint        = [bool]$bestEvt.OpenReparsePoint
+        OpenLink                = [bool]$bestEvt.OpenLink
+        IsKernelAttribution     = [bool]$bestEvt.IsKernelOrCacheManager
+        AnyWrite                = $rec.AnyWrite
+        AnyRead                 = $rec.AnyRead
+        AnyPrivWrite            = $rec.AnyPrivWrite
+        AnyPrivRead             = $rec.AnyPrivRead
+        AnyImpersonating        = $rec.AnyImpersonating
+        AnyOpenReparsePoint     = $rec.AnyOpenReparsePoint
+        AnyOpenLink             = $rec.AnyOpenLink
+        AnyPagingIO             = $rec.AnyPagingIO
+        IsUserOnlyConsumer      = $userOnlyConsumer
+        # Perspective-aware writability (rev 3)
+        WritableByLowPriv       = $writability.WritableByLowPriv
+        WritableByMediumILAdmin = $writability.WritableByMediumILAdmin
+        WritableByHighILAdmin   = $writability.WritableByHighILAdmin
+        WritableFrom            = $lowestPersp
+        IntegrityLabel          = $writability.IntegrityLabel
+        AclSource               = $writability.AclSource
+        # Current-user context for the analyzer
+        CurrentUserSid          = $userContext.UserSid
+        CurrentUserIsAdminLatent   = $userContext.IsAdminLatent
+        CurrentUserIsAdminElevated = $userContext.IsAdminElevated
+        CurrentUserCanWrite     = $currentCanWrite
+        CurrentProcessIntegrity = $userContext.ProcessIntegrityLevel
+    })
 }
 Write-Progress -Activity "Testing Permissions" -Completed
 $swTest.Stop()
