@@ -1,46 +1,91 @@
 # Procmon Analyzer
 
-A high-performance pipeline and interactive web dashboard connecting Sysinternals Process Monitor (Procmon) traces directly to LLM Cognitive Agents.   
+A Procmon / ETW trace triage pipeline that identifies user-writable filesystem and registry paths consumed by privileged Windows processes, classifies them across 20+ exploitation primitives (LPE, UAC bypass, RCE / Lateral, Proxy / LOLBin, Admin → SYSTEM / Kernel), and hands each lead off to a downstream agentic research workflow with a purpose-built prompt.
 
-Procmon Analyzer enables triage execution risks from analysis of a procmon trace.
+## What it does
 
-## Features 
-*   **Dual-Orchestration Parsing** - First, traces are heuristically analyzed across a local offline PowerShell pipeline.
-*   **Gemini Streaming Resolution** - Unresolved or complex logic traces are piped dynamically over Server-Sent Events (SSE) asynchronously using native Google Generative AI SDK APIs.
-*   **Quota Optimization Engine** - Attempted to be efficient on request quotas. Promps the user for estimated amounts of tokens consumed when using cognitive AI analysis.
-*   **Project Workspaces** - Support for isolating different analyses in the UI.
-*   **Custom Prompting Models** - Supports user-selection of advanced Gemini LLMs dynamically fetched from API hooks directly in your UI settings.
-*   **Agent Analysis without API** - Supports agents analysis without Gemini API with your favorite agents via skill.md stuff when invoked from a normal agent (at least it did so with AntiGravity).  
+Procmon Analyzer reads the trace, tells you **which paths a low-privilege user can plant into**, **which privileged processes consume those paths**, and **which exploitation primitive each lead matches** — then attaches a research prompt that an agent (Claude Code, Antigravity, etc.) can run against to produce a verdict.
+
+It is built specifically to *not* miss good leads and *not* spam you with the well-known false-positive classes from the LPE-research playbook (Paging-I/O attribution, "user-already-has-it" reads, `Open Reparse Point` already correctly used, indexer-only readers, self-trace contamination).
+
+## Pipeline at a glance
+
+1. **Capture** — Procmon CSV (or `NativeTrace.ps1` ETW capture, included).
+2. **Parse** (`Parse-ProcmonWriteables` skill) — best-event scoring per path; capture SQOS, Open Reparse Point, Open Link, Impersonating, Operations[]; canonicalize paths; filter self-trace contamination.
+3. **Analyze** (`Analyze-ExecutionLeads` skill) — heuristic primitives + cognitive queue. Suppresses Paging-I/O / kernel attribution, demotes `Open Reparse Point`/`Open Link` always-set, drops user-only-consumer noise, gates LOLBin matches by extension.
+4. **Triage in UI** — sortable lead lists, per-lead modal showing effective principal and the matched research prompt.
+5. **Research** — operator hands the matched prompt to an agent that produces `Execution_Lead_N\VERDICT_*.txt` with proof.
+
+## Features
+
+- **Best-event scoring** — a single SYSTEM `WriteFile` is no longer buried by 100 prior `QueryDirectory` reads on the same path.
+- **Effective-principal disclosure** — every lead states whose NTLMv2 hits the wire (user / `MACHINE$` / service account), per LPE prompt §6.
+- **20+ exploitation primitives** including (new in rev 2): COM hijack, env-var hijack (SilentCleanup), App Execution Alias squat, PowerShell profile sinks, Electron `app.asar` tamper, `desktop.ini`/`.url`/`.theme` NTLM coercion, IFEO/AeDebug/Service-binary-path ACL anomalies, scheduled-task plant.
+- **Five built-in research prompts** for downstream agents: LPE, UAC Bypass, RCE / Lateral, Proxy Execution / LOLBin, Admin → SYSTEM / Kernel.
+- **Project Workspaces** for isolating different traces.
+- **Optional Gemini cognitive analysis** via the UI.
+- **Skill-based usage** — works fully agent-driven via `skills/Parse-ProcmonWriteables/SKILL.md` even without the UI.
 
 ## UI Setup
 
-1. Install dependencies natively using Node.js:
 ```bash
 cd ui
 npm install
-```
-
-2. Run the internal background Server:
-```bash
 node server.js
 ```
 
-3. Navigate to \`http://localhost:3000\` and drop in your Procmon `.CSV` exports. *(Note: You must convert `.PML` binary traces using Sysinternals first)*.
+Open `http://localhost:3000` and drop in your Procmon `.CSV` exports. (Convert `.PML` binary traces with Procmon's `File → Save As → CSV` first.)
 
-4. Insert API Key and select your Agent / 
+## Recording a Procmon trace correctly
 
-# Usage
+When recording in Procmon:
 
-### 1. Using the Web UI
-1. Record a session with Procmon focusing on file and registry access operations (ensure "Show Registry Activity" is enabled in Procmon). Make sure to include the `Options`, `Detail`, and `Impersonating` columns in your export.
-2. Save as `.CSV`.
-3. Open the UI (`http://localhost:3000`) and drop the file in for fully automated pipeline analysis and Gemini streaming resolution. You can also drop your processed analysis result files (`.json`) into the UI for offline review.
+1. **Filter to file & registry activity.** Apply: `Operation is RegOpenKey / RegSetValue / RegCreateKey / RegQueryValue` AND `Class is File System` (alternative: filter by `Integrity is High` OR `System` to dramatically shrink the trace).
+2. **Enable Registry Activity** (toolbar icon).
+3. **Enable the optional columns** — Procmon's defaults DO NOT include the columns the analyzer reads:
+   - `Options → Columns` → check **Detail**, **Integrity**, **Impersonating**, **Result**, **Operation**, **Process Name**, **Time of Day**, **Path**.
+4. Capture, then `File → Save → CSV → All events`.
 
-### 2. Agent-Driven Local Workflow (Without UI)
-If you prefer to bypass the UI/Gemini API and use a local terminal-based agent (like Antigravity or Claude Code) to perform the cognitive analysis autonomously, follow these steps:
+If you capture at boot time via Procmon's bootlog, expect noise from Paging-I/O attributions during the first seconds — the analyzer will mark and demote them automatically.
 
-1. **Record & Export**: Save your Procmon trace as a `.CSV`.
-2. **Spawn the Agent**: Point your terminal agent natively to the initial parsing skill. The repository is designed for full agent autonomy. For example, simply ask:
-   > *"Read `skills\Parse-ProcmonWriteables\SKILL.md` and run the pipeline on `C:\Path\To\trace.csv`."*
-   
-   The agent will automatically execute the parsing script, adhere to the shell-output instructions to recursively trigger the `Analyze-ExecutionLeads` triage phase, semantically review the cognitive queue itself, and output the final `Execution_Leads_Report.md`.
+## Native ETW alternative
+
+If you want a Procmon-free capture, the bundled `ui/public/NativeTrace.ps1` ships a tiny ETW pipeline that produces a CSV in the same shape:
+
+```powershell
+.\NativeTrace.ps1 -Start
+# ... run your target workflow ...
+.\NativeTrace.ps1 -Stop
+```
+
+Then upload the generated `NativeWritablePaths.csv` into the UI (or hand it to the parsing skill).
+
+## Agent-Driven Local Workflow (no UI / no Gemini)
+
+Point a terminal agent (Claude Code, Antigravity) at the parsing skill:
+
+> *"Read `skills/Parse-ProcmonWriteables/SKILL.md` and run the pipeline on `C:\Path\To\trace.csv`."*
+
+The agent runs the parser, follows the shell-output instruction to invoke `Analyze-ExecutionLeads`, semantically reviews the cognitive queue, and produces `Execution_Leads_Report.md`. It then picks the matching research prompt for each `EXPLOITABLE`-suspect lead — see § "Research prompts" below.
+
+## Research prompts
+
+Each lead's `ExploitPrimitive` maps to one of five Markdown research prompts at the project root. Hand the relevant prompt to a research agent operating against a snapshotted Windows VM; the prompt frames the threat model, the primitives, the false-positive patterns, the PoC requirements, and the per-lead deliverables.
+
+| Prompt | Primitives covered |
+|---|---|
+| `LPE_Research_Prompt.md` | `SMB_Coercion`, `Oplock_ArbitraryWrite`, `Pipe_Plant_Redirect`, `Pipe_Hijack`, `Registry_Coercion`, `Binary_Plant_*`, `SxS_DotLocal`, `Dependency_Hijack`, `Config_Poison`, `AppExecAlias_Plant`, `PowerShell_Profile`, `Electron_AsarTamper` |
+| `UAC_Bypass_Research_Prompt.md` | `COM_Hijack_HKCU`, `Env_Hijack_HKCU` |
+| `RCE_LateralMovement_Research_Prompt.md` | `URL_NTLM_Coerce`, `Theme_NTLM_Coerce`, `DesktopIni_Coerce`, `WebShell_Plant`, `LNK_Hijack`, `Cert_Plant` |
+| `ProxyExecution_LOLBin_Research_Prompt.md` | `LOLBin_Proxy`, `AutoRun_Persistence` |
+| `AdminToSystemKernel_Research_Prompt.md` | `Service_BinaryPath`, `IFEO_Debugger`, `AeDebug`, `ScheduledTask_Plant` |
+
+In the UI, the **Research Prompts** tab lists, displays, and copies these prompts. Each lead's details modal shows a "Suggested research prompt" row with a one-click jump.
+
+## Output JSON shapes (for agentic consumers)
+
+`writable_paths.json` includes per-path: `Path`, `CanonicalPath`, `RelatedProcesses`, `Operations`, `EventCount`, `Operation` (best-event), `Result`, `Detail`, `Integrity`, `Impersonating`, `BestProcess`, `DesiredAccess`, `SqosLevel`, `IsPagingIO`, `OpenReparsePoint`, `OpenLink`, `IsKernelAttribution`, `AnyWrite`, `AnyRead`, `AnyPrivWrite`, `AnyPrivRead`, `AnyImpersonating`, `AnyOpenReparsePoint`, `AnyOpenLink`, `AnyPagingIO`, `IsUserOnlyConsumer`.
+
+`high_confidence_leads.json` includes per-lead: `Severity`, `Type`, `ExploitPrimitive`, `Path`, `Processes`, `Operations`, `DetailedReason`, `EffectivePrincipal`, `OperationDirection`, `SqosLevel`, `OpenReparsePoint`, `OpenLink`, `AnyPrivRead`, `AnyPrivWrite`, `AnyImpersonating`, plus the original `Detail`/`Integrity`/`Impersonating`/`TraceFile`/`Timestamp`/`Result`.
+
+`cognitive_review_queue.json` items have a `Hint` field (free-form text describing what the agent should look for) plus the same telemetry context. `FilterReason` is set when the analyzer demoted a finding (Paging-I/O, OpenReparsePoint always-set, OpenLink always-set, BenignReaderOnly).

@@ -467,6 +467,101 @@ app.post('/api/toggle-report', (req, res) => {
     }
 });
 
+// --- RESEARCH PROMPTS API ---
+
+// Catalog of agentic research prompts (Markdown files at the project root).
+// Each entry maps an exploitation primitive class to the prompt that an
+// operator should hand to a downstream research agent (Claude Code,
+// Antigravity, etc.).
+const RESEARCH_PROMPTS = [
+    {
+        id: 'lpe',
+        title: 'LPE (Local Privilege Escalation)',
+        file: 'LPE_Research_Prompt.md',
+        description: 'Reparse-point / REG_LINK / NTLM-coercion / oplock-junction primitives — medium IL → SYSTEM chains via privileged consumers of user-controllable namespaces.',
+        primitives: ['SMB_Coercion', 'Oplock_ArbitraryWrite', 'Pipe_Plant_Redirect', 'Pipe_Hijack', 'Registry_Coercion', 'Binary_Plant_HighPriv', 'Binary_Plant_UserSpace', 'SxS_DotLocal', 'Dependency_Hijack', 'Config_Poison', 'AppExecAlias_Plant', 'PowerShell_Profile', 'Electron_AsarTamper']
+    },
+    {
+        id: 'uac',
+        title: 'UAC Bypass',
+        file: 'UAC_Bypass_Research_Prompt.md',
+        description: 'Auto-elevating Microsoft binaries that consume user-controllable HKCU keys / env vars / per-user COM registrations. Medium IL → High IL.',
+        primitives: ['COM_Hijack_HKCU', 'Env_Hijack_HKCU']
+    },
+    {
+        id: 'rce_lateral',
+        title: 'RCE / Lateral Movement',
+        file: 'RCE_LateralMovement_Research_Prompt.md',
+        description: 'NTLM coercion + relay, credential capture, deserialization sinks, framework-config poisoning, web-shell planting.',
+        primitives: ['URL_NTLM_Coerce', 'Theme_NTLM_Coerce', 'DesktopIni_Coerce', 'WebShell_Plant', 'LNK_Hijack', 'Cert_Plant']
+    },
+    {
+        id: 'proxy',
+        title: 'Proxy Execution / LOLBins',
+        file: 'ProxyExecution_LOLBin_Research_Prompt.md',
+        description: 'Living-off-the-Land binary abuse: signed Microsoft binaries parsing writable files in ways that yield code execution past WDAC / AppLocker / SAC.',
+        primitives: ['LOLBin_Proxy', 'AutoRun_Persistence']
+    },
+    {
+        id: 'admin_kernel',
+        title: 'Admin → SYSTEM / Kernel',
+        file: 'AdminToSystemKernel_Research_Prompt.md',
+        description: 'High-IL admin → SYSTEM token, and SYSTEM → kernel primitives. Service hijacks, IFEO/AeDebug, scheduled-task plant, BYOVD.',
+        primitives: ['Service_BinaryPath', 'IFEO_Debugger', 'AeDebug', 'ScheduledTask_Plant']
+    }
+];
+
+// API: List available research prompts (catalog only — no body payload)
+app.get('/api/research-prompts', (req, res) => {
+    const list = RESEARCH_PROMPTS.map(p => {
+        const filePath = path.join(ROOT_DIR, p.file);
+        return {
+            id: p.id,
+            title: p.title,
+            file: p.file,
+            description: p.description,
+            primitives: p.primitives,
+            available: fs.existsSync(filePath)
+        };
+    });
+    res.json({ success: true, prompts: list });
+});
+
+// API: Fetch one prompt's body. Hardened to disallow ../ traversal.
+app.get('/api/research-prompts/:id', (req, res) => {
+    const entry = RESEARCH_PROMPTS.find(p => p.id === req.params.id);
+    if (!entry) return res.status(404).json({ error: 'Unknown prompt id' });
+
+    const filePath = path.join(ROOT_DIR, entry.file);
+    if (!filePath.startsWith(ROOT_DIR)) {
+        return res.status(400).json({ error: 'Path traversal denied' });
+    }
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Prompt file missing on disk' });
+    }
+    try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        res.json({ success: true, id: entry.id, title: entry.title, file: entry.file, content });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// API: Map an ExploitPrimitive (or list of them) → the best matching prompt id.
+// Used by the UI's "open research prompt for this lead" button.
+app.post('/api/research-prompts/match', (req, res) => {
+    const { primitive } = req.body || {};
+    if (!primitive) return res.status(400).json({ error: 'Missing primitive' });
+
+    const target = String(primitive).trim();
+    const match = RESEARCH_PROMPTS.find(p => p.primitives.includes(target));
+    if (match) return res.json({ success: true, id: match.id, title: match.title });
+
+    // Fallback: LPE prompt is the universal default for ambiguous leads.
+    const fallback = RESEARCH_PROMPTS.find(p => p.id === 'lpe');
+    res.json({ success: true, id: fallback.id, title: fallback.title, fallback: true });
+});
+
 // API: Save raw memory states back to disk
 app.post('/api/save-state', (req, res) => {
     let { project, highConfidence, cognitiveQueue } = req.body;

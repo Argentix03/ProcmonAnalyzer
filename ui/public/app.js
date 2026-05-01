@@ -463,9 +463,25 @@ document.addEventListener('DOMContentLoaded', () => {
             if(trimmed) procsContainer.innerHTML += `<span class="process-tag">${trimmed}</span>`;
         });
 
-        document.getElementById('modalReason').innerHTML = isCognitive 
-            ? `<strong>Agent Hint:</strong> ${item.Hint}` 
+        document.getElementById('modalReason').innerHTML = isCognitive
+            ? `<strong>Agent Hint:</strong> ${item.Hint}`
             : `<strong>Rule Matched:</strong> ${item.DetailedReason}`;
+
+        // Effective principal (LPE prompt §6 — whose NTLM hits the wire)
+        const effPrinEl = document.getElementById('modalEffectivePrincipal');
+        if (effPrinEl) {
+            if (item.EffectivePrincipal) {
+                effPrinEl.style.display = 'block';
+                effPrinEl.innerHTML = '<strong style="color:var(--accent);">Effective Principal:</strong> ' + item.EffectivePrincipal;
+            } else {
+                effPrinEl.style.display = 'none';
+            }
+        }
+
+        // Suggested research prompt (matches by ExploitPrimitive, falls back to LPE)
+        if (typeof refreshModalResearchPrompt === 'function') {
+            refreshModalResearchPrompt(item);
+        }
 
         if (item.Timestamp || item.TraceFile || item.Operation) {
             document.getElementById('modalMetadataGroup').style.display = 'block';
@@ -734,6 +750,168 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.getElementById('closeWarnModal').addEventListener('click', () => {
         document.getElementById('tokenWarnModal').classList.add('hidden');
+    });
+
+    // ─── RESEARCH PROMPTS ─────────────────────────────────────────────────
+    const promptSelect      = document.getElementById('promptSelect');
+    const promptCardList    = document.getElementById('promptCardList');
+    const promptViewer      = document.getElementById('promptViewer');
+    const promptViewerTitle = document.getElementById('promptViewerTitle');
+    const promptViewerFile  = document.getElementById('promptViewerFile');
+    const promptBody        = document.getElementById('promptBody');
+    const promptCopyBtn     = document.getElementById('promptCopyBtn');
+    const promptDownloadBtn = document.getElementById('promptDownloadBtn');
+    let researchPromptCatalog = [];
+    let activePromptContent   = '';
+    let activePromptFilename  = '';
+
+    function renderPromptCards(catalog) {
+        promptCardList.innerHTML = '';
+        if (!catalog || catalog.length === 0) {
+            promptCardList.innerHTML = '<div class="empty-state">No research prompts registered on the server.</div>';
+            return;
+        }
+        catalog.forEach(p => {
+            const card = document.createElement('div');
+            card.style.background = 'var(--bg-card)';
+            card.style.border = '1px solid var(--border)';
+            card.style.borderRadius = '8px';
+            card.style.padding = '14px';
+            card.style.cursor = 'pointer';
+            card.style.transition = 'border-color 0.15s, transform 0.1s';
+
+            const status = p.available
+                ? '<span style="color:#50fa7b; font-size:0.78rem;">●</span>'
+                : '<span style="color:#f03e3e; font-size:0.78rem;" title="File missing on disk">●</span>';
+
+            const primChips = (p.primitives || []).map(x =>
+                '<span style="background:rgba(94,106,210,0.15); color:var(--accent); padding:2px 8px; border-radius:3px; font-size:0.72rem; margin-right:4px; display:inline-block; margin-bottom:4px; font-family: monospace;">' + x + '</span>'
+            ).join('');
+
+            card.innerHTML =
+                '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">' +
+                '  <div style="flex:1; min-width:0;">' +
+                '    <div style="font-weight:600; font-size:1rem; color:var(--text-main);">' + status + ' ' + p.title + '</div>' +
+                '    <div style="font-size:0.82rem; color:var(--text-muted); margin-top:6px; line-height:1.5;">' + p.description + '</div>' +
+                '    <div style="margin-top:10px;">' + primChips + '</div>' +
+                '  </div>' +
+                '  <div style="font-size:0.7rem; color:var(--text-muted); font-family: monospace;">' + p.file + '</div>' +
+                '</div>';
+
+            card.addEventListener('mouseenter', () => { card.style.borderColor = 'var(--accent)'; });
+            card.addEventListener('mouseleave', () => { card.style.borderColor = 'var(--border)'; });
+            card.addEventListener('click', () => loadPrompt(p.id));
+
+            promptCardList.appendChild(card);
+        });
+    }
+
+    function loadPromptCatalog() {
+        return fetch('/api/research-prompts')
+            .then(r => r.json())
+            .then(data => {
+                if (!data.success) return;
+                researchPromptCatalog = data.prompts || [];
+                promptSelect.innerHTML = '';
+                const opt0 = document.createElement('option');
+                opt0.value = '';
+                opt0.textContent = '— Select prompt —';
+                promptSelect.appendChild(opt0);
+                researchPromptCatalog.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p.id;
+                    opt.textContent = p.title + (p.available ? '' : ' (file missing)');
+                    promptSelect.appendChild(opt);
+                });
+                renderPromptCards(researchPromptCatalog);
+            })
+            .catch(() => {
+                promptSelect.innerHTML = '<option>Failed to load</option>';
+                promptCardList.innerHTML = '<div class="empty-state">Failed to load research prompts.</div>';
+            });
+    }
+
+    function loadPrompt(id) {
+        if (!id) {
+            promptViewer.classList.add('hidden');
+            return;
+        }
+        promptSelect.value = id;
+        return fetch('/api/research-prompts/' + encodeURIComponent(id))
+            .then(r => r.json())
+            .then(data => {
+                if (!data.success) {
+                    alert('Failed to load prompt: ' + (data.error || 'unknown error'));
+                    return;
+                }
+                activePromptContent  = data.content || '';
+                activePromptFilename = data.file || (id + '.md');
+                promptViewerTitle.textContent = data.title || id;
+                promptViewerFile.textContent  = data.file  || '';
+                promptBody.textContent        = activePromptContent;
+                promptViewer.classList.remove('hidden');
+                promptViewer.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            });
+    }
+
+    promptSelect.addEventListener('change', (e) => loadPrompt(e.target.value));
+
+    promptCopyBtn.addEventListener('click', () => {
+        if (!activePromptContent) return;
+        navigator.clipboard.writeText(activePromptContent).then(() => {
+            const orig = promptCopyBtn.textContent;
+            promptCopyBtn.textContent = 'Copied ✓';
+            setTimeout(() => { promptCopyBtn.textContent = orig; }, 1500);
+        }).catch(err => alert('Clipboard write failed: ' + err.message));
+    });
+
+    promptDownloadBtn.addEventListener('click', () => {
+        if (!activePromptContent || !activePromptFilename) return;
+        const blob = new Blob([activePromptContent], { type: 'text/markdown' });
+        const url  = URL.createObjectURL(blob);
+        const a    = document.createElement('a');
+        a.href = url; a.download = activePromptFilename;
+        document.body.appendChild(a); a.click();
+        document.body.removeChild(a); URL.revokeObjectURL(url);
+    });
+
+    // Auto-load catalog at startup
+    loadPromptCatalog();
+
+    // Per-lead "Open research prompt" button (lives in the details modal)
+    const modalResearchPromptRow  = document.getElementById('modalResearchPromptRow');
+    const modalResearchPromptName = document.getElementById('modalResearchPromptName');
+    const modalOpenResearchBtn    = document.getElementById('modalOpenResearchBtn');
+    let pendingPromptIdForModal   = null;
+
+    function refreshModalResearchPrompt(item) {
+        const primitive = item && item.ExploitPrimitive ? item.ExploitPrimitive : '';
+        if (!primitive) {
+            modalResearchPromptRow.style.display = 'none';
+            return;
+        }
+        fetch('/api/research-prompts/match', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ primitive })
+        }).then(r => r.json()).then(data => {
+            if (data.success) {
+                modalResearchPromptName.textContent = data.title + (data.fallback ? ' (default)' : '');
+                pendingPromptIdForModal = data.id;
+                modalResearchPromptRow.style.display = 'flex';
+            } else {
+                modalResearchPromptRow.style.display = 'none';
+            }
+        }).catch(() => { modalResearchPromptRow.style.display = 'none'; });
+    }
+
+    modalOpenResearchBtn.addEventListener('click', () => {
+        if (!pendingPromptIdForModal) return;
+        document.getElementById('detailsModal').classList.add('hidden');
+        // Switch to the Research Prompts tab and load the matched prompt
+        const targetTab = document.querySelector('.tab[data-target="promptsPanel"]');
+        if (targetTab) targetTab.click();
+        loadPrompt(pendingPromptIdForModal);
     });
 
     document.getElementById('proceedAiBtn').addEventListener('click', async () => {

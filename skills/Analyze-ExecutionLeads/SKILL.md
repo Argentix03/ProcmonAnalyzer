@@ -1,153 +1,102 @@
 ---
 name: Analyze-ExecutionLeads
-description: Triages writable path feeds via hybrid heuristic + cognitive model, covering 10+ low-privilege exploitation primitives.
+description: Triages writable-path feeds via hybrid heuristic + cognitive model, covering 20+ low-privilege exploitation primitives across LPE / UAC bypass / RCE-Lateral / Proxy-Execution / Admin-to-System families, with built-in suppression for the LPE-prompt §2 / §9 false-positive classes.
 ---
 # Analyze-ExecutionLeads
 
-This skill dictates how to process ProcMon/ETW path dumps using a hybrid Script + Agent model. The analysis is framed from the perspective of a **standard low-privilege user with no special privileges** (no `SeImpersonatePrivilege`, no admin rights).
+This skill processes ProcMon/ETW path dumps using a hybrid Script + Agent model. The analysis is framed from the perspective of a **standard low-privilege user with no special privileges** (no `SeImpersonatePrivilege`, no admin rights).
 
 ## Workflow
 
-1. **Invoke the Heuristic Triage Script:** 
-   Execute `scripts/AnalyzeExecutionLeads.ps1 -JsonFeed writable_paths.json` to evaluate structurally obvious vulnerabilities across all known exploitation primitives.
-   
-2. **Review High Confidence Baseline:**
-   The script outputs `high_confidence_leads.json` with deterministic findings. Each finding includes:
-   - `ExploitPrimitive`: canonical attack name (see taxonomy below)
-   - `OperationDirection`: `Read` or `Write` — determines which kill chain applies
-   - `SqosLevel`: Security Quality of Service from Procmon Detail field
-   - `Severity`, `Type`, `DetailedReason`: human-readable classification
-
-3. **Cognitive Agent Evaluation:**
-   The script pushes ambiguous items to `cognitive_review_queue.json`.
-   **YOUR JOB AS THE AGENT:**
-   - Read `cognitive_review_queue.json` in chunks (up to 500 lines).
+1. **Invoke the heuristic triage script:** Execute `scripts/AnalyzeExecutionLeads.ps1 -JsonFeed writable_paths.json` to evaluate structurally obvious primitives.
+2. **Review high-confidence baseline:** `high_confidence_leads.json` — each finding includes `ExploitPrimitive`, `OperationDirection`, `SqosLevel`, `EffectivePrincipal`, `OpenReparsePoint`, `OpenLink`, `AnyPrivRead`, `AnyPrivWrite`, `Severity`, `Type`, `DetailedReason`.
+3. **Cognitive agent evaluation:** ambiguous items go to `cognitive_review_queue.json`. **YOUR JOB AS THE AGENT:**
+   - Read `cognitive_review_queue.json` in chunks (≤500 lines).
    - Evaluate each entry against the **Exploitation Primitive Taxonomy** below.
-   - Pay special attention to `OperationDirection` and `SqosLevel` fields.
-   - You are looking for exploitable patterns that the heuristic rules couldn't match structurally.
+   - Pay special attention to `OperationDirection`, `SqosLevel`, `EffectivePrincipal`, `OpenReparsePoint`, and `OpenLink`.
+4. **Formulate the report.** Combine `high_confidence_leads.json` and your cognitive findings into `Execution_Leads_Report.md`. Every finding MUST be formatted as an unchecked Markdown task list item. Example:
 
-4. **Formulate the Report:**
-   Combine `high_confidence_leads.json` and your cognitive findings into `Execution_Leads_Report.md`.
-   
-   **CRITICAL REPORT STRUCTURE:**
-   Every finding MUST be formatted as an unchecked Markdown task list item:
+   ```markdown
    - [ ] [Critical] **Path:** `C:\Program Files\App\Core.dll`
      - **Exploit Primitive:** `Binary_Plant_HighPriv`
      - **Processes:** svchost.exe
-     - **Trace Source:** BootLog.csv | **Time:** 12:44:01 
+     - **Trace Source:** BootLog.csv | **Time:** 12:44:01
      - **Event Context:** Operation: CreateFile (Read) | Result: NAME NOT FOUND | Integrity: System
+     - **Effective Principal:** Pure SYSTEM (MACHINE$ NTLMv2 — uncrackable but relayable to LDAP/SMB)
      - **SQOS:** NotSpecified (dangerous default)
      - **Analysis:** Direct hijacking of an executable component inside a privileged hierarchy. No privileges required.
+     - **Suggested Research Prompt:** `LPE_Research_Prompt.md`
+   ```
+
+5. **Recommend research follow-up.** For each `EXPLOITABLE`-suspect lead, point the operator at the matching Markdown research prompt at the project root (`LPE_Research_Prompt.md`, `UAC_Bypass_Research_Prompt.md`, `RCE_LateralMovement_Research_Prompt.md`, `ProxyExecution_LOLBin_Research_Prompt.md`, `AdminToSystemKernel_Research_Prompt.md`). The UI also exposes a **Research Prompts** panel that lets the operator copy the prompt into a new agent context.
 
 ---
 
 ## Low-Privilege Attacker Model
 
 All analysis assumes the attacker is a **standard local user** with:
-- ❌ No `SeImpersonatePrivilege`
-- ❌ No admin group membership
-- ❌ No debug privileges
-- ✅ Can create NTFS junctions (no special privilege needed)
-- ✅ Can create files/directories in writable paths
+
+- ❌ No `SeImpersonatePrivilege`, no admin group membership, no debug privileges
+- ✅ Can create NTFS junctions, OM symlinks (in `\RPC Control\`, per-session DosDevices)
+- ✅ Can plant `REG_LINK`s in their own hive
 - ✅ Can set oplocks on files they own
-- ✅ Can run a named pipe server
-- ✅ Can run a local SMB/HTTP listener for NTLM capture
-- ✅ Can crack captured Net-NTLMv2 hashes offline
+- ✅ Can run a named-pipe server, local SMB/HTTP listener, Responder
+- ✅ Can crack captured Net-NTLMv2 hashes offline (hashcat -m 5600)
+
+---
+
+## Built-in False-Positive Suppression (LPE prompt § 2 / § 9)
+
+The script drops or demotes leads on the following patterns BEFORE writing the high-confidence queue:
+
+1. **Paging-I/O / kernel-thread attribution** — Cache Manager dirty-page flush, attribution unreliable (LPE §2).
+2. **Open Reparse Point set on every observed open** — consumer is using `FILE_FLAG_OPEN_REPARSE_POINT` correctly. Demoted to cognitive queue with hint "look elsewhere in the code path for an open missing the flag" (LPE §2).
+3. **REG_OPTION_OPEN_LINK set on every observed open** — same logic for registry coercion candidates.
+4. **User-only-consumer** — every observed actor is the current user's own session and no privileged actor touched the path. The redirect cannot reach anywhere the user can't reach already (LPE §9).
+5. **Benign-readers-only** — when the only actors are AV/Search indexers (`MsMpEng.exe`, `SearchProtocolHost.exe`, `MsSense.exe`, etc.) and they only read, the lead is "Defender scanned the file" — demoted unless a non-indexer privileged process also touches the path.
+6. **LOLBin extension mismatch** — `powershell.exe` → `~/Downloads/` no longer fires the LOLBin-proxy rule; only file extensions the LOLBin actually parses (`.ps1`/`.psm1`/`.psd1`/`.ps1xml` for PowerShell, `.dll`/`.ocx`/`.cpl` for rundll32, etc.) escalate severity.
+7. **Self-trace contamination** — already filtered upstream by `Parse-ProcmonWriteables`.
 
 ---
 
 ## Exploitation Primitive Taxonomy
 
-### READ-PATH Primitives (privileged process READS from writable path)
+### READ-PATH (privileged consumer reads from a writable path)
 
-#### 1. SMB / NTLM Coercion (`SMB_Coercion`)
-- **Trigger:** High-integrity process reads from user-writable directory
-- **Attack:** Plant NTFS junction → `\\attacker-ip\share`. Kernel follows junction. Privileged process authenticates via NTLM to attacker's listener.
-- **Result:** Net-NTLMv2 hash captured. Crack offline (hashcat -m 5600) or relay to another service (ntlmrelayx.py → LDAP/SMB/HTTP).
-- **Privileges needed:** NONE. Standard users can create junctions.
-- **Severity:** Critical
-- **Look for in cognitive review:** Any privileged read from `%ProgramData%`, `%TEMP%`, or any path confirmed writable. Even `.log` or `.tmp` paths count — the file content doesn't matter, only the path traversal.
+| Primitive | Trigger | Attack | Reference Prompt |
+|---|---|---|---|
+| `SMB_Coercion` | High-IL process reads writable dir | NTFS junction → drive-letter → UNC chain (LPE §3.5) | `LPE_Research_Prompt.md`, `RCE_LateralMovement_Research_Prompt.md` |
+| `Binary_Plant_HighPriv` / `Binary_Plant_UserSpace` | `.exe`/`.dll`/`.sys` / etc. in writable dir | Replace; loaded by High/SYSTEM = code exec at integrity | `LPE_Research_Prompt.md` |
+| `Pipe_Plant_Redirect` | NAME NOT FOUND from privileged process | Symlink → `\\.\pipe\<own>` for relay/Identification | `LPE_Research_Prompt.md`, `RCE_LateralMovement_Research_Prompt.md` |
+| `Config_Poison` | `.config`/`.xml`/`.json` read by framework host | `assemblyBinding`, `machineKey`, XXE, type-confusion deserialization | `LPE_Research_Prompt.md`, `ProxyExecution_LOLBin_Research_Prompt.md` |
+| `SxS_DotLocal` | `.manifest`/`.local` writable | DLL load-order hijack | `LPE_Research_Prompt.md` |
+| `Dependency_Hijack` | writable `node_modules`/`site-packages`/`vendor`/`gems`/Cargo registry | Replace package | `LPE_Research_Prompt.md` |
+| `Registry_Coercion` | High-IL `RegOpenKey` etc. on `HKCU` / `HKU\<SID>` without `REG_OPTION_OPEN_LINK` | Plant REG_LINK; CVE-2014-6322 archetype | `LPE_Research_Prompt.md`, `UAC_Bypass_Research_Prompt.md` |
+| `COM_Hijack_HKCU` | `HKCU\Software\Classes\CLSID\{...}` | Plant `InprocServer32` | `UAC_Bypass_Research_Prompt.md` |
+| `Env_Hijack_HKCU` | `HKCU\Environment` — esp. `windir`/`SystemRoot`/`Path`/`PSModulePath` | SilentCleanup-class auto-elevation hijack | `UAC_Bypass_Research_Prompt.md` |
+| `AppExecAlias_Plant` | `%LocalAppData%\Microsoft\WindowsApps\` writable + on PATH | Drop `notepad.exe`/`wt.exe`/etc. shadow | `LPE_Research_Prompt.md` |
+| `PowerShell_Profile` | `Documents\PowerShell\*.ps1` writable | Auto-loaded on every shell start | `LPE_Research_Prompt.md`, `AdminToSystemKernel_Research_Prompt.md` |
+| `Electron_AsarTamper` | `\resources\app.asar` writable | Unpack/repack; Electron sig doesn't cover .asar | `LPE_Research_Prompt.md` |
+| `URL_NTLM_Coerce` / `Theme_NTLM_Coerce` / `DesktopIni_Coerce` | writable shortcuts/themes/desktop.ini | Set Icon/Wallpaper to UNC for NTLM coercion | `RCE_LateralMovement_Research_Prompt.md` |
 
-#### 2. DLL / Binary Hijacking (`Binary_Plant_HighPriv`, `Binary_Plant_UserSpace`)
-- **Trigger:** Process loads `.dll`/`.exe`/`.sys` from writable path
-- **Attack:** Replace binary with attacker's. Process loads attacker code.
-- **Result:** Code execution at the loading process's integrity level.
-- **Privileges needed:** NONE. Just write access to the directory.
-- **Severity:** Critical if in System32/ProgramFiles, High otherwise
+### WRITE-PATH (privileged consumer writes to a writable path)
 
-#### 3. Pipe Planting via Path Redirection (`Pipe_Plant_Redirect`)
-- **Trigger:** High-integrity process opens a **non-existent file path** (`Result: NAME NOT FOUND`)
-- **Attack:** Plant NTFS symlink from that path to `\\.\pipe\attacker_pipe`. Process connects as pipe client.
-- **Without SeImpersonatePrivilege:** Cannot call `ImpersonateNamedPipeClient()` for token. BUT:
-  - Can relay the NTLM auth embedded in the pipe connection
-  - Can query token at Identification level (enumerate SIDs, groups)
-  - Can deny service by holding the pipe open
-- **SQOS matters:** Check `SqosLevel` field. `NotSpecified` = dangerous default (Impersonation level for local pipes). `Identification` = relay still works. `Anonymous` = limited value.
-- **Severity:** Critical if SQOS absent/Impersonation, High if Identification, Medium if Anonymous
+| Primitive | Trigger | Attack | Reference Prompt |
+|---|---|---|---|
+| `Oplock_ArbitraryWrite` | High-IL process writes to writable path | Exclusive oplock + junction swap → write lands in System32/Tasks/etc. | `LPE_Research_Prompt.md`, `AdminToSystemKernel_Research_Prompt.md` |
+| `Service_BinaryPath` | `HKLM\...\Services\<name>\ImagePath` writable (ACL anomaly) | Direct service hijack | `AdminToSystemKernel_Research_Prompt.md` |
+| `IFEO_Debugger` / `AeDebug` | `HKLM\...\IFEO\<exe>\Debugger` or `AeDebug\Debugger` writable | Target EXE launches your debugger | `AdminToSystemKernel_Research_Prompt.md` |
+| `ScheduledTask_Plant` | `\System32\Tasks\<task>` XML writable | Rewrite `<Command>`; runs at task's principal | `AdminToSystemKernel_Research_Prompt.md` |
 
-#### 4. Config Poisoning (`Config_Poison`)
-- **Trigger:** Framework host process (w3wp, svchost, dotnet) reads `.config`/`.xml` from writable path
-- **Attack vectors:**
-  - `.NET config:` Inject `<assemblyBinding>` to redirect DLL loads to attacker assembly
-  - `.NET config:` Add `<machineKey>` for ViewState deserialization RCE
-  - `XML files:` XXE (XML External Entity) to read local files or trigger SMB auth
-  - `applicationHost.config:` Redirect IIS virtual directories
-- **Privileges needed:** NONE
-- **Severity:** Critical for .NET configs, High for generic XML
+### EXECUTION (no privileged consumer needed)
 
-#### 5. SxS / DotLocal Manifest Poisoning (`SxS_DotLocal`)
-- **Trigger:** `.manifest` or `.local` file in writable directory
-- **Attack:** Drop `.local` directory next to target EXE → DLL load order hijack
-- **Privileges needed:** NONE
-
-#### 6. Dependency Package Subversion (`Dependency_Hijack`)
-- **Trigger:** Writable `node_modules/`, `site-packages/`, `vendor/`, `gems/`
-- **Attack:** Replace any package with trojanized version
-- **Privileges needed:** NONE
-
-#### 7. Registry Path Coercion (`Registry_Coercion`)
-- **Trigger:** High-integrity process opens/creates a key in `HKCU` or `HKU\<SID>` without `REG_OPTION_OPEN_LINK`.
-- **Attack:** Plant a `REG_LINK` (registry symbolic link) to redirect the registry access to a different, attacker-controlled key within the user's hive.
-- **Result:** Context-dependent. Can result in privileged config poisoning, CLSID (COM) hijacking, or arbitrary registry write via TOCTOU.
-- **Privileges needed:** NONE. A standard medium-IL user can create `REG_LINK`s.
-- **Severity:** Critical
-- **Look for in cognitive review:** Any `RegOpenKey`, `RegCreateKey`, or `RegQueryValue` by a SYSTEM process against `HKCU` or `HKEY_USERS\<SID>`. Ensure `Open Link` is missing from the Options/Detail fields.
-
-### WRITE-PATH Primitives (privileged process WRITES to writable path)
-
-#### 8. Arbitrary Write via Oplock + Junction (`Oplock_ArbitraryWrite`)
-- **Trigger:** High-integrity process WRITES to user-writable path
-- **Attack:** Set oplock on target file → oplock fires when process opens file → attacker swaps NTFS junction → write lands in arbitrary privileged location (System32, drivers, etc.)
-- **Result:** Arbitrary file write as SYSTEM. Can drop DLLs into System32, modify hosts file, plant scheduled tasks.
-- **Privileges needed:** NONE. Standard users can set oplocks and create junctions.
-- **Severity:** Critical
-- **Best targets:** `.tmp`, `.log`, `.cache`, `.bak` files that are written repeatedly (reliable trigger). One-shot writes are harder to race.
-- **Look for in cognitive review:** ANY `WriteFile` or `SetDisposition` from a SYSTEM process to a writable path. The file content is irrelevant — it's the write operation itself that's the weapon.
-
-### EXECUTION Primitives (no privileged process required)
-
-#### 9. AutoRun / Script Persistence (`AutoRun_Persistence`)
-- **Trigger:** Writable `.bat`/`.ps1`/`.vbs`/`.cmd` or Startup/Tasks directories
-- **Privileges needed:** NONE
-
-#### 10. Web Shell Planting (`WebShell_Plant`)
-- **Trigger:** Writable webroot + script extension
-- **Privileges needed:** NONE
-
-#### 11. LNK Shortcut Hijacking (`LNK_Hijack`)
-- **Trigger:** Writable `.lnk` shortcuts
-- **Attack:** Modify target field to redirect execution
-- **Privileges needed:** NONE
-
-#### 12. Certificate Store Planting (`Cert_Plant`)
-- **Trigger:** Writable cert files (`.cer`/`.pfx`/`.p12`) or crypto store directories
-- **Attack:** Inject trusted root CA for MitM, or code-signing cert to bypass signature verification
-- **Privileges needed:** NONE to write; system impact depends on cert store location
-
-#### 13. LOLBin Proxy (`LOLBin_Proxy`)
-- **Trigger:** File accessed by a Living-off-the-Land binary
-- **Attack:** Depends on specific LOLBin parsing behavior
-- **Privileges needed:** NONE
+| Primitive | Trigger | Reference Prompt |
+|---|---|---|
+| `AutoRun_Persistence` | `.bat`/`.ps1`/`.vbs`/Startup/Run/Tasks | `ProxyExecution_LOLBin_Research_Prompt.md` |
+| `WebShell_Plant` | webroot + script extension | `RCE_LateralMovement_Research_Prompt.md` |
+| `LNK_Hijack` | writable `.lnk` | `RCE_LateralMovement_Research_Prompt.md` |
+| `Cert_Plant` | `.cer`/`.pfx`/etc. or AuthRoot store | `RCE_LateralMovement_Research_Prompt.md` |
+| `LOLBin_Proxy` | extension parsed by signed binary | `ProxyExecution_LOLBin_Research_Prompt.md` |
 
 ---
 
@@ -169,11 +118,22 @@ Most Windows services do NOT set SQOS flags, meaning the dangerous default appli
 
 ## Operation Direction Guide
 
-The `OperationDirection` field tells you which kill chain applies:
-
 | Direction | Low-Priv Kill Chain |
 |-----------|-------------------|
-| **Read** | SMB coercion (junction → UNC), DLL hijack, config poison, pipe plant |
+| **Read** | SMB coercion, DLL hijack, config poison, pipe plant |
 | **Write** | Oplock+junction arbitrary write, log/cache poisoning |
+| **Read+Write (same path)** | TOCTOU race window — LPE §3.7 oplock primitive applies directly |
 
-**Critical insight:** A privileged WRITE to a writable path is often MORE dangerous than a read, because the oplock+junction primitive gives you arbitrary file write as SYSTEM — the most powerful escalation primitive available to a standard user.
+**Critical insight:** A privileged WRITE to a writable path is often MORE dangerous than a read because the oplock+junction primitive yields arbitrary file write as SYSTEM — the most powerful escalation primitive available to a standard user.
+
+---
+
+## Effective Principal — Whose NTLM Hits the Wire
+
+The `EffectivePrincipal` field is computed once per lead and tells you exactly which credential class lands on the disk / registry / SMB share at the moment of I/O. This is **mandatory** for any credential-coercion verdict (LPE prompt §6).
+
+| Effective Principal | What you capture |
+|---|---|
+| `Impersonating <user>` | User's NTLMv2 (crackable, relayable) |
+| `Pure SYSTEM` | `MACHINE$` NTLMv2 (uncrackable; relayable to LDAP / SMB / HTTP) |
+| `Token: High` | The launching user's NTLMv2 |
