@@ -562,6 +562,63 @@ app.post('/api/research-prompts/match', (req, res) => {
     res.json({ success: true, id: fallback.id, title: fallback.title, fallback: true });
 });
 
+// --- RESEARCH-LEAD SKILL API ---
+// Stages per-lead Execution_Lead_N\ workspaces by invoking
+// skills/Research-Lead/scripts/Start-LeadResearch.ps1. Hard-gated: requires
+// `confirmed: true`, a snapshot string, and a guiDriver string in the body.
+// Refuses to run otherwise. Does NOT execute exploitation steps; only stages
+// the workspace + manifests. The actual research is performed by an agent
+// reading each lead's manifest.json.
+app.post('/api/research/stage', (req, res) => {
+    const { project, confirmed, snapshot, guiDriver, minSeverity, maxLeads } = req.body || {};
+    if (!confirmed) {
+        return res.status(400).json({
+            error: 'Confirmation required. Set confirmed:true after the user has read the destructive-action warning, and supply snapshot + guiDriver.'
+        });
+    }
+    if (!snapshot || !guiDriver) {
+        return res.status(400).json({ error: 'Both snapshot and guiDriver are required when confirmed:true.' });
+    }
+
+    const activeProject = (project || 'Default_Project').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const projPath = path.join(PROJECTS_DIR, activeProject);
+    const leadsJson = path.join(projPath, 'high_confidence_leads.json');
+    if (!fs.existsSync(leadsJson)) {
+        return res.status(404).json({ error: 'high_confidence_leads.json not found for this project.' });
+    }
+
+    const script = path.join(ROOT_DIR, 'skills', 'Research-Lead', 'scripts', 'Start-LeadResearch.ps1');
+    if (!fs.existsSync(script)) {
+        return res.status(500).json({ error: 'Research-Lead skill is missing. Did you pull the latest skills/ tree?' });
+    }
+
+    const args = [
+        '-ExecutionPolicy', 'Bypass',
+        '-File', script,
+        '-LeadsJson', leadsJson,
+        '-OutputRoot', projPath,
+        '-MinSeverity', (minSeverity || 'High'),
+        '-MaxLeads', String(maxLeads || 10),
+        '-Snapshot', snapshot,
+        '-GuiDriver', guiDriver,
+        '-Confirmed'
+    ];
+
+    const ps = spawn('powershell.exe', args, { cwd: ROOT_DIR });
+    let stdout = '';
+    let stderr = '';
+    ps.stdout.on('data', d => stdout += d.toString());
+    ps.stderr.on('data', d => stderr += d.toString());
+    ps.on('close', (code) => {
+        if (code !== 0) {
+            return res.status(500).json({ error: 'Stage script failed.', code, stdout, stderr });
+        }
+        const statePath = path.join(projPath, '_research_state.json');
+        const state = fs.existsSync(statePath) ? readSafeJson(statePath) : null;
+        res.json({ success: true, code, stdout, stderr, state });
+    });
+});
+
 // API: Save raw memory states back to disk
 app.post('/api/save-state', (req, res) => {
     let { project, highConfidence, cognitiveQueue } = req.body;

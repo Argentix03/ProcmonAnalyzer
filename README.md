@@ -14,7 +14,7 @@ It is built specifically to *not* miss good leads and *not* spam you with the we
 2. **Parse** (`Parse-ProcmonWriteables` skill) — best-event scoring per path; capture SQOS, Open Reparse Point, Open Link, Impersonating, Operations[]; canonicalize paths; filter self-trace contamination.
 3. **Analyze** (`Analyze-ExecutionLeads` skill) — heuristic primitives + cognitive queue. Suppresses Paging-I/O / kernel attribution, demotes `Open Reparse Point`/`Open Link` always-set, drops user-only-consumer noise, gates LOLBin matches by extension.
 4. **Triage in UI** — sortable lead lists, per-lead modal showing effective principal and the matched research prompt.
-5. **Research** — operator hands the matched prompt to an agent that produces `Execution_Lead_N\VERDICT_*.txt` with proof.
+5. **Research** *(optional, gated)* — `Research-Lead` skill stages per-lead workspaces and dispatches a research subagent against the matching prompt. **Destructive**: confirmed snapshotted-VM only.
 
 ## Features
 
@@ -81,6 +81,27 @@ Each lead's `ExploitPrimitive` maps to one of five Markdown research prompts at 
 | `AdminToSystemKernel_Research_Prompt.md` | `Service_BinaryPath`, `IFEO_Debugger`, `AeDebug`, `ScheduledTask_Plant` |
 
 In the UI, the **Research Prompts** tab lists, displays, and copies these prompts. Each lead's details modal shows a "Suggested research prompt" row with a one-click jump.
+
+## Optional final step: `Research-Lead` skill
+
+After the report is produced, the agent-driven workflow can run the optional `skills/Research-Lead/SKILL.md`. It:
+
+- **Asks for explicit confirmation** before doing anything (the skill is hard-gated; nothing happens without `-Confirmed` and a snapshot reference).
+- **Stages `Execution_Lead_N\` workspaces** under the project root, each with a `manifest.json` carrying the lead record, the matched research prompt, the snapshot ID, and the GUI-driver choice. A research subagent then reads the prompt verbatim and produces the per-lead deliverables (`VERDICT_*.txt`, `Setup/Reproduce/Restore_LeadN.ps1`, `Evidence_LeadN.txt`, proof artefact).
+
+> **WARNING — destructive workflow.** The research prompts plant junctions / OM symlinks / REG_LINKs / oplocks, attach debuggers, can disable AV, and (for the kernel prompt) load test-signed drivers that may BSOD. **Do not run on a production host.** The trace can be captured on any machine, but the research must run on a **snapshotted Windows VM** with a known-good revert point — ideally not the same host the trace originated from. If it must be the same host, that host MUST itself be a snapshotted VM you control.
+
+### GUI-driver MCPs (optional but recommended for secure-desktop work)
+
+Several research tasks need to drive the **secure desktop** (UAC consent.exe, Winlogon, lock screen) — surfaces invisible to in-guest user-session automation.
+
+| Option | Reaches secure desktop? | Notes |
+|---|---|---|
+| [`SystemAccessMCP`](https://github.com/Argentix03/SystemAccessMCP) | **Yes** — `HostHyperV` profile drives the guest VM through VMConnect from the host | Recommended. Two profiles (`GuestDesktop` / `HostHyperV`) are already referenced by name in `LPE_Research_Prompt.md`. Three transports (stdio, HTTP, MCP-over-HTTP). |
+| [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) | No — user session only | Strong fallback for in-guest work. Exposes the UI Automation tree (more reliable than blind screenshot+vision). |
+| Claude Code Desktop **Computer Use** (built-in 2026, Pro/Max) | No — user session only | Lowest friction; toggle in **Settings → General → Desktop app → Computer use**. |
+
+If no GUI-driver is available, the agent falls back to manual user steps for any secure-desktop interaction and notes those steps as `# MANUAL: …` in the lead's `Reproduce_LeadN.ps1`.
 
 ## Output JSON shapes (for agentic consumers)
 

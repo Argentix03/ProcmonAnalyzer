@@ -30,6 +30,10 @@ This skill processes ProcMon/ETW path dumps using a hybrid Script + Agent model.
 
 5. **Recommend research follow-up.** For each `EXPLOITABLE`-suspect lead, point the operator at the matching Markdown research prompt at the project root (`LPE_Research_Prompt.md`, `UAC_Bypass_Research_Prompt.md`, `RCE_LateralMovement_Research_Prompt.md`, `ProxyExecution_LOLBin_Research_Prompt.md`, `AdminToSystemKernel_Research_Prompt.md`). The UI also exposes a **Research Prompts** panel that lets the operator copy the prompt into a new agent context.
 
+6. **Offer the OPTIONAL `Research-Lead` skill.** After producing the report, ask the user: *"Want me to run the optional `Research-Lead` skill on the top leads? It is destructive and must run on a snapshotted VM (ideally **not** the same host the trace was captured from). I will not start it without your explicit go-ahead."*
+   - If the user confirms, hand off to `skills/Research-Lead/SKILL.md`. That skill enforces its own confirmation gate (warning text, snapshot reference, GUI-driver choice) before staging any per-lead workspace.
+   - If the user declines, finish here. The report + JSON queues are sufficient for the operator to drive research themselves later.
+
 ---
 
 ## Low-Privilege Attacker Model

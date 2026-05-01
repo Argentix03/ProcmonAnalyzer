@@ -878,6 +878,89 @@ document.addEventListener('DOMContentLoaded', () => {
     // Auto-load catalog at startup
     loadPromptCatalog();
 
+    // ─── RESEARCH STAGE (destructive workflow, hard-gated) ─────────────────
+    const stageResearchBtn        = document.getElementById('stageResearchBtn');
+    const researchStageModal      = document.getElementById('researchStageModal');
+    const closeResearchStageModal = document.getElementById('closeResearchStageModal');
+    const researchAck             = document.getElementById('researchAcknowledgeCheckbox');
+    const researchSnapshotInput   = document.getElementById('researchSnapshotInput');
+    const researchGuiDriverSelect = document.getElementById('researchGuiDriverSelect');
+    const researchMinSeveritySel  = document.getElementById('researchMinSeveritySelect');
+    const researchMaxLeadsInput   = document.getElementById('researchMaxLeadsInput');
+    const researchStageProceedBtn = document.getElementById('researchStageProceedBtn');
+    const researchStageResult     = document.getElementById('researchStageResult');
+
+    function refreshResearchProceedState() {
+        const ok = researchAck.checked
+                && researchSnapshotInput.value.trim().length > 0
+                && researchGuiDriverSelect.value.length > 0;
+        researchStageProceedBtn.disabled = !ok;
+        researchStageProceedBtn.style.cursor = ok ? 'pointer' : 'not-allowed';
+        researchStageProceedBtn.style.opacity = ok ? '1' : '0.5';
+    }
+    researchAck.addEventListener('change', refreshResearchProceedState);
+    researchSnapshotInput.addEventListener('input', refreshResearchProceedState);
+    researchGuiDriverSelect.addEventListener('change', refreshResearchProceedState);
+
+    if (stageResearchBtn) {
+        stageResearchBtn.addEventListener('click', () => {
+            if (!dataHighConf || dataHighConf.length === 0) {
+                alert('No high-confidence leads loaded. Run a trace first.');
+                return;
+            }
+            researchStageResult.classList.add('hidden');
+            researchStageResult.textContent = '';
+            researchAck.checked = false;
+            researchSnapshotInput.value = '';
+            refreshResearchProceedState();
+            researchStageModal.classList.remove('hidden');
+        });
+    }
+    closeResearchStageModal.addEventListener('click', () => researchStageModal.classList.add('hidden'));
+    researchStageModal.addEventListener('click', (e) => { if (e.target === researchStageModal) researchStageModal.classList.add('hidden'); });
+
+    researchStageProceedBtn.addEventListener('click', () => {
+        if (researchStageProceedBtn.disabled) return;
+        researchStageResult.classList.remove('hidden');
+        researchStageResult.textContent = 'Staging Execution_Lead_N folders...';
+
+        fetch('/api/research/stage', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                project: projectSelect.value,
+                confirmed: true,
+                snapshot: researchSnapshotInput.value.trim(),
+                guiDriver: researchGuiDriverSelect.value,
+                minSeverity: researchMinSeveritySel.value,
+                maxLeads: parseInt(researchMaxLeadsInput.value, 10) || 10
+            })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                researchStageResult.textContent = '[ERROR] ' + data.error + '\n\n' + (data.stderr || '');
+                return;
+            }
+            const lines = [];
+            lines.push('Workspace staged successfully.');
+            if (data.state && data.state.Leads) {
+                lines.push('');
+                lines.push('Leads staged: ' + data.state.Leads.length);
+                lines.push('Snapshot: ' + (data.state.Snapshot || '(none)'));
+                lines.push('GUI driver: ' + (data.state.GuiDriver || '(none)'));
+                lines.push('');
+                data.state.Leads.forEach(l => {
+                    lines.push('  Execution_Lead_' + l.Index + ' [' + l.Severity + '] ' + l.Primitive + '  ->  ' + l.Prompt);
+                });
+            }
+            lines.push('');
+            lines.push('Next: hand each Execution_Lead_N\\manifest.json to a research agent.');
+            researchStageResult.textContent = lines.join('\n');
+        })
+        .catch(err => { researchStageResult.textContent = '[ERROR] ' + err.message; });
+    });
+
     // Per-lead "Open research prompt" button (lives in the details modal)
     const modalResearchPromptRow  = document.getElementById('modalResearchPromptRow');
     const modalResearchPromptName = document.getElementById('modalResearchPromptName');

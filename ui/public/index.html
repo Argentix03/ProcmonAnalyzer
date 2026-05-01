@@ -144,9 +144,14 @@
             <div class="panel-container">
                 <!-- High Confidence Panel -->
                 <div class="list-panel active" id="highConfPanel">
-                    <div class="controls-bar">
-                        <input type="text" id="searchHighConf" class="search-box"
+                    <div class="controls-bar" style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                        <input type="text" id="searchHighConf" class="search-box" style="flex:1;"
                             placeholder="Search paths, processes, or types...">
+                        <button id="stageResearchBtn" title="Stage Execution_Lead_N workspaces for the top leads (destructive workflow — VM only)"
+                            style="background:#f03e3e; color:#fff; border:none; padding:8px 14px; border-radius:5px; cursor:pointer; font-weight:600; font-size:0.85rem; display:flex; align-items:center; gap:6px;">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 9v4M12 17h.01M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/></svg>
+                            Stage Research (VM only)
+                        </button>
                     </div>
                     <div class="items-list" id="highConfList">
                         <div class="empty-state">No high confidence leads loaded.</div>
@@ -605,6 +610,79 @@
         </div>
     </div>
 
+    <!-- Research Stage Confirmation Modal (destructive workflow) -->
+    <div class="modal-overlay hidden" id="researchStageModal">
+        <div class="modal-content">
+            <button class="close-btn" id="closeResearchStageModal">&times;</button>
+            <h3 class="modal-title" style="color:#f03e3e;">Stage Research Workspace</h3>
+
+            <div class="detail-group highlight-box" style="border-left-color:#f03e3e; background:rgba(240,62,62,0.06);">
+                <label style="color:#f03e3e;">DESTRUCTIVE WORKFLOW — READ BEFORE PROCEEDING</label>
+                <p style="font-size:0.9rem; line-height:1.55; margin-top:6px; color:var(--text-main);">
+                    Per-lead research will plant NTFS junctions / OM symlinks / REG_LINKs / files / oplocks, attach debuggers, can disable AV, mutate registry / scheduled tasks / services / IFEO / AeDebug, and (for kernel work) load test-signed drivers that may BSOD. Artefacts (junctions, REG_LINKs) survive logoff.
+                </p>
+                <p style="font-size:0.9rem; line-height:1.55; margin-top:8px; color:var(--text-main);">
+                    <strong>Run on a snapshotted Windows VM only.</strong> The trace can be captured anywhere, but the research must NOT run on a daily-driver workstation. If it must be the same host the trace was captured from, that host MUST itself be a snapshotted VM you control with a known-good revert point.
+                </p>
+            </div>
+
+            <div class="detail-group" style="margin-top:14px;">
+                <label>VM Snapshot Reference (required)</label>
+                <input type="text" id="researchSnapshotInput"
+                    placeholder='e.g., "Win11-24H2-clean-2026-05-01"'
+                    style="width:100%; appearance:none; background:#000; border:1px solid #222; color:#fff; padding:10px; border-radius:6px; font-family: monospace;">
+                <p style="font-size:0.78rem; color:var(--text-muted); margin-top:4px;">Free-text identifier of the VM snapshot the research agent will revert to between leads.</p>
+            </div>
+
+            <div class="detail-group" style="margin-top:14px;">
+                <label>GUI Driver MCP (required)</label>
+                <select id="researchGuiDriverSelect"
+                    style="width:100%; height:40px; background:#000; border:1px solid #222; color:#fff; padding:0 10px; border-radius:6px; cursor:pointer;">
+                    <option value="SystemAccessMCP">SystemAccessMCP — recommended (reaches secure desktop / UAC / Winlogon)</option>
+                    <option value="Windows-MCP">Windows-MCP (CursorTouch) — in-guest user session only</option>
+                    <option value="ClaudeCodeComputerUse">Claude Code Desktop "Computer use" (built-in 2026, Pro/Max)</option>
+                    <option value="manual">manual — operator clicks secure-desktop steps by hand</option>
+                </select>
+                <p style="font-size:0.78rem; color:var(--text-muted); margin-top:4px;">
+                    SystemAccessMCP is the only surveyed option that drives consent.exe / Winlogon / lock screen via the host-side Hyper-V channel. Source:
+                    <a href="https://github.com/Argentix03/SystemAccessMCP" target="_blank" style="color:var(--accent);">github.com/Argentix03/SystemAccessMCP</a>.
+                </p>
+            </div>
+
+            <div class="detail-group" style="margin-top:14px; display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                <div>
+                    <label>Min Severity</label>
+                    <select id="researchMinSeveritySelect"
+                        style="width:100%; height:40px; background:#000; border:1px solid #222; color:#fff; padding:0 10px; border-radius:6px; cursor:pointer;">
+                        <option value="Critical">Critical only</option>
+                        <option value="High" selected>High and above</option>
+                        <option value="Medium">Medium and above</option>
+                        <option value="Low">All</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Max Leads</label>
+                    <input type="number" id="researchMaxLeadsInput" value="10" min="1" max="100"
+                        style="width:100%; height:40px; appearance:none; background:#000; border:1px solid #222; color:#fff; padding:0 10px; border-radius:6px;">
+                </div>
+            </div>
+
+            <div class="detail-group" style="margin-top:14px;">
+                <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                    <input type="checkbox" id="researchAcknowledgeCheckbox" style="width:18px; height:18px; cursor:pointer;">
+                    <span style="font-size:0.88rem; color:var(--text-main);">I confirm the target is a snapshotted VM, not a production host, and that I accept the destructive nature of this workflow.</span>
+                </label>
+            </div>
+
+            <button id="researchStageProceedBtn" disabled
+                style="margin-top:18px; width:100%; background:#f03e3e; color:#fff; border:none; padding:12px; border-radius:6px; font-weight:700; cursor:not-allowed; opacity:0.5;">
+                Stage Workspace
+            </button>
+
+            <div id="researchStageResult" class="hidden" style="margin-top:14px; padding:12px; background:rgba(80,250,123,0.08); border-radius:6px; border:1px solid rgba(80,250,123,0.25); font-size:0.85rem; color:var(--text-main); white-space:pre-wrap; max-height:240px; overflow-y:auto; font-family: monospace;"></div>
+        </div>
+    </div>
+
     <!-- Global Info Modal -->
     <div class="modal-overlay hidden" id="globalInfoModal">
         <div class="modal-content">
@@ -644,7 +722,7 @@
         </div>
     </div>
 
-    <script src="app.js?v=rev2"></script>
+    <script src="app.js?v=rev2-research"></script>
     <script src="analytics.js?v=1"></script>
     <script src="graph.js?v=5"></script>
 </body>
