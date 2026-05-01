@@ -19,3 +19,8 @@ projects/
 !ui/package-lock.json
 *.log
 Execution_Leads_Report.md
+
+# Local research outputs (host-specific recon — keep off public history)
+Security_Research_Addendum.md
+Execution_Lead_*/
+_research_state.json
