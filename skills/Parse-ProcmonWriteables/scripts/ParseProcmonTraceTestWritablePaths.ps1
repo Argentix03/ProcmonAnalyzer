@@ -423,6 +423,9 @@ Write-Host "Starting safe permission tests (no destructive writes)..." -Foregrou
 # sets every bit including those two.
 
 # Pure plant bits — what "you can plant a file/junction/symlink here" means.
+# NT generic access masks: filesystem WriteData|AppendData = 0x6, and registry
+# SetValue|CreateSubKey are encoded onto the same bit positions (also 0x6),
+# so the same mask works for both ACL families in Invoke-DaclEvaluation below.
 $script:_plantBits = [int]([System.Security.AccessControl.FileSystemRights]::WriteData) -bor `
                      [int]([System.Security.AccessControl.FileSystemRights]::AppendData)
 
@@ -470,6 +473,262 @@ $script:_highILPathPatterns = @(
     '\Program Files (x86)\'
 )
 
+# ── REGISTRY HELPERS (rev 3.2) ───────────────────────────────────────────────
+#
+# rev 3.1 left registry paths on a coarse heuristic (HKLM=admin-only,
+# HKCU=everyone-writable) with no DACL parse. That silently under-reported
+# real low-priv-writable HKLM subkeys (vendor-installed keys with permissive
+# ACLs, misconfigured Performance subkeys) and missed conditional ACEs on
+# HKLM entirely. rev 3.2 promotes registry to a first-class DACL parse.
+
+# Translate a registry path string ("HKLM\Software\Foo", "HKEY_CURRENT_USER\..\Bar")
+# into a (Hive, Subkey, RootName) triple. Long-form roots are normalised to
+# short-form for matching, but the subkey portion preserves original case so
+# OpenSubKey's case-insensitive lookup still works.
+function Get-RegistryHiveAndSubkey {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $p = $Path.Trim()
+    $p = $p -replace '^HKEY_LOCAL_MACHINE\\?',   'HKLM\'
+    $p = $p -replace '^HKEY_CURRENT_USER\\?',    'HKCU\'
+    $p = $p -replace '^HKEY_CLASSES_ROOT\\?',    'HKCR\'
+    $p = $p -replace '^HKEY_USERS\\?',           'HKU\'
+    $p = $p -replace '^HKEY_CURRENT_CONFIG\\?',  'HKCC\'
+    $p = $p -replace '^HKEY_PERFORMANCE_DATA\\?','HKPD\'
+
+    $hive = $null; $sub = ""; $rootName = ""
+    if     ($p -match '^HKLM\\?(.*)$') { $hive = [Microsoft.Win32.Registry]::LocalMachine;    $sub = $matches[1]; $rootName = "HKLM" }
+    elseif ($p -match '^HKCU\\?(.*)$') { $hive = [Microsoft.Win32.Registry]::CurrentUser;     $sub = $matches[1]; $rootName = "HKCU" }
+    elseif ($p -match '^HKCR\\?(.*)$') { $hive = [Microsoft.Win32.Registry]::ClassesRoot;     $sub = $matches[1]; $rootName = "HKCR" }
+    elseif ($p -match '^HKU\\?(.*)$')  { $hive = [Microsoft.Win32.Registry]::Users;           $sub = $matches[1]; $rootName = "HKU" }
+    elseif ($p -match '^HKCC\\?(.*)$') { $hive = [Microsoft.Win32.Registry]::CurrentConfig;   $sub = $matches[1]; $rootName = "HKCC" }
+    elseif ($p -match '^HKPD\\?(.*)$') { $hive = [Microsoft.Win32.Registry]::PerformanceData; $sub = $matches[1]; $rootName = "HKPD" }
+    else { return $null }
+
+    return @{ Hive = $hive; Subkey = $sub; RootName = $rootName }
+}
+
+# Open the registry key at $Path (ancestor-walk style: the trace often gives
+# us value paths like "...\BIOS\SystemSKU" which aren't keys, so step up to
+# the parent key whose DACL governs SetValue rights). Returns a hashtable with
+# the RegistrySecurity, the AclSource tag ("registry-exact" / "-ancestor" /
+# "-hive-root" / "-denied" / "-bad-path"), and the resolved root name so the
+# caller can decide IntegrityLabel + fallback behavior.
+function Get-RegistryDaclForPath {
+    param([string]$Path)
+    $parts = Get-RegistryHiveAndSubkey -Path $Path
+    if ($null -eq $parts) {
+        return @{ Sec = $null; Source = "registry-bad-path"; RootName = "" }
+    }
+
+    $sub = $parts.Subkey
+    while ($sub.EndsWith('\')) { $sub = $sub.Substring(0, $sub.Length - 1) }
+    $exact = $true
+    $depth = 0
+
+    while ($depth -lt 32) {
+        if ([string]::IsNullOrEmpty($sub)) {
+            # Hive root — read its DACL directly. GetAccessControl on the hive
+            # key itself works without needing OpenSubKey first.
+            try {
+                $sec = $parts.Hive.GetAccessControl()
+                $src = if ($exact) { "registry-hive-root" } else { "registry-ancestor" }
+                return @{ Sec = $sec; Source = $src; RootName = $parts.RootName }
+            } catch {
+                return @{ Sec = $null; Source = "registry-denied"; RootName = $parts.RootName }
+            }
+        }
+        try {
+            $key = $parts.Hive.OpenSubKey(
+                $sub,
+                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree,
+                [System.Security.AccessControl.RegistryRights]::ReadPermissions)
+            if ($key) {
+                try {
+                    $sec = $key.GetAccessControl()
+                    $src = if ($exact) { "registry-exact" } else { "registry-ancestor" }
+                    return @{ Sec = $sec; Source = $src; RootName = $parts.RootName }
+                } finally {
+                    $key.Close()
+                }
+            }
+        } catch {
+            # OpenSubKey failed (key missing / no ReadPermissions). Walk up.
+        }
+        $lastSlash = $sub.LastIndexOf('\')
+        if ($lastSlash -lt 0) { $sub = "" } else { $sub = $sub.Substring(0, $lastSlash) }
+        $exact = $false
+        $depth++
+    }
+    return @{ Sec = $null; Source = "registry-denied"; RootName = $parts.RootName }
+}
+
+# ── SHARED DACL EVALUATION (rev 3.2) ─────────────────────────────────────────
+#
+# Single-source-of-truth for the rules loop + conditional-ACE detection +
+# writability flag computation. Used by both the FS and Registry branches of
+# Get-PathWritability. The $Result hashtable is mutated in place — its
+# WritableByLowPriv / WritableByMediumILAdmin / WritableByHighILAdmin /
+# HasConditionalACE / ConditionalACEPrincipals / ConditionalACESddl fields
+# are populated.
+#
+# Caller is responsible for:
+#   * Determining the ACL object ($Acl) — FileSecurity or RegistrySecurity
+#   * Choosing IsContainer correctly (true for directories and registry keys,
+#     false for individual files)
+#   * Setting IsRegistry so the rights extractor picks RegistryRights vs
+#     FileSystemRights (the underlying mask bits coincide for plant rights,
+#     but using the wrong concrete property would throw)
+#   * Pre-setting Result.AclSource / Result.IntegrityLabel as appropriate
+#   * Applying MIC NW (no-write-up) at the end if IntegrityLabel is High/System
+function Invoke-DaclEvaluation {
+    param(
+        [Parameter(Mandatory=$true)] $Acl,
+        [Parameter(Mandatory=$true)] [hashtable]$Result,
+        [Parameter(Mandatory=$true)] [hashtable]$UserContext,
+        [Parameter(Mandatory=$true)] [bool]$IsContainer,
+        [Parameter(Mandatory=$true)] [bool]$IsRegistry
+    )
+
+    $rules = $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+
+    # Conditional / callback ACE detection via raw SDDL. GetAccessRules drops
+    # the AceType byte, so we re-parse the SDDL with CommonSecurityDescriptor
+    # (which preserves it) and build SID-keyed sets of unconditional vs
+    # callback Allow grants AND unconditional vs callback Deny restrictions
+    # (rev 3.2 symmetric DENY handling).
+    $sddl = $null
+    try { $sddl = $Acl.Sddl } catch { $sddl = $null }
+    $unconditionalAllowSids = New-Object System.Collections.Generic.HashSet[string]
+    $conditionalAllowSids   = New-Object System.Collections.Generic.HashSet[string]
+    $unconditionalDenySids  = New-Object System.Collections.Generic.HashSet[string]
+    $conditionalDenySids    = New-Object System.Collections.Generic.HashSet[string]
+    if (-not [string]::IsNullOrWhiteSpace($sddl)) {
+        try {
+            $csd = New-Object System.Security.AccessControl.CommonSecurityDescriptor(
+                $IsContainer, $false, $sddl)
+            foreach ($ace in $csd.DiscretionaryAcl) {
+                if (-not ($ace -is [System.Security.AccessControl.CommonAce])) { continue }
+                $aceMask = [int]$ace.AccessMask
+                if (($aceMask -band $script:_plantBits) -eq 0) { continue }
+                $aceSid  = $ace.SecurityIdentifier.Value
+                $aceType = $ace.AceType
+                $isAllow = ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) `
+                        -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallback) `
+                        -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedObject) `
+                        -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallbackObject)
+                $isDenyAce = ($aceType -eq [System.Security.AccessControl.AceType]::AccessDenied) `
+                          -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessDeniedCallback) `
+                          -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessDeniedObject) `
+                          -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessDeniedCallbackObject)
+                $isCallback = ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallback) `
+                           -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallbackObject) `
+                           -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessDeniedCallback) `
+                           -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessDeniedCallbackObject)
+                if ($isAllow) {
+                    if ($isCallback) { [void]$conditionalAllowSids.Add($aceSid) }
+                    else             { [void]$unconditionalAllowSids.Add($aceSid) }
+                } elseif ($isDenyAce) {
+                    if ($isCallback) { [void]$conditionalDenySids.Add($aceSid) }
+                    else             { [void]$unconditionalDenySids.Add($aceSid) }
+                }
+            }
+            if ($conditionalAllowSids.Count -gt 0 -or $conditionalDenySids.Count -gt 0) {
+                $Result.ConditionalACESddl = $sddl
+            }
+        } catch {
+            # SDDL parser hiccup (malformed / extremely long descriptors).
+            # Fall through; the rules loop behaves as it did before rev 3.1.
+        }
+    }
+
+    $allowedLow = $false; $deniedLow = $false
+    $allowedMed = $false; $deniedMed = $false
+    $allowedHigh = $false; $deniedHigh = $false
+    $flaggedConditionalSids = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($sid -eq 'S-1-3-0') { continue }                # CREATOR OWNER
+        if ($script:_systemSids -contains $sid) { continue } # unreachable from our perspectives
+
+        $rights = if ($IsRegistry) {
+            [int]$rule.RegistryRights
+        } else {
+            [int]$rule.FileSystemRights
+        }
+        if (($rights -band $script:_plantBits) -eq 0) { continue }
+        $isDeny = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny)
+
+        # Conditional-ACE handling — symmetric across Allow and Deny (rev 3.2):
+        #   * Allow + callback-only for this SID: don't count the grant
+        #     (Microsoft restricted it by SKU / capability / AppID and we
+        #     can't statically verify the condition on this host). Flag.
+        #   * Allow + both callback AND unconditional: the unconditional ACE
+        #     carries the writability; count it but still flag.
+        #   * Deny + callback-only: don't count the deny (treating it as
+        #     unconditional under-reports writability on hosts where the
+        #     condition evaluates false). Flag.
+        #   * Deny + both: count, flag.
+        if (-not $isDeny -and $conditionalAllowSids.Contains($sid)) {
+            $Result.HasConditionalACE = $true
+            [void]$flaggedConditionalSids.Add($sid)
+            if (-not $unconditionalAllowSids.Contains($sid)) {
+                continue
+            }
+        }
+        if ($isDeny -and $conditionalDenySids.Contains($sid)) {
+            $Result.HasConditionalACE = $true
+            [void]$flaggedConditionalSids.Add($sid)
+            if (-not $unconditionalDenySids.Contains($sid)) {
+                continue
+            }
+        }
+
+        if ($script:_lowPrivSids -contains $sid) {
+            if ($isDeny) {
+                $deniedLow = $true; $deniedMed = $true; $deniedHigh = $true
+            } else {
+                $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
+            }
+            continue
+        }
+
+        if ($script:_adminSids -contains $sid) {
+            if ($isDeny) {
+                $deniedMed = $true; $deniedHigh = $true
+            } else {
+                $allowedMed = $true; $allowedHigh = $true
+            }
+            continue
+        }
+
+        # Current user's specific SID.
+        if ($sid -eq $UserContext.UserSid) {
+            if ($UserContext.IsAdminLatent) {
+                if ($isDeny) { $deniedMed = $true; $deniedHigh = $true }
+                else         { $allowedMed = $true; $allowedHigh = $true }
+            } else {
+                if ($isDeny) {
+                    $deniedLow = $true; $deniedMed = $true; $deniedHigh = $true
+                } else {
+                    $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
+                }
+            }
+            continue
+        }
+        # Other SIDs (specific user accounts, custom groups) — leave alone.
+    }
+
+    $Result.WritableByLowPriv       = $allowedLow  -and -not $deniedLow
+    $Result.WritableByMediumILAdmin = $allowedMed  -and -not $deniedMed
+    $Result.WritableByHighILAdmin   = $allowedHigh -and -not $deniedHigh
+
+    if ($flaggedConditionalSids.Count -gt 0) {
+        $Result.ConditionalACEPrincipals = @($flaggedConditionalSids)
+    }
+}
+
 function Get-PathWritability {
     param(
         [Parameter(Mandatory=$true)] [string]$TargetPath,
@@ -495,27 +754,42 @@ function Get-PathWritability {
     }
 
     try {
-        # Registry — heuristic, no SACL parsing.
-        if ($TargetPath -match "^HKLM" -or $TargetPath -match "^HKEY_LOCAL_MACHINE" `
-            -or $TargetPath -match "^HKCR" -or $TargetPath -match "^HKEY_CLASSES_ROOT") {
-            $r.WritableByHighILAdmin = $true
-            $r.IntegrityLabel = "High"
-            $r.AclSource = "registry-heuristic"
-            return $r
-        }
-        if ($TargetPath -match "^HKCU" -or $TargetPath -match "^HKEY_CURRENT_USER" `
-            -or $TargetPath -match "^HKU\\" -or $TargetPath -match "^HKEY_USERS\\") {
-            $r.WritableByLowPriv = $true
-            $r.WritableByMediumILAdmin = $true
-            $r.WritableByHighILAdmin = $true
-            $r.AclSource = "registry-heuristic"
-            return $r
-        }
-        if ($TargetPath -match "^HK") {
-            # Other roots (HKCC, HKPD) — assume admin-only.
-            $r.WritableByHighILAdmin = $true
-            $r.IntegrityLabel = "High"
-            $r.AclSource = "registry-heuristic"
+        # Registry — proper DACL parse (rev 3.2). Was a coarse heuristic in
+        # rev 3.1 that just stamped HKLM as admin-writable / HKCU as
+        # everyone-writable without looking at the actual ACL; this silently
+        # under-reported real low-priv-writable HKLM subkeys (vendor-installed
+        # keys with permissive ACLs, misconfigured Performance subkeys) and
+        # missed conditional ACEs on HKLM entirely. Now we open the key via
+        # the appropriate hive (ancestor walk for value-paths and missing
+        # keys) and run Invoke-DaclEvaluation, the same evaluator the FS
+        # path uses. Falls back to the old heuristic only if DACL read fails.
+        if ($TargetPath -match '^(HKLM|HKCU|HKCR|HKU|HKCC|HKPD|HKEY_)') {
+            $regResult = Get-RegistryDaclForPath -Path $TargetPath
+            $r.AclSource = $regResult.Source
+            # Machine-scope hives are High-IL labeled; user hives are not.
+            if ($regResult.RootName -in @('HKLM','HKCR','HKCC','HKPD')) {
+                $r.IntegrityLabel = "High"
+            }
+            if ($null -ne $regResult.Sec) {
+                Invoke-DaclEvaluation -Acl $regResult.Sec -Result $r `
+                    -UserContext $UserContext -IsContainer $true -IsRegistry $true
+                # MIC NW: lower-IL tokens can't write up to High-IL labeled keys.
+                if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
+                    $r.WritableByLowPriv       = $false
+                    $r.WritableByMediumILAdmin = $false
+                }
+            } else {
+                # DACL read failed (key vanished, no ReadPermissions, etc.).
+                # Fall back to the per-root heuristic that rev 3.1 used so we
+                # don't regress on paths the new parser can't reach.
+                if ($regResult.RootName -eq 'HKCU' -or $regResult.RootName -eq 'HKU') {
+                    $r.WritableByLowPriv       = $true
+                    $r.WritableByMediumILAdmin = $true
+                    $r.WritableByHighILAdmin   = $true
+                } else {
+                    $r.WritableByHighILAdmin   = $true
+                }
+            }
             return $r
         }
 
@@ -578,136 +852,19 @@ function Get-PathWritability {
             $r.AclSource = $r.AclSource + "-null"
             return $r
         }
-        $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
-
-        # ── Conditional-ACE detection (rev 3.1) ──────────────────────────────
-        # GetAccessRules returns FileSystemAccessRule objects which DO NOT
-        # expose AceType, so an ACCESS_ALLOWED_CALLBACK_ACE with a SKU /
-        # capability / AppID conditional clause is indistinguishable from a
-        # plain ACCESS_ALLOWED_ACE in the rules loop. Re-parse the raw SDDL
-        # with CommonSecurityDescriptor (which preserves the ACE-type byte)
-        # to find callback ACEs and build SID-keyed maps the loop consults
-        # before counting any Allow grant.
-        $sddl = $null
-        try { $sddl = $acl.Sddl } catch { $sddl = $null }
-        $unconditionalAllowSids = New-Object System.Collections.Generic.HashSet[string]
-        $conditionalAllowSids   = New-Object System.Collections.Generic.HashSet[string]
+        # Evaluate the DACL via the shared rev-3.2 helper. Includes
+        # callback-ACE detection (both Allow and Deny — see Invoke-DaclEvaluation)
+        # and the perspective-aware writability flag computation that used to
+        # live inline here.
         $isContainerAcl = [System.IO.Directory]::Exists($aclTarget)
-        if (-not [string]::IsNullOrWhiteSpace($sddl)) {
-            try {
-                $csd = New-Object System.Security.AccessControl.CommonSecurityDescriptor(
-                    $isContainerAcl, $false, $sddl)
-                foreach ($ace in $csd.DiscretionaryAcl) {
-                    if (-not ($ace -is [System.Security.AccessControl.CommonAce])) { continue }
-                    $aceMask = [int]$ace.AccessMask
-                    if (($aceMask -band $script:_plantBits) -eq 0) { continue }
-                    $aceSid = $ace.SecurityIdentifier.Value
-                    $aceType = $ace.AceType
-                    $isAllow = ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) `
-                            -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallback) `
-                            -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedObject) `
-                            -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallbackObject)
-                    if (-not $isAllow) { continue }
-                    $isCallback = ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallback) `
-                               -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallbackObject)
-                    if ($isCallback) { [void]$conditionalAllowSids.Add($aceSid) }
-                    else             { [void]$unconditionalAllowSids.Add($aceSid) }
-                }
-                # Capture SDDL only if we actually found a callback ACE; keeps
-                # the output noise-free on non-conditional paths (the vast
-                # majority).
-                if ($conditionalAllowSids.Count -gt 0) {
-                    $r.ConditionalACESddl = $sddl
-                }
-            } catch {
-                # SDDL parser hiccup (unusual but possible for malformed or
-                # extremely long descriptors). Fall through; the rules loop
-                # will behave exactly as it did pre-fix on this path.
-            }
-        }
-
-        $allowedLow = $false; $deniedLow = $false
-        $allowedMed = $false; $deniedMed = $false
-        $allowedHigh = $false; $deniedHigh = $false
-        $flaggedConditionalSids = New-Object System.Collections.Generic.HashSet[string]
-
-        foreach ($rule in $rules) {
-            $sid = $rule.IdentityReference.Value
-            if ($sid -eq 'S-1-3-0') { continue }                # CREATOR OWNER — see comment above
-            if ($script:_systemSids -contains $sid) { continue } # unreachable from our perspectives
-
-            $rights = [int]$rule.FileSystemRights
-            if (($rights -band $script:_plantBits) -eq 0) { continue }   # not a plant grant
-            $isDeny = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny)
-
-            # Conditional-ACE handling (rev 3.1, fix B+):
-            #   * If this SID's plant grants come ONLY from callback ACEs
-            #     (Microsoft restricted access by SKU / capability / AppID),
-            #     skip the grant — we can't statically verify the condition
-            #     and counting it produces SKU-specific false positives.
-            #   * If the SID also has an unconditional peer ACE, count
-            #     normally but still mark HasConditionalACE so the analyst
-            #     knows the writability is environment-aware.
-            # Denies are intentionally NOT demoted: a conditional deny we
-            # silently ignore could mask a real restriction on the deployment
-            # we're analyzing. Conditional denies are rare; if they matter we
-            # surface them via HasConditionalACE alone.
-            if (-not $isDeny -and $conditionalAllowSids.Contains($sid)) {
-                $r.HasConditionalACE = $true
-                [void]$flaggedConditionalSids.Add($sid)
-                if (-not $unconditionalAllowSids.Contains($sid)) {
-                    continue   # demote: conditional-only Allow doesn't count
-                }
-            }
-
-            if ($script:_lowPrivSids -contains $sid) {
-                if ($isDeny) {
-                    $deniedLow = $true; $deniedMed = $true; $deniedHigh = $true
-                } else {
-                    $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
-                }
-                continue
-            }
-
-            if ($script:_adminSids -contains $sid) {
-                if ($isDeny) {
-                    $deniedMed = $true; $deniedHigh = $true
-                } else {
-                    $allowedMed = $true; $allowedHigh = $true
-                }
-                continue
-            }
-
-            # Current user's specific SID.
-            if ($sid -eq $UserContext.UserSid) {
-                if ($UserContext.IsAdminLatent) {
-                    if ($isDeny) { $deniedMed = $true; $deniedHigh = $true }
-                    else         { $allowedMed = $true; $allowedHigh = $true }
-                } else {
-                    if ($isDeny) {
-                        $deniedLow = $true; $deniedMed = $true; $deniedHigh = $true
-                    } else {
-                        $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
-                    }
-                }
-                continue
-            }
-            # Other SIDs (specific user accounts, custom groups) — leave alone.
-        }
-
-        $r.WritableByLowPriv       = $allowedLow  -and -not $deniedLow
-        $r.WritableByMediumILAdmin = $allowedMed  -and -not $deniedMed
-        $r.WritableByHighILAdmin   = $allowedHigh -and -not $deniedHigh
+        Invoke-DaclEvaluation -Acl $acl -Result $r `
+            -UserContext $UserContext -IsContainer $isContainerAcl -IsRegistry $false
 
         # MIC NW: paths with the High mandatory label refuse writes from
         # tokens at lower IL. LowPriv / MediumIL can't write up.
         if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
             $r.WritableByLowPriv       = $false
             $r.WritableByMediumILAdmin = $false
-        }
-
-        if ($flaggedConditionalSids.Count -gt 0) {
-            $r.ConditionalACEPrincipals = @($flaggedConditionalSids)
         }
 
         return $r

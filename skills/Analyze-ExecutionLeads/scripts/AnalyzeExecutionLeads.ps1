@@ -968,6 +968,48 @@ foreach ($entry in $rawData) {
                 OpenLink = $openLink
                 FilterReason = "PrivilegedActor_NoRuleMatched"
             })
+        } elseif ($isFsPath -and $path -match "(?i)\.(dll|exe|sys|drv|ocx|cpl|ax|ps1|psm1|psd1|bat|cmd|vbs|js|wsf|hta|jar|war|node|pyd|so)$") {
+            # Branch 4 (rev 3.2): persistence-class binary/script in a
+            # writable location with no privileged actor observed in THIS
+            # trace. Used to vanish entirely — the prior branches required
+            # either config-extension semantics, registry path, or a
+            # privileged consumer in scope. These leads are real research
+            # surfaces even without a privileged consumer:
+            #   * Persistence vectors (Startup, auto-loaded module, Run keys)
+            #   * Supply-chain plants (a vendor binary an SCCM/Defender pkg
+            #     might eventually load privileged)
+            #   * Latent LPE — privileged consumer not in trace window but
+            #     known from the path's role (e.g. .dll in a service's
+            #     install dir)
+            $hint = "Persistence / supply-chain binary candidate. Writable executable or script in a $writableFrom-writable location; no privileged consumer was observed in this trace, but the file may still be loaded later by a privileged process (service startup, scheduled task, AV scan with engine load, dependency resolution) or trigger on user action."
+            $hint += " Check: (1) is this binary referenced by a service ImagePath / scheduled-task action / Run key / Startup folder; (2) does a higher-IL process load this directory on demand (DLL search-order, Authenticode-signed loader); (3) for scripts, is this auto-loaded on shell start / user logon / explorer interaction."
+            if ($anyWrite -and $anyRead) {
+                $hint += " NOTE: BOTH read and write observed → race-window candidate if a privileged consumer joins later."
+            } elseif ($opDirection -eq "Write") {
+                $hint += " NOTE: Process WRITES this binary → if a privileged consumer loads it before next overwrite, you have a code-exec primitive."
+            }
+            $cognitiveQueue.Add([PSCustomObject]@{
+                Path = $path
+                Processes = $procs
+                Operations = $operations
+                Hint = $hint
+                TraceFile = (Get-FieldValue $entry "TraceFile")
+                Timestamp = (Get-FieldValue $entry "Timestamp")
+                Operation = $operation
+                Result = $result
+                Detail = $detail
+                Integrity = $integrity
+                Impersonating = $impersonating
+                OperationDirection = $opDirection
+                SqosLevel = $sqos
+                EffectivePrincipal = $effectivePrincipal
+                WritableFrom = $writableFrom
+                AnyPrivRead  = $anyPrivRead
+                AnyPrivWrite = $anyPrivWrite
+                OpenReparsePoint = $openRP
+                OpenLink = $openLink
+                FilterReason = "PersistenceBinary_NoPrivilegedConsumer"
+            })
         }
     } else {
         # Severity boost when same path has BOTH privileged Read and Write
