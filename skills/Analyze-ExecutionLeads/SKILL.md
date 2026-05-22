@@ -79,7 +79,8 @@ The script drops or demotes leads on the following patterns BEFORE writing the h
 4. **User-only-consumer** — every observed actor is the current user's own session and no privileged actor touched the path. The redirect cannot reach anywhere the user can't reach already (LPE §9).
 5. **Benign-readers-only** — when the only actors are AV/Search indexers (`MsMpEng.exe`, `SearchProtocolHost.exe`, `MsSense.exe`, etc.) and they only read, the lead is "Defender scanned the file" — demoted unless a non-indexer privileged process also touches the path.
 6. **LOLBin extension mismatch** — `powershell.exe` → `~/Downloads/` no longer fires the LOLBin-proxy rule; only file extensions the LOLBin actually parses (`.ps1`/`.psm1`/`.psd1`/`.ps1xml` for PowerShell, `.dll`/`.ocx`/`.cpl` for rundll32, etc.) escalate severity.
-7. **Self-trace contamination** — already filtered upstream by `Parse-ProcmonWriteables`.
+7. **LPE-class read/write/pipe primitives gated by writability perspective + path family** (rev 3.1). `SMB_Coercion` (Rule 5), `Oplock_ArbitraryWrite` (Rule 6), and `Pipe_Plant_Redirect` (Rule 7) all require a low-priv user to plant the junction/oplock/symlink — they're LPE primitives, not Admin_To_System primitives. They now fire only when `WritableByLowPriv = true` AND (for Rules 5/6) the path is a filesystem path (you can't plant an NTFS junction on a registry key). Previous rev fired on `isPrivileged + Read/Write` alone, mislabeling admin-only HKLM reads (e.g. `HKLM\HARDWARE\DESCRIPTION\System\BIOS\SystemSKU` read by `taskhostw.exe`) as Critical `SMB_Coercion` candidates. Entries that fall out of these rules but still involve a privileged actor flow into the cognitive queue via the `PrivilegedActor_NoRuleMatched` catch-all (perspective-tagged), so Admin_To_System and supply-chain candidates aren't lost.
+8. **Self-trace contamination** — already filtered upstream by `Parse-ProcmonWriteables`.
 
 ---
 

@@ -477,11 +477,21 @@ function Get-PathWritability {
     )
 
     $r = @{
-        WritableByLowPriv       = $false
-        WritableByMediumILAdmin = $false
-        WritableByHighILAdmin   = $false
-        IntegrityLabel          = "Default"
-        AclSource               = "none"
+        WritableByLowPriv         = $false
+        WritableByMediumILAdmin   = $false
+        WritableByHighILAdmin     = $false
+        IntegrityLabel            = "Default"
+        AclSource                 = "none"
+        # Conditional/callback ACE tracking (rev 3.1). FileSystemAccessRule
+        # silently strips the conditional clause from ACCESS_ALLOWED_CALLBACK_ACE
+        # entries; an ACE that actually says "Allow IU FullControl IF
+        # !WIN://ISMULTISESSIONSKU" reaches the consumer as a plain Allow.
+        # We re-parse the raw SDDL to detect this and either demote (when
+        # there's no unconditional peer ACE) or just flag the path so the
+        # analyst knows writability is environment-dependent.
+        HasConditionalACE         = $false
+        ConditionalACEPrincipals  = @()
+        ConditionalACESddl        = ""
     }
 
     try {
@@ -570,9 +580,56 @@ function Get-PathWritability {
         }
         $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
 
+        # ── Conditional-ACE detection (rev 3.1) ──────────────────────────────
+        # GetAccessRules returns FileSystemAccessRule objects which DO NOT
+        # expose AceType, so an ACCESS_ALLOWED_CALLBACK_ACE with a SKU /
+        # capability / AppID conditional clause is indistinguishable from a
+        # plain ACCESS_ALLOWED_ACE in the rules loop. Re-parse the raw SDDL
+        # with CommonSecurityDescriptor (which preserves the ACE-type byte)
+        # to find callback ACEs and build SID-keyed maps the loop consults
+        # before counting any Allow grant.
+        $sddl = $null
+        try { $sddl = $acl.Sddl } catch { $sddl = $null }
+        $unconditionalAllowSids = New-Object System.Collections.Generic.HashSet[string]
+        $conditionalAllowSids   = New-Object System.Collections.Generic.HashSet[string]
+        $isContainerAcl = [System.IO.Directory]::Exists($aclTarget)
+        if (-not [string]::IsNullOrWhiteSpace($sddl)) {
+            try {
+                $csd = New-Object System.Security.AccessControl.CommonSecurityDescriptor(
+                    $isContainerAcl, $false, $sddl)
+                foreach ($ace in $csd.DiscretionaryAcl) {
+                    if (-not ($ace -is [System.Security.AccessControl.CommonAce])) { continue }
+                    $aceMask = [int]$ace.AccessMask
+                    if (($aceMask -band $script:_plantBits) -eq 0) { continue }
+                    $aceSid = $ace.SecurityIdentifier.Value
+                    $aceType = $ace.AceType
+                    $isAllow = ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) `
+                            -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallback) `
+                            -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedObject) `
+                            -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallbackObject)
+                    if (-not $isAllow) { continue }
+                    $isCallback = ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallback) `
+                               -or ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCallbackObject)
+                    if ($isCallback) { [void]$conditionalAllowSids.Add($aceSid) }
+                    else             { [void]$unconditionalAllowSids.Add($aceSid) }
+                }
+                # Capture SDDL only if we actually found a callback ACE; keeps
+                # the output noise-free on non-conditional paths (the vast
+                # majority).
+                if ($conditionalAllowSids.Count -gt 0) {
+                    $r.ConditionalACESddl = $sddl
+                }
+            } catch {
+                # SDDL parser hiccup (unusual but possible for malformed or
+                # extremely long descriptors). Fall through; the rules loop
+                # will behave exactly as it did pre-fix on this path.
+            }
+        }
+
         $allowedLow = $false; $deniedLow = $false
         $allowedMed = $false; $deniedMed = $false
         $allowedHigh = $false; $deniedHigh = $false
+        $flaggedConditionalSids = New-Object System.Collections.Generic.HashSet[string]
 
         foreach ($rule in $rules) {
             $sid = $rule.IdentityReference.Value
@@ -582,6 +639,26 @@ function Get-PathWritability {
             $rights = [int]$rule.FileSystemRights
             if (($rights -band $script:_plantBits) -eq 0) { continue }   # not a plant grant
             $isDeny = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny)
+
+            # Conditional-ACE handling (rev 3.1, fix B+):
+            #   * If this SID's plant grants come ONLY from callback ACEs
+            #     (Microsoft restricted access by SKU / capability / AppID),
+            #     skip the grant — we can't statically verify the condition
+            #     and counting it produces SKU-specific false positives.
+            #   * If the SID also has an unconditional peer ACE, count
+            #     normally but still mark HasConditionalACE so the analyst
+            #     knows the writability is environment-aware.
+            # Denies are intentionally NOT demoted: a conditional deny we
+            # silently ignore could mask a real restriction on the deployment
+            # we're analyzing. Conditional denies are rare; if they matter we
+            # surface them via HasConditionalACE alone.
+            if (-not $isDeny -and $conditionalAllowSids.Contains($sid)) {
+                $r.HasConditionalACE = $true
+                [void]$flaggedConditionalSids.Add($sid)
+                if (-not $unconditionalAllowSids.Contains($sid)) {
+                    continue   # demote: conditional-only Allow doesn't count
+                }
+            }
 
             if ($script:_lowPrivSids -contains $sid) {
                 if ($isDeny) {
@@ -627,6 +704,10 @@ function Get-PathWritability {
         if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
             $r.WritableByLowPriv       = $false
             $r.WritableByMediumILAdmin = $false
+        }
+
+        if ($flaggedConditionalSids.Count -gt 0) {
+            $r.ConditionalACEPrincipals = @($flaggedConditionalSids)
         }
 
         return $r
@@ -771,6 +852,17 @@ foreach ($canonical in $canonicalPaths) {
         WritableFrom            = $lowestPersp
         IntegrityLabel          = $writability.IntegrityLabel
         AclSource               = $writability.AclSource
+        # Conditional/callback-ACE detection (rev 3.1). HasConditionalACE is
+        # true when at least one Allow grant for a SID we'd otherwise count
+        # was a callback ACE (Microsoft restricted access by SKU /
+        # capability / AppID). Writable* flags above already exclude
+        # conditional-only grants — when both are conditional-only, the
+        # path may still be flagged Writable* if a different SID had an
+        # unconditional grant, but the analyst should treat any path with
+        # HasConditionalACE = true as environment-dependent.
+        HasConditionalACE        = [bool]$writability.HasConditionalACE
+        ConditionalACEPrincipals = @($writability.ConditionalACEPrincipals)
+        ConditionalACESddl       = $writability.ConditionalACESddl
         # Current-user context for the analyzer
         CurrentUserSid          = $userContext.UserSid
         CurrentUserIsAdminLatent   = $userContext.IsAdminLatent
@@ -783,6 +875,10 @@ Write-Progress -Activity "Testing Permissions" -Completed
 $swTest.Stop()
 
 Write-Host "Process Complete in $($swTest.Elapsed.TotalSeconds.ToString('0.00'))s. $( $results.Count ) writable paths found." -ForegroundColor Green
+$conditionalCount = ($results | Where-Object { $_.HasConditionalACE }).Count
+if ($conditionalCount -gt 0) {
+    Write-Host "  - $conditionalCount path(s) had conditional/callback ACEs (Microsoft-restricted by SKU/capability/AppID). See HasConditionalACE / ConditionalACEPrincipals / ConditionalACESddl." -ForegroundColor DarkYellow
+}
 
 if ($results.Count -gt 0) {
     $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

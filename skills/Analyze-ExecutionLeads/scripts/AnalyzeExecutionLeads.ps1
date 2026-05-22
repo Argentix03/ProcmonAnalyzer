@@ -317,6 +317,10 @@ foreach ($entry in $rawData) {
     $isPrivileged  = Test-PrivilegedIntegrity -Integrity $integrity
     $isPrivilegedAny = $isPrivileged -or $anyPrivRead -or $anyPrivWrite
     $isNameNotFound = ($result -match "(?i)NAME NOT FOUND")
+    # Filesystem vs registry — gates the FS-only LPE primitives (Rules 5/6/7).
+    # NTFS junction / oplock / pipe-symlink plants require an actual FS path;
+    # they can't be planted on a registry key. Mirrors the parser's path class.
+    $isFsPath      = ($path -match "^[a-zA-Z]:\\") -or ($path -match "^\\\\")
     $effectivePrincipal = Get-EffectivePrincipal -Integrity $integrity -Impersonating $impersonating
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -695,8 +699,17 @@ foreach ($entry in $rawData) {
 
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 5: SMB / NTLM Coercion via Path Redirection (LPE prompt §3.5)
+    #
+    # Gating: requires (a) a low-priv writable path — the entire exploit is a
+    # low-priv user planting an NTFS junction → drive-letter → \\attacker\share,
+    # so admin-only-writable paths can't trigger this primitive; admin already
+    # has SYSTEM-equivalent surface elsewhere. (b) a filesystem path — you can't
+    # plant an NTFS junction on a registry key. Without these gates the rule
+    # fires on every "privileged process reads anything," producing critical
+    # mislabels on HKLM\HARDWARE reads and similar Admin_To_System candidates.
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $isPrivileged -and $opDirection -eq "Read") {
+    if (-not $isDirectLead -and $isPrivileged -and $opDirection -eq "Read" `
+        -and $writableLow -and $isFsPath) {
         $severity = "Critical"
         $type = "SMB / NTLM Coercion Candidate"
         $exploitPrimitive = "SMB_Coercion"
@@ -713,8 +726,15 @@ foreach ($entry in $rawData) {
 
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 6: Arbitrary Write via Oplock + Junction (LPE prompt §3.5 + §3.7)
+    #
+    # Same gates as Rule 5: low-priv writable + filesystem. The oplock-swap
+    # primitive is the low-priv user holding an exclusive oplock on a directory
+    # they can write, then swapping the contents to an NTFS junction mid-write.
+    # Admin-only-writable paths aren't an LPE surface, and registry keys can't
+    # hold oplocks or NTFS junctions.
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($isPrivileged -and $opDirection -eq "Write" -or $anyPrivWrite)) {
+    if (-not $isDirectLead -and ($isPrivileged -and $opDirection -eq "Write" -or $anyPrivWrite) `
+        -and $writableLow -and $isFsPath) {
         $severity = "Critical"
         $type = "Arbitrary Write via Oplock+Junction"
         $exploitPrimitive = "Oplock_ArbitraryWrite"
@@ -730,8 +750,14 @@ foreach ($entry in $rawData) {
 
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 7: Pipe Planting via Path Redirection
+    #
+    # Already FS-path-gated via the drive-letter regex; adds $writableLow so
+    # the rule doesn't fire on a privileged read of a non-existent path under
+    # an admin-only directory (where a low-priv user couldn't plant the
+    # symlink anyway). Local drive-letter check intentionally kept narrower
+    # than $isFsPath: pipe planting via UNC is a separate primitive class.
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $isPrivileged -and $isNameNotFound -and
+    if (-not $isDirectLead -and $isPrivileged -and $isNameNotFound -and $writableLow -and
         ($path -notmatch "^\\\\\.\\pipe\\") -and ($path -match "^[a-zA-Z]:\\")) {
         $severity = "High"
         $type = "Pipe Planting via Path Redirection"
@@ -896,6 +922,51 @@ foreach ($entry in $rawData) {
                 AnyPrivWrite = $anyPrivWrite
                 OpenReparsePoint = $openRP
                 OpenLink = $openLink
+            })
+        } elseif ($isPrivilegedAny -and $isFsPath) {
+            # Catch-all for privileged-actor reads/writes on FS paths the prior
+            # two branches missed: ProgramData, non-system drives, third-party
+            # install paths, UNC. After the Rule 5/6/7 writability+FS gates
+            # these entries would otherwise vanish; preserve them as
+            # Admin_To_System / UAC_Bypass / supply-chain research candidates,
+            # perspective-tagged so the analyst knows what writability level
+            # they'd need to weaponize.
+            $writabilityNote = if ($writableLow) {
+                "low-priv-writable"
+            } elseif ($writableMed) {
+                "admin-writable (medium-IL — UAC_Bypass surface if consumer is auto-elevated)"
+            } elseif ($writableHigh) {
+                "admin-writable (high-IL only — Admin_To_System surface)"
+            } else {
+                "not writable from any tracked perspective"
+            }
+            $hint = "Privileged-actor-on-path candidate (no primitive rule matched). Path is $writabilityNote. Effective principal: $effectivePrincipal. Direction: $opDirection. Worth checking: (1) DLL search-order / KnownDLLs override, (2) ImagePath / ServiceDll in a paired registry key, (3) auto-elevated COM server load, (4) signed-binary side-loading, (5) supply-chain plant if path is a vendor install dir, (6) for UNC: SMB credential exposure / MitM."
+            if ($anyWrite -and $anyRead) {
+                $hint += " NOTE: BOTH read and write observed → race-window candidate."
+            } elseif ($opDirection -eq "Write") {
+                $hint += " NOTE: Process WRITES this file → if you can race/redirect, this is an arbitrary-write primitive at the $writableFrom level."
+            }
+            $cognitiveQueue.Add([PSCustomObject]@{
+                Path = $path
+                Processes = $procs
+                Operations = $operations
+                Hint = $hint
+                TraceFile = (Get-FieldValue $entry "TraceFile")
+                Timestamp = (Get-FieldValue $entry "Timestamp")
+                Operation = $operation
+                Result = $result
+                Detail = $detail
+                Integrity = $integrity
+                Impersonating = $impersonating
+                OperationDirection = $opDirection
+                SqosLevel = $sqos
+                EffectivePrincipal = $effectivePrincipal
+                WritableFrom = $writableFrom
+                AnyPrivRead  = $anyPrivRead
+                AnyPrivWrite = $anyPrivWrite
+                OpenReparsePoint = $openRP
+                OpenLink = $openLink
+                FilterReason = "PrivilegedActor_NoRuleMatched"
             })
         }
     } else {
