@@ -527,7 +527,16 @@ const RESEARCH_PROMPTS = [
         title: 'LPE (Local Privilege Escalation)',
         file: 'LPE_Research_Prompt.md',
         description: 'Reparse-point / REG_LINK / NTLM-coercion / oplock-junction primitives — medium IL → SYSTEM chains via privileged consumers of user-controllable namespaces.',
-        primitives: ['SMB_Coercion', 'Oplock_ArbitraryWrite', 'Pipe_Plant_Redirect', 'Pipe_Hijack', 'Registry_Coercion', 'Binary_Plant_HighPriv', 'Binary_Plant_UserSpace', 'SxS_DotLocal', 'Dependency_Hijack', 'Config_Poison', 'AppExecAlias_Plant', 'PowerShell_Profile', 'Electron_AsarTamper']
+        primitives: [
+            'SMB_Coercion', 'Oplock_ArbitraryWrite', 'Pipe_Plant_Redirect', 'Pipe_Hijack',
+            'Pipe_Instance_Squat', 'Pipe_Client_IPC_Sink',
+            'Registry_Coercion', 'Registry_BufferOverflow_TOCTOU', 'Registry_Data_Path_Reference',
+            'Binary_Plant_HighPriv', 'Binary_Plant_UserSpace', 'File_DeleteChild_Recreate',
+            'SxS_DotLocal', 'Dependency_Hijack', 'Config_Poison', 'AppExecAlias_Plant',
+            'PowerShell_Profile', 'Electron_AsarTamper', 'ACL_WriteDac_WriteOwner',
+            'Arbitrary_DACL_Overwrite', 'Arbitrary_Delete_ConfigMsi_LPE', 'Arbitrary_Move_FileRename',
+            'Parent_Directory_Reparse_Bypass', 'BackupSemantics_DACL_Bypass', 'Signature_TOCTOU_Bypass'
+        ]
     },
     {
         id: 'uac',

@@ -99,14 +99,20 @@
     // ── Color for a node ─────────────────────────────────────────────────────
     var PRIMITIVE_COLOR = {
         'smb_coercion':'#f03e3e', 'oplock_arbitrarywrite':'#ff6b6b', 'pipe_plant_redirect':'#e64980',
-        'pipe_hijack':'#d6336c', 'binary_plant_highpriv':'#f59f00', 'binary_plant_userspace':'#fcc419',
+        'pipe_hijack':'#d6336c', 'pipe_instance_squat':'#f06595', 'pipe_client_ipc_sink':'#cc5de8',
+        'binary_plant_highpriv':'#f59f00', 'binary_plant_userspace':'#fcc419', 'file_deletechild_recreate':'#ff922b',
         'config_poison':'#bd93f9', 'cert_plant':'#08bdbd', 'autorun_persistence':'#50fa7b',
         'dependency_hijack':'#ff79c6', 'sxs_dotlocal':'#ffb86c', 'webshell_plant':'#e599f7',
         'lnk_hijack':'#74c0fc', 'lolbin_proxy':'#69db7c', 'registry_coercion':'#fa5252',
+        'registry_bufferoverflow_toctou':'#ff8787', 'registry_data_path_reference':'#ffa8a8',
         'com_hijack_hkcu':'#fd7e14', 'env_hijack_hkcu':'#fab005', 'appexecalias_plant':'#40c057',
         'powershell_profile':'#15aabf', 'electron_asartamper':'#be4bdb', 'url_ntlm_coerce':'#339af0',
         'theme_ntlm_coerce':'#5c7cfa', 'desktopini_coerce':'#22b8cf', 'service_binarypath':'#c92a2a',
-        'ifeo_debugger':'#a61e4d', 'aedebug':'#862e9c', 'scheduledtask_plant':'#d9480f'
+        'ifeo_debugger':'#a61e4d', 'aedebug':'#862e9c', 'scheduledtask_plant':'#d9480f',
+        'acl_writedac_writeowner':'#e8590c', 'arbitrary_dacl_overwrite':'#e03131',
+        'arbitrary_delete_configmsi_lpe':'#f03e3e', 'arbitrary_move_filerename':'#ff6b6b',
+        'parent_directory_reparse_bypass':'#fa5252', 'backupsemantics_dacl_bypass':'#c92a2a',
+        'signature_toctou_bypass':'#e67700'
     };
 
     function getNodeColor(field, value) {

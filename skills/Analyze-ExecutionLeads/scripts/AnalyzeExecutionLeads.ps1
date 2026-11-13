@@ -138,7 +138,7 @@ function Get-EscalationCategory {
     if ($primitive -in @('LOLBin_Proxy','AutoRun_Persistence')) {
         return 'Proxy_Execution'
     }
-    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Binary_Plant_HighPriv','Pipe_Hijack','Config_Poison')) {
+    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Binary_Plant_HighPriv','Pipe_Hijack','Pipe_Instance_Squat','Pipe_Client_IPC_Sink','Config_Poison','Parent_Directory_Reparse_Bypass','File_DeleteChild_Recreate','Arbitrary_Delete_ConfigMsi_LPE','Arbitrary_DACL_Overwrite','Arbitrary_Move_FileRename','ACL_WriteDac_WriteOwner','Signature_TOCTOU_Bypass','BackupSemantics_DACL_Bypass','Registry_BufferOverflow_TOCTOU','Registry_Data_Path_Reference')) {
         switch ($writableFrom) {
             'LowPriv'       { return 'LPE' }
             'MediumILAdmin' { return 'UAC_Bypass' }
@@ -290,6 +290,25 @@ foreach ($entry in $rawData) {
     $highestIntegrity = Get-FieldValue $entry "HighestIntegrity" $integrity
     $isUserOnly       = [bool](Get-FieldValue $entry "IsUserOnlyConsumer" $false)
     $sqosFromFeed     = Get-FieldValue $entry "SqosLevel" "NotSpecified"
+    $procCmdLines     = Get-FieldValue $entry "ProcessCommandLines" ""
+    $aclSource        = Get-FieldValue $entry "AclSource" "none"
+    $hasDeleteOp      = [bool](Get-FieldValue $entry "HasDeleteOp" $false) -or ($operation -in @("SetDispositionInformationFile","SetDispositionInformationEx","RegDeleteKey","RegDeleteValue")) -or [bool](Get-FieldValue $entry "DeleteOnClose" $false) -or ($detail -match '(?i)Delete\s*On\s*Close|Desired\s*Access:[^\r\n,]*\bDelete\b')
+    $hasSetSecurityOp = [bool](Get-FieldValue $entry "HasSetSecurityOp" $false) -or ($operation -in @("SetSecurityFile","RegSetInfoKey")) -or ($detail -match '(?i)Desired\s*Access:[^\r\n,]*Write\s*(DAC|Owner)')
+    $hasRenameOp      = [bool](Get-FieldValue $entry "HasRenameOp" $false) -or ($operation -eq "SetRenameInformationFile")
+    $hasOpenForBackup = [bool](Get-FieldValue $entry "HasOpenForBackup" $false) -or [bool](Get-FieldValue $entry "OpenForBackup" $false) -or ($detail -match '(?i)Open\s*For\s*Backup')
+    $hasBufferOverflow = [bool](Get-FieldValue $entry "HasBufferOverflow" $false) -or ($result -match '(?i)BUFFER OVERFLOW|MORE DATA')
+    $hasVerifyThenLoad = [bool](Get-FieldValue $entry "HasVerifyThenLoad" $false)
+    $canWriteDacOrOwner = [bool](Get-FieldValue $entry "CanWriteDacOrOwner" $false)
+    $canDeleteOrReplace = [bool](Get-FieldValue $entry "CanDeleteOrReplace" $false)
+    $hasWritableAncestor = [bool](Get-FieldValue $entry "HasWritableAncestor" $false)
+    $writableAncestorPath = Get-FieldValue $entry "WritableAncestorPath" ""
+    $hasPipeInstField  = ($null -ne (Get-FieldValue $entry "CanCreatePipeInstance" $null))
+    $canCreatePipeInst = if ($hasPipeInstField) { [bool](Get-FieldValue $entry "CanCreatePipeInstance" $true) } else { $true }
+    $canWritePipeClient = [bool](Get-FieldValue $entry "CanWritePipeClient" $true)
+    $regDataPath       = Get-FieldValue $entry "RegistryDataPath" ""
+    if ([string]::IsNullOrWhiteSpace($regDataPath) -and $detail -match '(?i)\bData:\s*"?([a-zA-Z]:\\[^"\r\n,;]+|\\\\[^"\r\n,;]+)') {
+        $regDataPath = $matches[1].Trim()
+    }
 
     # Perspective-aware writability fields (rev 3 parser). Backwards compat:
     # if the feed predates rev 3, every path defaults to LowPriv-writable
@@ -362,11 +381,11 @@ foreach ($entry in $rawData) {
     }
 
     # When EVERY observed event already had Open Reparse Point set, the
-    # consumer is correctly using FILE_FLAG_OPEN_REPARSE_POINT. Demote to the
-    # cognitive queue with a hint so an analyst can still scan the surrounding
-    # code path (LPE §2: another open of the same path elsewhere may still be
-    # missing the flag).
-    if ($allOpenRP -and -not $anyWrite) {
+    # consumer is using FILE_FLAG_OPEN_REPARSE_POINT on the leaf. However,
+    # FILE_OPEN_REPARSE_POINT only protects the final path component — if an
+    # intermediate ancestor directory is modifiable/replaceable ($hasWritableAncestor),
+    # keep it in the main pipeline so Rule 5.1 (Parent_Directory_Reparse_Bypass) fires.
+    if ($allOpenRP -and (-not $anyWrite) -and (-not $hasWritableAncestor)) {
         $dropOpenReparse++
         $cognitiveQueue.Add([PSCustomObject]@{
             Path = $path
@@ -435,15 +454,29 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 1: Named Pipe Hijacking (literal pipe paths)
+    # RULE 1: Named Pipe Hijacking / Instance Squatting / Client IPC Sink
     # ─────────────────────────────────────────────────────────────────────────
     if ($path -match "^\\\\\.\\pipe\\" -and ($writableLow -or $writableMed)) {
-        $severity = "Critical"
-        $type = "Named Pipe Hijacking / Impersonation"
-        $exploitPrimitive = "Pipe_Hijack"
-        $reason = "Direct named-pipe endpoint at a writable location. A medium-IL attacker can plant a pipe server here and capture connecting clients."
+        if ($aclSource -in @("named-pipe-live-dacl", "pipe-dacl") -or ($hasPipeInstField -and -not $canCreatePipeInst)) {
+            if ($canCreatePipeInst) {
+                $severity = "Critical"
+                $type = "Active Named Pipe Instance Squatting"
+                $exploitPrimitive = "Pipe_Instance_Squat"
+                $reason = "Active named pipe DACL grants FILE_CREATE_PIPE_INSTANCE (0x4) to a standard user. A medium-IL process can create a secondary pipe server instance to intercept subsequent clients."
+            } else {
+                $severity = "High"
+                $type = "Named Pipe Client IPC Sink"
+                $exploitPrimitive = "Pipe_Client_IPC_Sink"
+                $reason = "Active named pipe DACL denies instance creation but grants FILE_WRITE_DATA (0x2) to a standard user. Audit the pipe server's message handler for unauthenticated IPC commands or path-processing sinks."
+            }
+        } else {
+            $severity = "Critical"
+            $type = "Named Pipe Hijacking / Impersonation"
+            $exploitPrimitive = "Pipe_Hijack"
+            $reason = "Direct named-pipe endpoint at a writable location. A medium-IL attacker can plant a pipe server here and capture connecting clients."
+        }
         if ($isPrivileged) {
-            $reason += " PRIVILEGED CLIENT ($effectiveIntegrity) connects → token material available."
+            $reason += " PRIVILEGED ACTOR ($effectiveIntegrity) interacts with pipe → token or IPC surface available."
         }
         if ($sqos -in @("NotSpecified","Impersonation","Delegation")) {
             $reason += " SQOS=$sqos → impersonation-safe for service accounts; SMB relay viable for standard users."
@@ -580,6 +613,39 @@ foreach ($entry in $rawData) {
             $severity = "Critical"
         }
         $reason = "HKCU\\Environment is consumed by 'ExpandEnvironmentStringsForUser' and the user's logon path resolution.${valHint} A privileged auto-elevation task (e.g. SilentCleanup, fodhelper, computerdefaults) that fails to enforce per-user environment isolation will resolve a hijacked variable while running High/SYSTEM."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 1.11: Backup Semantics Open (FILE_FLAG_BACKUP_SEMANTICS indicator)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $hasOpenForBackup -and ($writableLow -or $writableMed -or $anyImpersonating) -and $isFsPath) {
+        $severity = "Critical"
+        $type = "Backup Semantics Open (DACL Override Indicator)"
+        $exploitPrimitive = "BackupSemantics_DACL_Bypass"
+        $reason = "Privileged process ($effectiveIntegrity) opened a user-accessible path with FILE_FLAG_BACKUP_SEMANTICS ('Open For Backup'). When combined with active SeBackupPrivilege / SeRestorePrivilege, path redirection can bypass standard DACL enforcement on target files. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 2.0a: Signature Verification TOCTOU (Verify-then-Load without Lock)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $hasVerifyThenLoad -and ($isPrivileged -or $isPrivilegedAny) -and ($writableLow -or $writableMed) -and $path -match "\.(exe|dll|sys|msi|msp|ocx|cpl|cab|cat)$") {
+        $severity = "Critical"
+        $type = "Signature Verification TOCTOU (Verify-then-Load without Exclusive Lock)"
+        $exploitPrimitive = "Signature_TOCTOU_Bypass"
+        $reason = "Trace shows a privileged read/verification event followed by an execution or image load on a writable binary where an open permitted concurrent write/delete sharing. Because the file handle was not locked exclusively across verification and load, the file can be modified between signature check and load. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 2.0b: Read-Only File Replaceable via Parent FILE_DELETE_CHILD
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $canDeleteOrReplace -and ($isPrivileged -or $isPrivilegedAny) -and $isFsPath) {
+        $severity = "Critical"
+        $type = "Read-Only File Replaceable via Parent Delete-Child"
+        $exploitPrimitive = "File_DeleteChild_Recreate"
+        $reason = "Target file DACL is not directly writable, but its parent directory grants FILE_DELETE_CHILD (0x40) and FILE_ADD_FILE (0x2) to a non-admin principal (AclSource=$aclSource). Under Windows NTFS semantics, POSIX-style unlinking or deletion and recreation replaces the read-only file consumed by a privileged process ($effectiveIntegrity). Effective principal: $effectivePrincipal."
         $isDirectLead = $true
     }
 
@@ -797,6 +863,50 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
+    # RULE 5.1: Privileged Security Descriptor Modification (SetSecurityFile / RegSetInfoKey)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $hasSetSecurityOp -and ($writableLow -or $hasWritableAncestor)) {
+        $severity = "Critical"
+        $type = "Privileged Security Descriptor Modification on Redirectable Path"
+        $exploitPrimitive = "Arbitrary_DACL_Overwrite"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) performs a security descriptor modification (SetSecurityFile / RegSetInfoKey / WriteDAC) on a user-writable or ancestor-redirectable path. Redirecting the target path before the DACL write applies a permissive DACL to a protected system resource. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 5.2: Privileged File/Directory Deletion (SetDispositionInformationFile / DeleteOnClose)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $hasDeleteOp -and ($writableLow -or $hasWritableAncestor) -and $isFsPath) {
+        $severity = "Critical"
+        $type = "Privileged File/Directory Deletion on Redirectable Path"
+        $exploitPrimitive = "Arbitrary_Delete_ConfigMsi_LPE"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) performs a file/directory deletion (SetDispositionInformationFile / DeleteOnClose / DELETE access) on a user-writable or ancestor-redirectable path. Redirecting the parent directory via junction/oplock converts this into an arbitrary deletion primitive (e.g., C:\\Config.Msi rollback replacement). Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 5.3: Privileged File Move / Rename (SetRenameInformationFile)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $hasRenameOp -and ($writableLow -or $hasWritableAncestor) -and $isFsPath) {
+        $severity = "Critical"
+        $type = "Privileged File Move / Rename on Redirectable Path"
+        $exploitPrimitive = "Arbitrary_Move_FileRename"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) performs a file move/rename operation (SetRenameInformationFile) involving a user-writable or ancestor-redirectable path. Redirecting the destination or source mid-operation enables arbitrary file placement into protected directories. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 5.4: Ancestor Directory Junction Redirect (OpenReparsePoint Bypass)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $allOpenRP -and $hasWritableAncestor -and $writableLow -and $isFsPath) {
+        $severity = "Critical"
+        $type = "Ancestor Directory Junction Redirect (OpenReparsePoint Bypass)"
+        $exploitPrimitive = "Parent_Directory_Reparse_Bypass"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) opens the leaf path with FILE_OPEN_REPARSE_POINT, which only suppresses reparse traversal on the final path component. Because intermediate ancestor directory '$writableAncestorPath' is writable by a non-admin principal, replacing the ancestor with an NTFS junction redirects path resolution before the leaf check is reached. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
     # RULE 5: SMB / NTLM Coercion via Path Redirection (LPE prompt §3.5)
     #
     # Gating: requires (a) a low-priv writable path — the entire exploit is a
@@ -840,6 +950,17 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
+    # RULE 10.1: Registry Query Buffer Sizing Double-Read (BUFFER OVERFLOW)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $hasBufferOverflow -and ($writableLow -or $writableMed) -and $path -match "^HK") {
+        $severity = "High"
+        $type = "Registry Query Buffer Sizing Double-Read (TOCTOU Indicator)"
+        $exploitPrimitive = "Registry_BufferOverflow_TOCTOU"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) received BUFFER OVERFLOW / MORE DATA while querying a user-writable registry value, indicating a two-step size-query then data-read pattern. Modifying the value size or type between the two reads can trigger heap buffer miscalculation or type confusion. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
     # RULE 10: Registry Path Coercion via REG_LINK
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and $isPrivileged -and ($writableLow -or $writableMed) -and ($path -match "^HKCU" -or $path -match "^HKEY_CURRENT_USER" -or $path -match "^HKU\\" -or $path -match "^HKEY_USERS\\")) {
@@ -855,8 +976,35 @@ foreach ($entry in $rawData) {
                 $reason += " (Caveat: at least one observed open used REG_OPTION_OPEN_LINK — target an open that omits the flag.)"
                 $severity = "High"
             }
+            if (-not [string]::IsNullOrWhiteSpace($regDataPath)) {
+                $reason += " Value data references path '$regDataPath'."
+            }
             $isDirectLead = $true
         }
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 10.2: Registry Value Data References Filesystem / UNC Path
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and (-not [string]::IsNullOrWhiteSpace($regDataPath)) -and ($writableLow -or $writableMed) -and $path -match "^HK") {
+        $severity = "High"
+        $type = "Writable Registry Value Referencing File/UNC Path"
+        $exploitPrimitive = "Registry_Data_Path_Reference"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) reads or writes a writable registry value whose data points to '$regDataPath'. Modifying this registry value redirects the privileged consumer to an arbitrary file or UNC path. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 11: DACL Modification Rights (WRITE_DAC / WRITE_OWNER / Owner Rights)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and ($isPrivileged -or $isPrivilegedAny) -and $canWriteDacOrOwner -and ($writableLow -or $writableMed)) {
+        $severity = "High"
+        $type = "DACL / Ownership Modification Rights on Privileged Resource"
+        $exploitPrimitive = "ACL_WriteDac_WriteOwner"
+        $reason = "Principal holds WRITE_DAC, WRITE_OWNER, or implicit Owner WRITE_DAC rights on a resource accessed by a privileged process ($effectiveIntegrity). Granting FullControl in the DACL enables direct modification of the resource. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    } elseif ($isDirectLead -and $canWriteDacOrOwner) {
+        $reason += " [DACL Note: Principal holds WRITE_DAC / WRITE_OWNER or implicit Owner WRITE_DAC rights]"
     }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1109,6 +1257,15 @@ foreach ($entry in $rawData) {
             WritableByHighILAdmin   = $writableHigh
             WritableFrom            = $writableFrom
             IntegrityLabel          = $intLabel
+            # Telemetry & DACL depth (rev 3.4)
+            ProcessCommandLines     = $procCmdLines
+            AclSource               = $aclSource
+            CanWriteDacOrOwner      = $canWriteDacOrOwner
+            CanDeleteOrReplace      = $canDeleteOrReplace
+            HasWritableAncestor     = $hasWritableAncestor
+            WritableAncestorPath    = $writableAncestorPath
+            RegistryDataPath        = $regDataPath
+            WritableByAppContainer  = [bool](Get-FieldValue $entry "WritableByAppContainer" $false)
         })
     }
 }

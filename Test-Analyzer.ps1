@@ -164,6 +164,134 @@ $mockData = @(
         WritableByMediumILAdmin = $true
         WritableByHighILAdmin = $true
         WritableFrom = "LowPriv"
+    },
+    # --- rev 3.4 test cases ---
+    [PSCustomObject]@{
+        Path = "C:\ProgramData\VendorSuite\LockedSubdir\state.dat"
+        RelatedProcesses = "VendorService.exe"
+        Operation = "CreateFile"
+        Result = "SUCCESS"
+        Detail = "Desired Access: Generic Read, Options: Open Reparse Point"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        OpenReparsePoint = $true
+        AnyOpenReparsePoint = $true
+        AllOpenReparsePoint = $true
+        HasWritableAncestor = $true
+        WritableAncestorPath = "C:\ProgramData\VendorSuite"
+        AclSource = "ancestor-dir-replaceable"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "C:\Users\Alice\AppData\Local\Temp\UpdaterCleanup\staging.tmp"
+        RelatedProcesses = "UpdateService.exe"
+        Operation = "SetDispositionInformationFile"
+        Result = "SUCCESS"
+        Detail = "Delete: True"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        HasDeleteOp = $true
+        AnyPrivWrite = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "C:\ProgramData\VendorAgent\logs\audit.log"
+        RelatedProcesses = "VendorAgent.exe"
+        Operation = "SetSecurityFile"
+        Result = "SUCCESS"
+        Detail = "Information: DACL"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        HasSetSecurityOp = $true
+        AnyPrivWrite = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "C:\ProgramData\VendorApp\ReadOnlyPlugin.dll"
+        RelatedProcesses = "VendorService.exe"
+        Operation = "Load Image"
+        Result = "SUCCESS"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        CanDeleteOrReplace = $true
+        AclSource = "parent-delete-recreate"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "\\.\pipe\VendorServiceControlPipe"
+        RelatedProcesses = "VendorService.exe"
+        Operation = "CreateFile"
+        Result = "SUCCESS"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        CanCreatePipeInstance = $false
+        CanWritePipeClient = $true
+        AclSource = "pipe-dacl"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "HKCU\Software\VendorService\ConfigBuffer"
+        RelatedProcesses = "VendorService.exe"
+        Operation = "RegQueryValue"
+        Result = "BUFFER OVERFLOW"
+        Detail = "Length: 512"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        HasBufferOverflow = $true
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "C:\ProgramData\VendorUpdater\signed_update.exe"
+        RelatedProcesses = "VendorUpdater.exe"
+        Operation = "Load Image"
+        Result = "SUCCESS"
+        Detail = "ShareMode: Read, Write, Delete"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        HasVerifyThenLoad = $true
+        HasSharedWriteOrDelete = $true
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "C:\ProgramData\BackupService\restore_target.dat"
+        RelatedProcesses = "BackupSvc.exe"
+        Operation = "CreateFile"
+        Result = "SUCCESS"
+        Detail = "Desired Access: Generic Read/Write, Options: Open For Backup"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        HasOpenForBackup = $true
+        AnyPrivWrite = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
     }
 )
 
@@ -198,7 +326,15 @@ if (Test-Path $analyzerScript) {
         "ScheduledTask_Plant",
         "Pipe_Plant_Redirect",
         "SMB_Coercion",
-        "Service_BinaryPath"
+        "Service_BinaryPath",
+        "Parent_Directory_Reparse_Bypass",
+        "Arbitrary_Delete_ConfigMsi_LPE",
+        "Arbitrary_DACL_Overwrite",
+        "File_DeleteChild_Recreate",
+        "Pipe_Client_IPC_Sink",
+        "Registry_BufferOverflow_TOCTOU",
+        "Signature_TOCTOU_Bypass",
+        "BackupSemantics_DACL_Bypass"
     )
     $allPassed = $true
     foreach ($ep in $expectedPrimitives) {

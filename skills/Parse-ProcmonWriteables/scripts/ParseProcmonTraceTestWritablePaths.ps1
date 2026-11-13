@@ -85,17 +85,22 @@ if (-not $parser.EndOfData) {
     }
 }
 
-$idxTime = if ($headerMap.ContainsKey("time of day")) { $headerMap["time of day"] } else { 0 }
-$idxProc = if ($headerMap.ContainsKey("process name")) { $headerMap["process name"] } else { 1 }
-$idxPid  = if ($headerMap.ContainsKey("pid")) { $headerMap["pid"] } else { -1 }
-$idxOp   = if ($headerMap.ContainsKey("operation")) { $headerMap["operation"] } else { 3 }
-$idxPath = if ($headerMap.ContainsKey("path")) { $headerMap["path"] } else { 4 }
-$idxRes  = if ($headerMap.ContainsKey("result")) { $headerMap["result"] } else { 5 }
-$idxDet  = if ($headerMap.ContainsKey("detail")) { $headerMap["detail"] } else { 6 }
-$idxInt  = if ($headerMap.ContainsKey("integrity")) { $headerMap["integrity"] } else { -1 }
-$idxImp  = if ($headerMap.ContainsKey("impersonating")) { $headerMap["impersonating"] } else { -1 }
+$idxTime    = if ($headerMap.ContainsKey("time of day")) { $headerMap["time of day"] } else { 0 }
+$idxProc    = if ($headerMap.ContainsKey("process name")) { $headerMap["process name"] } else { 1 }
+$idxPid     = if ($headerMap.ContainsKey("pid")) { $headerMap["pid"] } else { -1 }
+$idxOp      = if ($headerMap.ContainsKey("operation")) { $headerMap["operation"] } else { 3 }
+$idxPath    = if ($headerMap.ContainsKey("path")) { $headerMap["path"] } else { 4 }
+$idxRes     = if ($headerMap.ContainsKey("result")) { $headerMap["result"] } else { 5 }
+$idxDet     = if ($headerMap.ContainsKey("detail")) { $headerMap["detail"] } else { 6 }
+$idxInt     = if ($headerMap.ContainsKey("integrity")) { $headerMap["integrity"] } else { -1 }
+$idxImp     = if ($headerMap.ContainsKey("impersonating")) { $headerMap["impersonating"] } else { -1 }
+$idxTid     = if ($headerMap.ContainsKey("tid")) { $headerMap["tid"] } else { -1 }
+$idxCmdLine = if ($headerMap.ContainsKey("command line")) { $headerMap["command line"] } else { -1 }
+$idxParent  = if ($headerMap.ContainsKey("parent pid")) { $headerMap["parent pid"] } else { -1 }
+$idxSession = if ($headerMap.ContainsKey("session")) { $headerMap["session"] } else { -1 }
 
 $traceFileName = Split-Path $CsvPath -Leaf
+$processLineageMap = @{}
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -167,7 +172,7 @@ function Get-IntegrityRank {
     }
 }
 
-# Build volume device -> drive letter map once for \Device\HarddiskVolume<N> normalization.
+# Build volume device -> drive letter map and unprivileged Mandatory Label reader.
 $script:_driveMap = @{}
 try {
     if (-not ("Win32DeviceMap.DosDeviceHelper" -as [type])) {
@@ -183,6 +188,49 @@ namespace Win32DeviceMap {
             StringBuilder sb = new StringBuilder(1000);
             uint result = QueryDosDevice(driveLetter, sb, 1000);
             if (result > 0) return sb.ToString();
+            return "";
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern uint GetNamedSecurityInfoW(
+            string pObjectName,
+            int ObjectType,
+            uint SecurityInfo,
+            out IntPtr ppsidOwner,
+            out IntPtr ppsidGroup,
+            out IntPtr ppDacl,
+            out IntPtr ppSacl,
+            out IntPtr ppSecurityDescriptor);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            IntPtr SecurityDescriptor,
+            uint RequestedStringSDRevision,
+            uint SecurityInformation,
+            out IntPtr StringSecurityDescriptor,
+            out uint StringSecurityDescriptorLen);
+
+        [DllImport("kernel32.dll")]
+        static extern IntPtr LocalFree(IntPtr hMem);
+
+        // SE_FILE_OBJECT = 1, SE_REGISTRY_KEY = 4; LABEL_SECURITY_INFORMATION = 0x00000010
+        public static string GetMandatoryLabelSddl(string objectName, int objectType) {
+            IntPtr owner, group, dacl, sacl, sd;
+            uint err = GetNamedSecurityInfoW(objectName, objectType, 0x00000010u, out owner, out group, out dacl, out sacl, out sd);
+            if (err != 0 || sd == IntPtr.Zero) return "";
+            try {
+                IntPtr strSd;
+                uint strLen;
+                if (ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1u, 0x00000010u, out strSd, out strLen) && strSd != IntPtr.Zero) {
+                    try {
+                        return Marshal.PtrToStringUni(strSd) ?? "";
+                    } finally {
+                        LocalFree(strSd);
+                    }
+                }
+            } finally {
+                LocalFree(sd);
+            }
             return "";
         }
     }
@@ -314,23 +362,44 @@ function Get-DetailFlags {
         IsPagingIO        = $false
         OpenReparsePoint  = $false
         OpenLink          = $false
+        DeleteOnClose     = $false
+        OpenForBackup     = $false
         SqosLevel         = "NotSpecified"
         DesiredAccess     = ""
+        Disposition       = ""
+        ShareMode         = ""
+        RegistryDataPath  = ""
+        CommandLine       = ""
     }
     if ([string]::IsNullOrWhiteSpace($Detail)) { return $flags }
 
     if ($Detail -match '(?i)Paging\s*I/?O') { $flags.IsPagingIO = $true }
-    # Procmon Options field: "Open Reparse Point", "Synchronous IO Non-Alert", etc.
+    # Procmon Options field: "Open Reparse Point", "Delete On Close", "Open For Backup"
     if ($Detail -match '(?i)Open\s*Reparse\s*Point') { $flags.OpenReparsePoint = $true }
+    if ($Detail -match '(?i)Delete\s*On\s*Close')    { $flags.DeleteOnClose    = $true }
+    if ($Detail -match '(?i)Open\s*For\s*Backup')    { $flags.OpenForBackup    = $true }
     # Registry symlink open: "Open Link" or "REG_OPTION_OPEN_LINK"
     if ($Detail -match '(?i)Open\s*Link|REG_OPTION_OPEN_LINK|OBJ_OPENLINK') { $flags.OpenLink = $true }
     # SQOS impersonation level
     if ($Detail -match '(?i)Impersonation(?:\s*Level)?:\s*(Impersonation|Delegation|Identification|Anonymous)') {
         $flags.SqosLevel = $matches[1]
     }
-    # Desired Access (informational; useful for Load Image / write detection)
-    if ($Detail -match '(?i)Desired\s*Access:\s*([^,]+)') {
+    # Desired Access (captures full comma-separated list up to the next named field)
+    if ($Detail -match '(?i)Desired\s*Access:\s*(.+?)(?:,\s*(?:Disposition|Options|ShareMode|Attributes|AllocationSize|OpenResult|Impersonating|Security\s*QOS):|$)') {
         $flags.DesiredAccess = $matches[1].Trim()
+    }
+    if ($Detail -match '(?i)Disposition:\s*([^,\r\n]+)') {
+        $flags.Disposition = $matches[1].Trim()
+    }
+    if ($Detail -match '(?i)ShareMode:\s*(.+?)(?:,\s*(?:Attributes|Options|AllocationSize|OpenResult|Impersonating):|$)') {
+        $flags.ShareMode = $matches[1].Trim()
+    }
+    # Registry value Data containing a filesystem or UNC path
+    if ($Detail -match '(?i)\bData:\s*"?([a-zA-Z]:\\[^"\r\n,;]+|\\\\[^"\r\n,;]+)') {
+        $flags.RegistryDataPath = $matches[1].Trim()
+    }
+    if ($Detail -match '(?i)Command\s*line:\s*(.+)$') {
+        $flags.CommandLine = $matches[1].Trim()
     }
     return $flags
 }
@@ -348,8 +417,21 @@ while (-not $parser.EndOfData) {
         if ($fields.Length -lt 5) { continue }
 
         $processName = if ($idxProc -lt $fields.Length) { $fields[$idxProc] } else { "" }
-        $pathRawOrig = if ($idxPath -lt $fields.Length) { $fields[$idxPath] } else { "" }
+        $pidVal      = if ($idxPid -ge 0 -and $idxPid -lt $fields.Length) { $fields[$idxPid] } else { "" }
+        $opStr       = if ($idxOp -lt $fields.Length)   { $fields[$idxOp] } else { "" }
+        $detailStr   = if ($idxDet -lt $fields.Length)  { $fields[$idxDet] } else { "" }
+        $cmdColStr   = if ($idxCmdLine -ge 0 -and $idxCmdLine -lt $fields.Length) { $fields[$idxCmdLine] } else { "" }
 
+        # Capture Process Create / Process Start command-line lineage before path filtering
+        if (-not [string]::IsNullOrWhiteSpace($processName)) {
+            if (-not [string]::IsNullOrWhiteSpace($cmdColStr)) {
+                $processLineageMap[$processName] = $cmdColStr.Trim()
+            } elseif ($opStr -match '^(?i)Process\s*(Start|Create)' -and $detailStr -match '(?i)Command\s*line:\s*(.+)$') {
+                $processLineageMap[$processName] = $matches[1].Trim()
+            }
+        }
+
+        $pathRawOrig = if ($idxPath -lt $fields.Length) { $fields[$idxPath] } else { "" }
         if ([string]::IsNullOrWhiteSpace($pathRawOrig)) { continue }
 
         # Normalize \??\, \Device\HarddiskVolume<N>, \Device\NamedPipe, \REGISTRY\...
@@ -371,9 +453,7 @@ while (-not $parser.EndOfData) {
         }
 
         $timeStr   = if ($idxTime -lt $fields.Length) { $fields[$idxTime] } else { "" }
-        $opStr     = if ($idxOp -lt $fields.Length)   { $fields[$idxOp] } else { "" }
         $resStr    = if ($idxRes -lt $fields.Length)  { $fields[$idxRes] } else { "" }
-        $detailStr = if ($idxDet -lt $fields.Length)  { $fields[$idxDet] } else { "" }
         $integStr  = if ($idxInt -ge 0 -and $idxInt -lt $fields.Length) { $fields[$idxInt] } else { "Unknown" }
         $impStr    = if ($idxImp -ge 0 -and $idxImp -lt $fields.Length) { $fields[$idxImp] } else { "" }
 
@@ -383,6 +463,9 @@ while (-not $parser.EndOfData) {
         }
 
         $detailFlags = Get-DetailFlags -Detail $detailStr
+        if (-not [string]::IsNullOrWhiteSpace($detailFlags.CommandLine) -and -not [string]::IsNullOrWhiteSpace($processName)) {
+            $processLineageMap[$processName] = $detailFlags.CommandLine
+        }
         $isKernelAttrib = $kernelAttribProcs -contains $processName.Trim()
 
         # Track Paging-I/O drop count (still index it for the analyzer to know
@@ -400,8 +483,13 @@ while (-not $parser.EndOfData) {
             IsPagingIO             = $detailFlags.IsPagingIO
             OpenReparsePoint       = $detailFlags.OpenReparsePoint
             OpenLink               = $detailFlags.OpenLink
+            DeleteOnClose          = $detailFlags.DeleteOnClose
+            OpenForBackup          = $detailFlags.OpenForBackup
             SqosLevel              = $detailFlags.SqosLevel
             DesiredAccess          = $detailFlags.DesiredAccess
+            Disposition            = $detailFlags.Disposition
+            ShareMode              = $detailFlags.ShareMode
+            RegistryDataPath       = $detailFlags.RegistryDataPath
             IsKernelOrCacheManager = $isKernelAttrib
         }
 
@@ -429,6 +517,16 @@ while (-not $parser.EndOfData) {
                 AllOpenLink = $true
                 RegOpenEventCount   = 0
                 AnyPagingIO = $false
+                HasDeleteOp = $false
+                HasSetSecurityOp = $false
+                HasRenameOp = $false
+                HasOpenForBackup = $false
+                HasBufferOverflow = $false
+                HasSharedWriteOrDelete = $false
+                HasReadOrCheckOp = $false
+                HasLoadOrExecOp  = $false
+                HasNameNotFound  = $false
+                RegistryDataPaths = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
                 NamePrincipals = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
             }
         }
@@ -464,6 +562,39 @@ while (-not $parser.EndOfData) {
             if (-not $detailFlags.OpenLink) { $rec.AllOpenLink = $false }
         }
         if ($detailFlags.IsPagingIO) { $rec.AnyPagingIO = $true }
+
+        # Granular operation & Detail flag tracking (rev 3.4)
+        if ($opStr -in @("SetDispositionInformationFile", "SetDispositionInformationEx", "RegDeleteKey", "RegDeleteValue") -or
+            $detailFlags.DeleteOnClose -or ($detailFlags.DesiredAccess -match '(?i)\bDelete\b')) {
+            $rec.HasDeleteOp = $true
+        }
+        if ($opStr -in @("SetSecurityFile", "RegSetInfoKey") -or ($detailFlags.DesiredAccess -match '(?i)Write\s*(DAC|Owner)')) {
+            $rec.HasSetSecurityOp = $true
+        }
+        if ($opStr -eq "SetRenameInformationFile") {
+            $rec.HasRenameOp = $true
+        }
+        if ($detailFlags.OpenForBackup) {
+            $rec.HasOpenForBackup = $true
+        }
+        if ($resStr -match '(?i)BUFFER OVERFLOW|MORE DATA') {
+            $rec.HasBufferOverflow = $true
+        }
+        if ($resStr -match '(?i)NAME NOT FOUND') {
+            $rec.HasNameNotFound = $true
+        }
+        if ($detailFlags.ShareMode -match '(?i)(Write|Delete)') {
+            $rec.HasSharedWriteOrDelete = $true
+        }
+        if ($opStr -in @("ReadFile", "QueryBasicInformationFile", "QueryOpen")) {
+            $rec.HasReadOrCheckOp = $true
+        }
+        if ($opStr -match '(?i)Load\s*Image|Process\s*(Create|Start)') {
+            $rec.HasLoadOrExecOp = $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace($detailFlags.RegistryDataPath)) {
+            [void]$rec.RegistryDataPaths.Add($detailFlags.RegistryDataPath)
+        }
 
         $score = Get-EventScore -Evt $evt
         if ($score -gt $rec.BestScore) {
@@ -533,6 +664,17 @@ Write-Host "Starting safe permission tests (no destructive writes)..." -Foregrou
 # so the same mask works for both ACL families in Invoke-DaclEvaluation below.
 $script:_plantBits = [int]([System.Security.AccessControl.FileSystemRights]::WriteData) -bor `
                      [int]([System.Security.AccessControl.FileSystemRights]::AppendData)
+$script:_dacOwnerBits         = 0x00040000 -bor 0x00080000 # WRITE_DAC | WRITE_OWNER
+$script:_deleteBit            = 0x00010000                 # DELETE
+$script:_deleteChildBit       = 0x00000040                 # FILE_DELETE_CHILD
+$script:_regCreateLinkBit     = 0x00000020                 # KEY_CREATE_LINK
+$script:_pipeCreateInstBit    = 0x00000004                 # FILE_CREATE_PIPE_INSTANCE
+$script:_pipeClientWriteBit   = 0x00000002                 # FILE_WRITE_DATA
+$script:_appContainerSids     = @(
+    'S-1-15-2-1',       # ALL APPLICATION PACKAGES
+    'S-1-15-2-2'        # ALL RESTRICTED APPLICATION PACKAGES
+)
+$script:_dirEvalCache = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Hashtable]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 # SID classification. Names match the canonical well-known SIDs.
 $script:_lowPrivSids = @(
@@ -696,12 +838,9 @@ function Invoke-DaclEvaluation {
     )
 
     $rules = $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+    $effectiveWriteMask = $script:_plantBits -bor $script:_dacOwnerBits
 
-    # Conditional / callback ACE detection via raw SDDL. GetAccessRules drops
-    # the AceType byte, so we re-parse the SDDL with CommonSecurityDescriptor
-    # (which preserves it) and build SID-keyed sets of unconditional vs
-    # callback Allow grants AND unconditional vs callback Deny restrictions
-    # (rev 3.2 symmetric DENY handling).
+    # Conditional / callback ACE detection via raw SDDL.
     $sddl = $null
     try { $sddl = $Acl.Sddl } catch { $sddl = $null }
     $unconditionalAllowSids = New-Object System.Collections.Generic.HashSet[string]
@@ -709,10 +848,15 @@ function Invoke-DaclEvaluation {
     $unconditionalDenySids  = New-Object System.Collections.Generic.HashSet[string]
     $conditionalDenySids    = New-Object System.Collections.Generic.HashSet[string]
     if (-not [string]::IsNullOrWhiteSpace($sddl)) {
-        # Check SACL for an explicit Mandatory Label (HI = High, SI = System) if present in SDDL
-        if ($sddl -match 'S:\([^)]*ML[^)]*;;;(HI|SI|S-1-16-12288|S-1-16-16384)\)') {
+        # Check SACL for an explicit Mandatory Label (LW/ME/HI/SI) if present in SDDL
+        if ($sddl -match 'S:\([^)]*ML[^)]*;;;(LW|ME|HI|SI|S-1-16-\d+)\)') {
             $mlToken = $matches[1]
-            $Result.IntegrityLabel = if ($mlToken -eq 'SI' -or $mlToken -eq 'S-1-16-16384') { "System" } else { "High" }
+            switch ($mlToken) {
+                { $_ -eq 'SI' -or $_ -eq 'S-1-16-16384' } { $Result.IntegrityLabel = "System" }
+                { $_ -eq 'HI' -or $_ -eq 'S-1-16-12288' } { $Result.IntegrityLabel = "High" }
+                { $_ -eq 'LW' -or $_ -eq 'S-1-16-4096'  } { $Result.IntegrityLabel = "Low" }
+                { $_ -eq 'ME' -or $_ -eq 'S-1-16-8192'  } { $Result.IntegrityLabel = "Medium" }
+            }
         }
         try {
             $csd = New-Object System.Security.AccessControl.CommonSecurityDescriptor(
@@ -720,7 +864,7 @@ function Invoke-DaclEvaluation {
             foreach ($ace in $csd.DiscretionaryAcl) {
                 if (-not ($ace -is [System.Security.AccessControl.CommonAce])) { continue }
                 $aceMask = [int]$ace.AccessMask
-                if (($aceMask -band $script:_plantBits) -eq 0) { continue }
+                if (($aceMask -band $effectiveWriteMask) -eq 0) { continue }
                 $aceSid  = $ace.SecurityIdentifier.Value
                 $aceType = $ace.AceType
                 $isAllow = ($aceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) `
@@ -747,39 +891,65 @@ function Invoke-DaclEvaluation {
                 $Result.ConditionalACESddl = $sddl
             }
         } catch {
-            # SDDL parser hiccup (malformed / extremely long descriptors).
-            # Fall through; the rules loop behaves as it did before rev 3.1.
+            # SDDL parser hiccup — fall through to standard rule iteration.
         }
     }
 
     $allowedLow = $false; $deniedLow = $false
     $allowedMed = $false; $deniedMed = $false
     $allowedHigh = $false; $deniedHigh = $false
+    $allowedAppContainer = $false; $deniedAppContainer = $false
+    $hasOwnerRightsAce = $false
     $flaggedConditionalSids = New-Object System.Collections.Generic.HashSet[string]
+    $serviceSids = New-Object System.Collections.Generic.HashSet[string]
 
     foreach ($rule in $rules) {
         $sid = $rule.IdentityReference.Value
-        if ($sid -eq 'S-1-3-0') { continue }                # CREATOR OWNER
-        if ($script:_systemSids -contains $sid) { continue } # unreachable from our perspectives
+        if ($sid -eq 'S-1-3-0') { continue } # CREATOR OWNER
+        if ($sid -eq 'S-1-3-4') { $hasOwnerRightsAce = $true }
+        if ($script:_systemSids -contains $sid) { continue }
 
         $rights = if ($IsRegistry) {
             [int]$rule.RegistryRights
         } else {
             [int]$rule.FileSystemRights
         }
-        if (($rights -band $script:_plantBits) -eq 0) { continue }
         $isDeny = ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny)
 
-        # Conditional-ACE handling — symmetric across Allow and Deny (rev 3.2):
-        #   * Allow + callback-only for this SID: don't count the grant
-        #     (Microsoft restricted it by SKU / capability / AppID and we
-        #     can't statically verify the condition on this host). Flag.
-        #   * Allow + both callback AND unconditional: the unconditional ACE
-        #     carries the writability; count it but still flag.
-        #   * Deny + callback-only: don't count the deny (treating it as
-        #     unconditional under-reports writability on hosts where the
-        #     condition evaluates false). Flag.
-        #   * Deny + both: count, flag.
+        # Track per-service SIDs (S-1-5-80-*) that hold modification rights
+        if (-not $isDeny -and $sid -match '^S-1-5-80-' -and (($rights -band $effectiveWriteMask) -ne 0)) {
+            [void]$serviceSids.Add($sid)
+            continue
+        }
+
+        # Track AppContainer SIDs (S-1-15-2-1 / S-1-15-2-2)
+        if ($script:_appContainerSids -contains $sid -and (($rights -band $effectiveWriteMask) -ne 0)) {
+            if ($isDeny) { $deniedAppContainer = $true }
+            else         { $allowedAppContainer = $true }
+        }
+
+        $isLowOrUser = ($script:_lowPrivSids -contains $sid) -or ($sid -eq $UserContext.UserSid -and -not $UserContext.IsAdminLatent)
+        $isMedUser   = ($sid -eq $UserContext.UserSid -and $UserContext.IsAdminLatent)
+
+        # Check auxiliary permission bits (DELETE, FILE_DELETE_CHILD, KEY_CREATE_LINK, WRITE_DAC/WRITE_OWNER)
+        if (-not $isDeny -and ($isLowOrUser -or $isMedUser)) {
+            if (($rights -band $script:_dacOwnerBits) -ne 0) {
+                $Result.CanWriteDacOrOwner = $true
+            }
+            if (-not $IsRegistry -and (($rights -band $script:_deleteBit) -ne 0)) {
+                $Result.CanDeleteSelf = $true
+            }
+            if (-not $IsRegistry -and $IsContainer -and (($rights -band $script:_deleteChildBit) -ne 0)) {
+                $Result.CanDeleteChild = $true
+            }
+            if ($IsRegistry -and (($rights -band $script:_regCreateLinkBit) -ne 0) -and (($rights -band 0x2) -ne 0)) {
+                $Result.CanCreateRegLink = $true
+            }
+        }
+
+        if (($rights -band $effectiveWriteMask) -eq 0) { continue }
+
+        # Conditional-ACE handling — symmetric across Allow and Deny (rev 3.2)
         if (-not $isDeny -and $conditionalAllowSids.Contains($sid)) {
             $Result.HasConditionalACE = $true
             [void]$flaggedConditionalSids.Add($sid)
@@ -805,9 +975,6 @@ function Invoke-DaclEvaluation {
         }
 
         if ($script:_adminSids -contains $sid) {
-            # In a UAC-filtered medium-IL admin token, BUILTIN\Administrators is
-            # SE_GROUP_USE_FOR_DENY_ONLY: Deny ACEs apply to MediumILAdmin, but
-            # Allow ACEs only grant access when elevated (HighILAdmin).
             if ($isDeny) {
                 $deniedMed = $true; $deniedHigh = $true
             } else {
@@ -816,7 +983,6 @@ function Invoke-DaclEvaluation {
             continue
         }
 
-        # Current user's specific SID.
         if ($sid -eq $UserContext.UserSid) {
             if ($UserContext.IsAdminLatent) {
                 if ($isDeny) { $deniedMed = $true; $deniedHigh = $true }
@@ -830,37 +996,134 @@ function Invoke-DaclEvaluation {
             }
             continue
         }
-        # Other SIDs (specific user accounts, custom groups) — leave alone.
+    }
+
+    # Check object Owner SID: in Windows, the Owner implicitly holds WRITE_DAC
+    # unless constrained by an explicit S-1-3-4 (OWNER_RIGHTS) ACE.
+    if (-not $hasOwnerRightsAce) {
+        try {
+            $ownerRef = $Acl.GetOwner([System.Security.Principal.SecurityIdentifier])
+            if ($null -ne $ownerRef -and -not [string]::IsNullOrWhiteSpace($ownerRef.Value)) {
+                $ownerSid = $ownerRef.Value
+                $Result.OwnerSid = $ownerSid
+                if (($script:_lowPrivSids -contains $ownerSid) -or ($ownerSid -eq $UserContext.UserSid -and -not $UserContext.IsAdminLatent)) {
+                    $Result.CanWriteDacOrOwner = $true
+                    $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
+                } elseif ($ownerSid -eq $UserContext.UserSid -and $UserContext.IsAdminLatent) {
+                    $Result.CanWriteDacOrOwner = $true
+                    $allowedMed = $true; $allowedHigh = $true
+                }
+            }
+        } catch {}
     }
 
     $Result.WritableByLowPriv       = $allowedLow  -and -not $deniedLow
     $Result.WritableByMediumILAdmin = $allowedMed  -and -not $deniedMed
     $Result.WritableByHighILAdmin   = $allowedHigh -and -not $deniedHigh
+    $Result.WritableByAppContainer  = ($allowedAppContainer -or $Result.WritableByLowPriv) -and (-not $deniedAppContainer) -and ($Result.IntegrityLabel -eq "Low")
+    if ($serviceSids.Count -gt 0) {
+        $Result.WritableServiceSids = @($serviceSids)
+    }
 
     if ($flaggedConditionalSids.Count -gt 0) {
         $Result.ConditionalACEPrincipals = @($flaggedConditionalSids)
     }
 }
 
+function Test-TopLevelProtectedRoot {
+    param([string]$DirPath)
+    if ([string]::IsNullOrWhiteSpace($DirPath)) { return $true }
+    $d = $DirPath.TrimEnd('\')
+    if ($d -match '^[a-zA-Z]:$') { return $true }
+    if ($d -match '^(?i)[a-zA-Z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Users|System Volume Information|\$Recycle\.Bin)$') { return $true }
+    if ($d -match '^(?i)[a-zA-Z]:\\Users\\[^\\]+$') { return $true }
+    return $false
+}
+
+function Get-DirectoryWritabilityCached {
+    param(
+        [Parameter(Mandatory=$true)] [string]$DirPath,
+        [Parameter(Mandatory=$true)] [hashtable]$UserContext
+    )
+    $key = $DirPath.TrimEnd('\')
+    if ($script:_dirEvalCache.ContainsKey($key)) {
+        return $script:_dirEvalCache[$key]
+    }
+    $dRes = @{
+        WritableByLowPriv       = $false
+        WritableByMediumILAdmin = $false
+        WritableByHighILAdmin   = $false
+        WritableByAppContainer  = $false
+        CanWriteDacOrOwner      = $false
+        CanDeleteSelf           = $false
+        CanDeleteChild          = $false
+        CanCreateRegLink        = $false
+        IntegrityLabel          = "Default"
+        OwnerSid                = ""
+        WritableServiceSids     = @()
+        HasConditionalACE       = $false
+        ConditionalACEPrincipals = @()
+        ConditionalACESddl      = ""
+    }
+    try {
+        foreach ($pat in $script:_highILPathPatterns) {
+            if (($DirPath + '\') -like ('*' + $pat + '*')) {
+                $dRes.IntegrityLabel = "High"
+                break
+            }
+        }
+        if ($dRes.IntegrityLabel -eq "Default" -and $DirPath -match '(?i)\\Windows\\?$') {
+            $dRes.IntegrityLabel = "High"
+        }
+        $dAcl = Get-Acl -LiteralPath $DirPath -ErrorAction Stop
+        if ($null -ne $dAcl) {
+            Invoke-DaclEvaluation -Acl $dAcl -Result $dRes -UserContext $UserContext -IsContainer $true -IsRegistry $false
+            if ($dRes.IntegrityLabel -eq "Default") {
+                $lblSddl = [Win32DeviceMap.DosDeviceHelper]::GetMandatoryLabelSddl($DirPath, 1)
+                if ($lblSddl -match 'S:\([^)]*ML[^)]*;;;(LW|ME|HI|SI|S-1-16-\d+)\)') {
+                    $mlTok = $matches[1]
+                    if ($mlTok -eq 'SI' -or $mlTok -eq 'S-1-16-16384') { $dRes.IntegrityLabel = "System" }
+                    elseif ($mlTok -eq 'HI' -or $mlTok -eq 'S-1-16-12288') { $dRes.IntegrityLabel = "High" }
+                    elseif ($mlTok -eq 'LW' -or $mlTok -eq 'S-1-16-4096') { $dRes.IntegrityLabel = "Low" }
+                }
+            }
+            if ($dRes.IntegrityLabel -eq "High" -or $dRes.IntegrityLabel -eq "System") {
+                $dRes.WritableByLowPriv       = $false
+                $dRes.WritableByMediumILAdmin = $false
+                $dRes.CanDeleteSelf           = $false
+                $dRes.CanDeleteChild          = $false
+            }
+        }
+    } catch {}
+    $script:_dirEvalCache[$key] = $dRes
+    return $dRes
+}
+
 function Get-PathWritability {
     param(
         [Parameter(Mandatory=$true)] [string]$TargetPath,
-        [Parameter(Mandatory=$true)] [hashtable]$UserContext
+        [Parameter(Mandatory=$true)] [hashtable]$UserContext,
+        [bool]$HasNameNotFound = $false
     )
 
     $r = @{
         WritableByLowPriv         = $false
         WritableByMediumILAdmin   = $false
         WritableByHighILAdmin     = $false
+        WritableByAppContainer    = $false
+        CanWriteDacOrOwner        = $false
+        CanDeleteSelf             = $false
+        CanDeleteChild            = $false
+        CanDeleteOrReplace        = $false
+        HasWritableAncestor       = $false
+        WritableAncestorPath      = ""
+        CanCreateRegLink          = $false
+        CanCreatePipeInstance     = $false
+        CanWritePipeClient        = $false
+        OwnerSid                  = ""
+        WritableServiceSids       = @()
         IntegrityLabel            = "Default"
         AclSource                 = "none"
-        # Conditional/callback ACE tracking (rev 3.1). FileSystemAccessRule
-        # silently strips the conditional clause from ACCESS_ALLOWED_CALLBACK_ACE
-        # entries; an ACE that actually says "Allow IU FullControl IF
-        # !WIN://ISMULTISESSIONSKU" reaches the consumer as a plain Allow.
-        # We re-parse the raw SDDL to detect this and either demote (when
-        # there's no unconditional peer ACE) or just flag the path so the
-        # analyst knows writability is environment-dependent.
         HasConditionalACE         = $false
         ConditionalACEPrincipals  = @()
         ConditionalACESddl        = ""
@@ -868,42 +1131,60 @@ function Get-PathWritability {
 
     try {
         # Named pipe namespace (\\.\pipe\...): read-only check.
-        # Standard users have FILE_CREATE_PIPE_INSTANCE on \Device\NamedPipe\
-        # by default, allowing pipe server planting when a pipe is unbound or
-        # permissively DACL'd.
         if ($TargetPath -match '^\\\\\.\\pipe\\') {
-            $r.WritableByLowPriv       = $true
-            $r.WritableByMediumILAdmin = $true
-            $r.WritableByHighILAdmin   = $true
-            $r.AclSource               = "named-pipe-namespace"
+            $r.WritableByHighILAdmin = $true
+            $pipeAcl = $null
+            try { $pipeAcl = Get-Acl -LiteralPath $TargetPath -ErrorAction Stop } catch { $pipeAcl = $null }
+            if ($null -ne $pipeAcl) {
+                $pipeRules = $pipeAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+                $allowInstLow = $false; $denyInstLow = $false
+                $allowWriteLow = $false; $denyWriteLow = $false
+                foreach ($pr in $pipeRules) {
+                    $pSid = $pr.IdentityReference.Value
+                    $pRights = [int]$pr.FileSystemRights
+                    $pDeny = ($pr.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny)
+                    if (($script:_lowPrivSids -contains $pSid) -or ($pSid -eq $UserContext.UserSid -and -not $UserContext.IsAdminLatent)) {
+                        if (($pRights -band $script:_pipeCreateInstBit) -ne 0) {
+                            if ($pDeny) { $denyInstLow = $true } else { $allowInstLow = $true }
+                        }
+                        if (($pRights -band $script:_pipeClientWriteBit) -ne 0) {
+                            if ($pDeny) { $denyWriteLow = $true } else { $allowWriteLow = $true }
+                        }
+                    }
+                }
+                $r.CanCreatePipeInstance = ($allowInstLow -and -not $denyInstLow) -or $HasNameNotFound
+                $r.CanWritePipeClient    = ($allowWriteLow -and -not $denyWriteLow)
+                $r.WritableByLowPriv     = ($r.CanCreatePipeInstance -or $r.CanWritePipeClient)
+                $r.WritableByMediumILAdmin = $r.WritableByLowPriv
+                $r.AclSource             = if ($HasNameNotFound) { "named-pipe-unbound-in-trace" } else { "named-pipe-live-dacl" }
+            } else {
+                $r.CanCreatePipeInstance   = $true
+                $r.CanWritePipeClient      = $true
+                $r.WritableByLowPriv       = $true
+                $r.WritableByMediumILAdmin = $true
+                $r.AclSource               = "named-pipe-namespace"
+            }
             return $r
         }
 
-        # Registry — proper DACL parse (rev 3.2/3.3).
-        # Opens the key read-only via ReadPermissions (ancestor walk for
-        # value-paths and missing keys) and runs Invoke-DaclEvaluation.
-        # Registry keys without an explicit High/System SACL mandatory label
-        # default to Medium IL in Windows MIC, so we trust the parsed DACL
-        # unless Invoke-DaclEvaluation detected an explicit High/System ML ACE.
+        # Registry — proper DACL parse (rev 3.2/3.4).
         if ($TargetPath -match '^(HKLM|HKCU|HKCR|HKU|HKCC|HKPD|HKEY_)') {
             $regResult = Get-RegistryDaclForPath -Path $TargetPath
             $r.AclSource = $regResult.Source
             if ($null -ne $regResult.Sec) {
                 Invoke-DaclEvaluation -Acl $regResult.Sec -Result $r `
                     -UserContext $UserContext -IsContainer $true -IsRegistry $true
-                # MIC NW: lower-IL tokens can't write up to explicitly High/System-labeled keys.
                 if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
                     $r.WritableByLowPriv       = $false
                     $r.WritableByMediumILAdmin = $false
+                    $r.CanCreateRegLink        = $false
                 }
             } else {
-                # DACL read failed (key vanished, no ReadPermissions, etc.).
-                # Fall back to the per-root heuristic that rev 3.1 used so we
-                # don't regress on paths the new parser can't reach.
                 if ($regResult.RootName -eq 'HKCU' -or $regResult.RootName -eq 'HKU') {
                     $r.WritableByLowPriv       = $true
                     $r.WritableByMediumILAdmin = $true
                     $r.WritableByHighILAdmin   = $true
+                    $r.CanCreateRegLink        = $true
                 } else {
                     $r.IntegrityLabel        = "High"
                     $r.WritableByHighILAdmin = $true
@@ -912,21 +1193,7 @@ function Get-PathWritability {
             return $r
         }
 
-        # Filesystem: pick the right ACL bearer (100% read-only; NEVER opens
-        # or writes to files).
-        #
-        # Distinction matters: writability of an EXISTING file requires
-        # WriteData on the file itself (not on the parent). Walking up to the
-        # parent and reading its ACL produces false positives like
-        # `C:\pagefile.sys` -> "C:\ has Users:CreateDirectories so pagefile is
-        # writable". So:
-        #   * If the path exists as a file: read THAT file's ACL. If we can't
-        #     (Get-Acl denies because we lack ReadPermissions), bail with
-        #     all-false rather than fall back to the parent.
-        #   * If the path exists as a directory: read THAT directory's ACL.
-        #   * If the path does NOT exist: walk up to the existing ancestor and
-        #     use its ACL; that genuinely tells us whether we can plant a new
-        #     entry under that name.
+        # Filesystem: pick the right ACL bearer (100% read-only; NEVER opens or writes to files).
         $aclTarget = $null
         $treatAsExistingFile = $false
         if ([System.IO.File]::Exists($TargetPath)) {
@@ -946,45 +1213,96 @@ function Get-PathWritability {
             $r.AclSource = "ancestor"
         }
 
-        # Tag integrity label by path (heuristic; SACL parsing is expensive
-        # and usually denied without SeSecurityPrivilege).
+        # Tag integrity label by path heuristic first
         foreach ($pat in $script:_highILPathPatterns) {
             if ($aclTarget -like ('*' + $pat + '*')) {
                 $r.IntegrityLabel = "High"
                 break
             }
         }
-        # \Windows root itself is High-IL even though most of \Windows\<X>\... isn't.
         if ($r.IntegrityLabel -eq "Default" -and $aclTarget -match '(?i)\\Windows\\?$') {
             $r.IntegrityLabel = "High"
         }
 
-        # Pull DACL. If we can't read it (typical for SYSTEM-only files like
-        # pagefile.sys), refuse to claim writability instead of falling
-        # through to ancestor-derived heuristics.
+        # Pull DACL read-only
+        $acl = $null
         try {
             $acl = Get-Acl -LiteralPath $aclTarget -ErrorAction Stop
         } catch {
             $r.AclSource = $r.AclSource + "-denied"
-            return $r
         }
-        if ($null -eq $acl) {
-            $r.AclSource = $r.AclSource + "-null"
-            return $r
-        }
-        # Evaluate the DACL via the shared rev-3.2 helper. Includes
-        # callback-ACE detection (both Allow and Deny — see Invoke-DaclEvaluation)
-        # and the perspective-aware writability flag computation that used to
-        # live inline here.
-        $isContainerAcl = [System.IO.Directory]::Exists($aclTarget)
-        Invoke-DaclEvaluation -Acl $acl -Result $r `
-            -UserContext $UserContext -IsContainer $isContainerAcl -IsRegistry $false
 
-        # MIC NW: paths with the High mandatory label refuse writes from
-        # tokens at lower IL. LowPriv / MediumIL can't write up.
-        if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
-            $r.WritableByLowPriv       = $false
-            $r.WritableByMediumILAdmin = $false
+        if ($null -ne $acl) {
+            $isContainerAcl = [System.IO.Directory]::Exists($aclTarget)
+            Invoke-DaclEvaluation -Acl $acl -Result $r `
+                -UserContext $UserContext -IsContainer $isContainerAcl -IsRegistry $false
+
+            # Query LABEL_SECURITY_INFORMATION (0x10) when IntegrityLabel is still Default
+            if ($r.IntegrityLabel -eq "Default") {
+                try {
+                    $lblSddl = [Win32DeviceMap.DosDeviceHelper]::GetMandatoryLabelSddl($aclTarget, 1)
+                    if ($lblSddl -match 'S:\([^)]*ML[^)]*;;;(LW|ME|HI|SI|S-1-16-\d+)\)') {
+                        $mlTok = $matches[1]
+                        if ($mlTok -eq 'SI' -or $mlTok -eq 'S-1-16-16384') { $r.IntegrityLabel = "System" }
+                        elseif ($mlTok -eq 'HI' -or $mlTok -eq 'S-1-16-12288') { $r.IntegrityLabel = "High" }
+                        elseif ($mlTok -eq 'LW' -or $mlTok -eq 'S-1-16-4096') {
+                            $r.IntegrityLabel = "Low"
+                            if ($r.WritableByLowPriv) { $r.WritableByAppContainer = $true }
+                        }
+                    }
+                } catch {}
+            }
+
+            if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
+                $r.WritableByLowPriv       = $false
+                $r.WritableByMediumILAdmin = $false
+                $r.CanDeleteSelf           = $false
+                $r.CanDeleteChild          = $false
+                $r.CanWriteDacOrOwner      = $false
+            }
+        }
+
+        # Ancestor-Chain & Parent Delete-Recreate Walk (rev 3.4, 100% read-only):
+        # 1. If the target is an existing file that isn't directly writable, check if its
+        #    immediate parent directory allows FILE_ADD_FILE (WritableByLowPriv) AND either
+        #    the file grants DELETE or the parent grants FILE_DELETE_CHILD (0x40).
+        # 2. Walk intermediate ancestor directories (below top-level roots like C:\ProgramData,
+        #    C:\Windows, C:\Program Files, C:\Users\<User>) to detect whether an intermediate
+        #    directory can be modified or replaced with a junction.
+        $immediateParent = [System.IO.Path]::GetDirectoryName($TargetPath)
+        if (-not [string]::IsNullOrWhiteSpace($immediateParent) -and [System.IO.Directory]::Exists($immediateParent) -and -not (Test-TopLevelProtectedRoot -DirPath $immediateParent)) {
+            $parentEval = Get-DirectoryWritabilityCached -DirPath $immediateParent -UserContext $UserContext
+            if ($treatAsExistingFile -and ($r.CanDeleteSelf -or $parentEval.CanDeleteChild) -and $parentEval.WritableByLowPriv) {
+                $r.CanDeleteOrReplace = $true
+                if (-not $r.WritableByLowPriv) {
+                    $r.WritableByLowPriv       = $true
+                    $r.WritableByMediumILAdmin = $true
+                    $r.WritableByHighILAdmin   = $true
+                    $r.AclSource               = "parent-delete-recreate"
+                }
+            }
+        }
+
+        $ancDir = $immediateParent
+        $ancDepth = 0
+        while (-not [string]::IsNullOrWhiteSpace($ancDir) -and $ancDepth -lt 16) {
+            if (Test-TopLevelProtectedRoot -DirPath $ancDir) { break }
+            if ([System.IO.Directory]::Exists($ancDir)) {
+                $ancEval = Get-DirectoryWritabilityCached -DirPath $ancDir -UserContext $UserContext
+                if ($ancEval.WritableByLowPriv) {
+                    $r.HasWritableAncestor  = $true
+                    $r.WritableAncestorPath = $ancDir
+                    if (-not $r.WritableByLowPriv) {
+                        $r.WritableByLowPriv       = $true
+                        $r.WritableByMediumILAdmin = $true
+                        $r.WritableByHighILAdmin   = $true
+                        $r.AclSource               = "ancestor-dir-replaceable"
+                    }
+                    break
+                }
+            }
+            $ancDir = [System.IO.Path]::GetDirectoryName($ancDir)
+            $ancDepth++
         }
 
         return $r
@@ -1065,12 +1383,11 @@ foreach ($canonical in $canonicalPaths) {
     $rec = $pathProcessMap[$canonical]
     $displayPath = $rec.Path
 
-    $writability = Get-PathWritability -TargetPath $displayPath -UserContext $userContext
+    $writability = Get-PathWritability -TargetPath $displayPath -UserContext $userContext -HasNameNotFound ([bool]$rec.HasNameNotFound)
     $lowestPersp = Get-LowestWritablePerspective -Writability $writability
 
-    # Skip paths writable by NONE of our perspectives (not interesting to any
-    # of LPE / UAC bypass / admin-to-SYSTEM).
-    if ($lowestPersp -eq "None") { continue }
+    # Skip paths writable by NONE of our perspectives (unless they carry a RegistryDataPath reference).
+    if ($lowestPersp -eq "None" -and $rec.RegistryDataPaths.Count -eq 0) { continue }
 
     # Whether the running token can ACTUALLY write (informational; depends on
     # current process IL + admin status).
@@ -1086,6 +1403,15 @@ foreach ($canonical in $canonicalPaths) {
     $relatedProcesses = ($rec.Processes -join ", ")
     $operationsList   = ($rec.Operations -join ", ")
     $bestEvt = $rec.BestEvent
+    $cmdLineEntries = @()
+    foreach ($pn in $rec.Processes) {
+        if ($processLineageMap.ContainsKey($pn)) {
+            $cmdLineEntries += "$pn`: $($processLineageMap[$pn])"
+        }
+    }
+    $processCommandLines = ($cmdLineEntries -join " | ")
+    $regDataPathList     = ($rec.RegistryDataPaths -join "; ")
+    $hasVerifyThenLoad   = ([bool]$rec.HasReadOrCheckOp -and [bool]$rec.HasLoadOrExecOp)
 
     # User-only-consumed filter: every observed process is the current user's
     # own session and no privileged actor touches the path. The redirect
@@ -1099,6 +1425,7 @@ foreach ($canonical in $canonicalPaths) {
         CanonicalPath           = $canonical
         FileExists              = ([System.IO.Directory]::Exists($displayPath) -or [System.IO.File]::Exists($displayPath))
         RelatedProcesses        = $relatedProcesses
+        ProcessCommandLines     = $processCommandLines
         Operations              = $operationsList
         EventCount              = $rec.EventCount
         TraceFile               = $traceFileName
@@ -1111,10 +1438,14 @@ foreach ($canonical in $canonicalPaths) {
         Impersonating           = $bestEvt.Impersonating
         BestProcess             = $bestEvt.ProcessName
         DesiredAccess           = $bestEvt.DesiredAccess
+        Disposition             = $bestEvt.Disposition
+        ShareMode               = $bestEvt.ShareMode
         SqosLevel               = $bestEvt.SqosLevel
         IsPagingIO              = [bool]$bestEvt.IsPagingIO
         OpenReparsePoint        = [bool]$bestEvt.OpenReparsePoint
         OpenLink                = [bool]$bestEvt.OpenLink
+        DeleteOnClose           = [bool]$bestEvt.DeleteOnClose
+        OpenForBackup           = [bool]$bestEvt.OpenForBackup
         IsKernelAttribution     = [bool]$bestEvt.IsKernelOrCacheManager
         AnyWrite                = $rec.AnyWrite
         AnyRead                 = $rec.AnyRead
@@ -1126,22 +1457,34 @@ foreach ($canonical in $canonicalPaths) {
         AnyOpenLink             = $rec.AnyOpenLink
         AllOpenLink             = [bool]$allOpenLink
         AnyPagingIO             = $rec.AnyPagingIO
+        HasDeleteOp             = [bool]$rec.HasDeleteOp
+        HasSetSecurityOp        = [bool]$rec.HasSetSecurityOp
+        HasRenameOp             = [bool]$rec.HasRenameOp
+        HasOpenForBackup        = [bool]$rec.HasOpenForBackup
+        HasBufferOverflow       = [bool]$rec.HasBufferOverflow
+        HasSharedWriteOrDelete  = [bool]$rec.HasSharedWriteOrDelete
+        HasVerifyThenLoad       = [bool]$hasVerifyThenLoad
+        RegistryDataPath        = $regDataPathList
         IsUserOnlyConsumer      = $userOnlyConsumer
-        # Perspective-aware writability (rev 3)
+        # Perspective-aware writability (rev 3 / rev 3.4)
         WritableByLowPriv       = $writability.WritableByLowPriv
         WritableByMediumILAdmin = $writability.WritableByMediumILAdmin
         WritableByHighILAdmin   = $writability.WritableByHighILAdmin
+        WritableByAppContainer  = [bool]$writability.WritableByAppContainer
         WritableFrom            = $lowestPersp
+        CanWriteDacOrOwner      = [bool]$writability.CanWriteDacOrOwner
+        CanDeleteSelf           = [bool]$writability.CanDeleteSelf
+        CanDeleteChild          = [bool]$writability.CanDeleteChild
+        CanDeleteOrReplace      = [bool]$writability.CanDeleteOrReplace
+        HasWritableAncestor     = [bool]$writability.HasWritableAncestor
+        WritableAncestorPath    = $writability.WritableAncestorPath
+        CanCreateRegLink        = [bool]$writability.CanCreateRegLink
+        CanCreatePipeInstance   = [bool]$writability.CanCreatePipeInstance
+        CanWritePipeClient      = [bool]$writability.CanWritePipeClient
+        OwnerSid                = $writability.OwnerSid
+        WritableServiceSids     = @($writability.WritableServiceSids)
         IntegrityLabel          = $writability.IntegrityLabel
         AclSource               = $writability.AclSource
-        # Conditional/callback-ACE detection (rev 3.1). HasConditionalACE is
-        # true when at least one Allow grant for a SID we'd otherwise count
-        # was a callback ACE (Microsoft restricted access by SKU /
-        # capability / AppID). Writable* flags above already exclude
-        # conditional-only grants — when both are conditional-only, the
-        # path may still be flagged Writable* if a different SID had an
-        # unconditional grant, but the analyst should treat any path with
-        # HasConditionalACE = true as environment-dependent.
         HasConditionalACE        = [bool]$writability.HasConditionalACE
         ConditionalACEPrincipals = @($writability.ConditionalACEPrincipals)
         ConditionalACESddl       = $writability.ConditionalACESddl
