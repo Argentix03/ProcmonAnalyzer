@@ -2,6 +2,9 @@
     [Parameter(Mandatory=$true)]
     [string]$JsonFeed,
 
+    [Parameter(Mandatory=$false)]
+    [string]$OutputPath,
+
     [switch]$Silent
 )
 
@@ -18,7 +21,7 @@
 #  admin targeting SYSTEM / TrustedInstaller).
 # ═══════════════════════════════════════════════════════════════════════════════
 
-$feedDir = Split-Path $JsonFeed
+$feedDir = if (-not [string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath } else { Split-Path $JsonFeed }
 if ([string]::IsNullOrWhiteSpace($feedDir)) { $feedDir = ".\" }
 
 Write-Host "[*] Initiating Advanced Execution Lead Analysis on: $JsonFeed" -ForegroundColor Cyan
@@ -588,7 +591,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 1.9: COM Hijack via HKCU\Software\Classes\CLSID
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)^(HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Software\\Classes\\(CLSID|Wow6432Node\\CLSID|Interface)\\\{[0-9a-fA-F-]+\}") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and ($isPrivileged -or $isPrivilegedAny -or $anyImpersonating) -and $path -match "(?i)^(HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Software\\Classes\\(CLSID|Wow6432Node\\CLSID|Interface)\\\{[0-9a-fA-F-]+\}") {
         $severity = "High"
         $type = "Per-User COM Hijack"
         $exploitPrimitive = "COM_Hijack_HKCU"
@@ -660,7 +663,7 @@ foreach ($entry in $rawData) {
     #   - Any missing binary (NAME NOT FOUND) in a writable directory
     # fires directly here.
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "\.(exe|dll|sys|cpl|ocx|efi|scr|msi|msp|msc|com|hta|jar|xll|wll|xla|drv|tlb|node)$") {
+    if (-not $isDirectLead -and $isFsPath -and $path -match "\.(exe|dll|sys|cpl|ocx|efi|scr|msi|msp|msc|com|hta|jar|xll|wll|xla|drv|tlb|node)$") {
         $isHighPrivDir = ($path -match "(?i)(System32|SysWOW64|Program Files|ProgramData\\[^\\]+\\|\\Windows\\)")
         $shouldFireRule2 = ($isHighPrivDir -and ($writableLow -or $writableMed)) `
             -or ($isPrivilegedAny -and ($writableLow -or $writableMed -or $writableHigh)) `
@@ -689,7 +692,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.1: SxS / DotLocal Manifest Hijacking
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "\.(manifest|local)$") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "\.(manifest|local)$") {
         $severity = "Critical"
         $type = "SxS / DotLocal Manifest Poisoning"
         $exploitPrimitive = "SxS_DotLocal"
@@ -700,7 +703,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.2: Package / Dependency Hijacking
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "(node_modules|site-packages|vendor\\|gems\\|\\.cargo\\registry)") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "(node_modules|site-packages|vendor\\|gems\\|\\.cargo\\registry)") {
         $severity = "Critical"
         $type = "Dependency / Package Subversion"
         $exploitPrimitive = "Dependency_Hijack"
@@ -711,7 +714,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.3: Web Shell / Webroot Planting
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(inetpub\\wwwroot|xampp\\htdocs|tomcat\\webapps|nginx\\html)" -and $path -match "\.(aspx|php|jsp|asmx|html|ashx|asp)$") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed) -and $path -match "(inetpub\\wwwroot|xampp\\htdocs|tomcat\\webapps|nginx\\html)" -and $path -match "\.(aspx|php|jsp|asmx|html|ashx|asp)$") {
         $severity = "Critical"
         $type = "Web Shell Proxy / Server Planting"
         $exploitPrimitive = "WebShell_Plant"
@@ -722,21 +725,21 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.4: LNK Shortcut Poisoning + URL/Theme/PIF coercion
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "\.lnk$") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed) -and $path -match "\.lnk$") {
         $severity = "High"
         $type = "LNK Shortcut Hijacking"
         $exploitPrimitive = "LNK_Hijack"
         $reason = "Writable .lnk shortcut. Modify target to redirect execution; or set Icon to UNC for NTLM coercion (CVE-2025-50154 family). No privileges needed."
         $isDirectLead = $true
     }
-    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "\.url$") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed) -and $path -match "\.url$") {
         $severity = "High"
         $type = ".URL Internet Shortcut NTLM Coercion"
         $exploitPrimitive = "URL_NTLM_Coerce"
         $reason = "Writable '.url' Internet shortcut. CVE-2024-43451 family — 'IconFile=\\\\attacker\\share\\icon.ico' triggers NTLMv2 from any user who interacts with the shortcut (single click, right-click, drag-move). Capture with Responder; relay or crack."
         $isDirectLead = $true
     }
-    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "\.(theme|themepack|deskthemepack)$") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed) -and $path -match "\.(theme|themepack|deskthemepack)$") {
         $severity = "High"
         $type = "Theme NTLM Coercion (CVE-2024-21320 family)"
         $exploitPrimitive = "Theme_NTLM_Coerce"
@@ -747,7 +750,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.5: desktop.ini IconResource SMB coercion (Section 8 of addendum)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)\\desktop\.ini$") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed) -and $path -match "(?i)\\desktop\.ini$") {
         $severity = "Medium"
         $type = "desktop.ini IconResource Coercion"
         $exploitPrimitive = "DesktopIni_Coerce"
@@ -793,7 +796,7 @@ foreach ($entry in $rawData) {
     # Rule 5/6/7 path-redirection rules so privileged reads of .config/.xml/.json
     # by framework hosts classify as Config_Poison rather than SMB_Coercion)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "\.(config|xml|json|yml|yaml)$") {
+    if (-not $isDirectLead -and $isFsPath -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "\.(config|xml|json|yml|yaml)$") {
         $isFrameworkHost = $false
         foreach ($fh in $frameworkHosts) {
             if ($procs -match "(?i)\b$([regex]::Escape($fh))\b") { $isFrameworkHost = $true; break }
@@ -828,7 +831,7 @@ foreach ($entry in $rawData) {
     # as Cert_Plant rather than SMB_Coercion)
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and ($path -match "\.(cer|crt|pfx|p12|pem|key|p7b)$" -or
-        $path -match "(?i)(Crypto\\Keys|Certificate|PKI|AuthRoot|ROOT\\Certificates|SystemCertificates\\Root)")) {
+        $path -match "(?i)(Crypto\\Keys|Certificate|PKI|AuthRoot|ROOT\\Certificates|SystemCertificates\\Root|\\ssl\\certs\\)")) {
         $severity = "High"
         $type = "Certificate / Crypto Store Planting"
         $exploitPrimitive = "Cert_Plant"
@@ -1084,7 +1087,7 @@ foreach ($entry in $rawData) {
             continue
         }
 
-        if ($path -match "\.(config|xml|ini|json|yml|yaml|txt|log|db|dat|reg|inf|pol|asar|md|csv)$" -or $path -match "^HK") {
+        if (($writableLow -or $writableMed -or (-not [string]::IsNullOrWhiteSpace($regDataPath))) -and ($path -match "\.(config|xml|ini|json|yml|yaml|txt|log|db|dat|reg|inf|pol|asar|md|csv)$" -or $path -match "^HK")) {
             $hint = "Requires semantic analysis. "
             if ($isPrivilegedAny) {
                 $hint += "HIGH-VALUE: a privileged actor was observed on this path. Effective principal: $effectivePrincipal. "
@@ -1275,7 +1278,61 @@ foreach ($entry in $rawData) {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 $severityOrder = @{ "Critical" = 1; "High" = 2; "Medium" = 3; "Low" = 4; "Unknown" = 5 }
-$sortedLeads = @($hardcodedLeads | Sort-Object { $severityOrder[$_.Severity] })
+$rawSortedLeads = @($hardcodedLeads | Sort-Object { $severityOrder[$_.Severity] })
+
+# Sibling-burst deduplication (rev 3.4.1): collapse repetitive sibling probes
+# (e.g., 25 locale satellite DLL probes or 15 profile XMLs in the same directory
+# by the same process with the same primitive) while preserving the top 2
+# representatives and annotating the collapsed count.
+$burstBuckets = @{}
+$dedupedLeads = New-Object System.Collections.Generic.List[PSCustomObject]
+$collapsedBurstTotal = 0
+
+foreach ($lead in $rawSortedLeads) {
+    if ($lead.WritableFrom -eq "HighILAdmin") {
+        $parentDir = "HighILAdmin-surface"
+        $bKey = "$($lead.ExploitPrimitive)|HighILAdmin"
+    } else {
+        $normPath = $lead.Path -replace '(?i)\\[a-z]{2}-[a-z]{2}(-[a-z]{2,4})?\\', '\_locale_\'
+        if ($normPath -match '^(?i)([a-z]:\\Users\\[^\\]+\\AppData\\Local\\Temp\\[^\\]+)\\') {
+            $parentDir = $matches[1]
+        } elseif ($normPath -match '^(?i)([a-z]:\\ProgramData\\Microsoft\\Windows\\WER\\Report(Archive|Queue))\\') {
+            $parentDir = $matches[1]
+        } elseif ($normPath -match '^(?i)((?:HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Software\\Classes\\(?:CLSID|Wow6432Node\\CLSID|Interface))\\\{[0-9a-fA-F-]+\}') {
+            $parentDir = $matches[1]
+        } else {
+            $ls = $normPath.LastIndexOf('\')
+            $parentDir = if ($ls -gt 0) { $normPath.Substring(0, $ls) } else { $normPath }
+        }
+        $bKey = "$($lead.ExploitPrimitive)|$($lead.Processes)|$($lead.OperationDirection)|$parentDir"
+    }
+    if (-not $burstBuckets.ContainsKey($bKey)) {
+        $burstBuckets[$bKey] = @{
+            Count   = 1
+            Primary = $lead
+            Parent  = $parentDir
+        }
+        $dedupedLeads.Add($lead)
+    } else {
+        $bucket = $burstBuckets[$bKey]
+        $bucket.Count++
+        if ($bucket.Count -le 2) {
+            $dedupedLeads.Add($lead)
+        } else {
+            $collapsedBurstTotal++
+        }
+    }
+}
+
+foreach ($bkv in $burstBuckets.GetEnumerator()) {
+    $b = $bkv.Value
+    if ($b.Count -gt 2) {
+        $extra = $b.Count - 2
+        $b.Primary.DetailedReason += " [+$extra sibling path(s) in '$($b.Parent)' collapsed]"
+    }
+}
+
+$sortedLeads = @($dedupedLeads)
 $cognitiveArr = @($cognitiveQueue)
 
 if ($sortedLeads.Count -eq 0) {
@@ -1290,13 +1347,13 @@ if ($cognitiveArr.Count -eq 0) {
     ConvertTo-Json -InputObject $cognitiveArr -Depth 4 | Out-File $cognitiveJsonPath -Encoding UTF8
 }
 
-$primitiveStats = $hardcodedLeads | Group-Object ExploitPrimitive | Sort-Object Count -Descending
-$categoryStats  = $hardcodedLeads | Group-Object EscalationCategory | Sort-Object Count -Descending
-$writableFromStats = $hardcodedLeads | Group-Object WritableFrom | Sort-Object Count -Descending
+$primitiveStats = $sortedLeads | Group-Object ExploitPrimitive | Sort-Object Count -Descending
+$categoryStats  = $sortedLeads | Group-Object EscalationCategory | Sort-Object Count -Descending
+$writableFromStats = $sortedLeads | Group-Object WritableFrom | Sort-Object Count -Descending
 
 Write-Host ""
 Write-Host "[+] Heuristic Analysis Complete." -ForegroundColor Green
-Write-Host "    -> High Confidence Leads: $($hardcodedLeads.Count)" -ForegroundColor Green
+Write-Host "    -> High Confidence Leads: $($sortedLeads.Count) (collapsed $collapsedBurstTotal sibling-burst duplicates)" -ForegroundColor Green
 Write-Host "    -> Pushed to Cognitive Queue: $($cognitiveQueue.Count)" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "    False-Positive Filters Applied:" -ForegroundColor Cyan

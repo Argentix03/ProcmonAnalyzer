@@ -1,6 +1,6 @@
 ﻿param (
     [Parameter(Mandatory=$false)]
-    [string]$CsvPath = "C:\Users\Argentix\Downloads\BootLogProcMonAllHighPrivFiles.CSV",
+    [string]$CsvPath = "D:\CyberSec\BootLogProcMonAll.CSV",
     [Parameter(Mandatory=$false)]
     [string]$OutputPath,
     [Parameter(Mandatory=$false)]
@@ -53,51 +53,14 @@
 #   - Operations[] aggregation.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-Write-Host "Calculating total size of CSV feed for progress telemetry..." -ForegroundColor Cyan
-$totalLines = 0
-try {
-    $reader = New-Object System.IO.StreamReader($CsvPath)
-    while ($reader.ReadLine() -ne $null) { $totalLines++ }
-} finally {
-    if ($reader) { $reader.Close() }
-}
-Write-Host "Total lines to process: $totalLines" -ForegroundColor Cyan
-
-Write-Host "Streaming CSV via TextFieldParser (best-event scoring per canonical path)..." -ForegroundColor Cyan
+Write-Host "Streaming CSV via high-throughput native C# aggregator (best-event scoring per canonical path)..." -ForegroundColor Cyan
 
 # Dictionary keyed by CANONICAL path; preserves original Path for display.
 $pathProcessMap = New-Object 'System.Collections.Generic.Dictionary[string, System.Collections.Hashtable]' ([System.StringComparer]::OrdinalIgnoreCase)
 $script:skippedErrors = New-Object System.Collections.Generic.List[PSCustomObject]
 $script:skippedSelfTrace = 0
 $script:skippedPagingIO  = 0
-
-Add-Type -AssemblyName Microsoft.VisualBasic
-$parser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($CsvPath)
-$parser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
-$parser.SetDelimiters(",")
-$parser.HasFieldsEnclosedInQuotes = $true
-
-$headerMap = @{}
-if (-not $parser.EndOfData) {
-    $headers = $parser.ReadFields()
-    for ($i = 0; $i -lt $headers.Length; $i++) {
-        $headerMap[$headers[$i].Trim().ToLower()] = $i
-    }
-}
-
-$idxTime    = if ($headerMap.ContainsKey("time of day")) { $headerMap["time of day"] } else { 0 }
-$idxProc    = if ($headerMap.ContainsKey("process name")) { $headerMap["process name"] } else { 1 }
-$idxPid     = if ($headerMap.ContainsKey("pid")) { $headerMap["pid"] } else { -1 }
-$idxOp      = if ($headerMap.ContainsKey("operation")) { $headerMap["operation"] } else { 3 }
-$idxPath    = if ($headerMap.ContainsKey("path")) { $headerMap["path"] } else { 4 }
-$idxRes     = if ($headerMap.ContainsKey("result")) { $headerMap["result"] } else { 5 }
-$idxDet     = if ($headerMap.ContainsKey("detail")) { $headerMap["detail"] } else { 6 }
-$idxInt     = if ($headerMap.ContainsKey("integrity")) { $headerMap["integrity"] } else { -1 }
-$idxImp     = if ($headerMap.ContainsKey("impersonating")) { $headerMap["impersonating"] } else { -1 }
-$idxTid     = if ($headerMap.ContainsKey("tid")) { $headerMap["tid"] } else { -1 }
-$idxCmdLine = if ($headerMap.ContainsKey("command line")) { $headerMap["command line"] } else { -1 }
-$idxParent  = if ($headerMap.ContainsKey("parent pid")) { $headerMap["parent pid"] } else { -1 }
-$idxSession = if ($headerMap.ContainsKey("session")) { $headerMap["session"] } else { -1 }
+$totalLines = 0
 
 $traceFileName = Split-Path $CsvPath -Leaf
 $processLineageMap = @{}
@@ -172,14 +135,22 @@ function Get-IntegrityRank {
     }
 }
 
-# Build volume device -> drive letter map and unprivileged Mandatory Label reader.
+# Build volume device -> drive letter map, unprivileged Mandatory Label reader, and C# fast CSV stream engine.
 $script:_driveMap = @{}
 try {
-    if (-not ("Win32DeviceMap.DosDeviceHelper" -as [type])) {
+    if (-not ("Win32DeviceMap.ProcmonFastParser" -as [type])) {
         Add-Type -TypeDefinition @"
 using System;
-using System.Runtime.InteropServices;
+using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
+using System.Collections;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using Microsoft.Win32;
+
 namespace Win32DeviceMap {
     public class DosDeviceHelper {
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -234,8 +205,794 @@ namespace Win32DeviceMap {
             return "";
         }
     }
+
+    public class ParseSummary {
+        public int TotalLines;
+        public int SkippedSelfTrace;
+        public int SkippedPagingIO;
+        public Dictionary<string, Hashtable> PathMap = new Dictionary<string, Hashtable>(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<string, string> ProcessLineage = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public class ProcmonFastParser {
+        static readonly HashSet<string> KernelProcs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "System", "System.exe", "MemCompression", "Registry", "Memory Compression"
+        };
+        static readonly HashSet<string> KnownSystemDaemons = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "System", "Registry", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
+            "lsass.exe", "lsaiso.exe", "winlogon.exe", "svchost.exe", "spoolsv.exe",
+            "SearchIndexer.exe", "SearchProtocolHost.exe", "MsMpEng.exe", "MpDefenderCoreService.exe",
+            "NisSrv.exe", "SecurityHealthService.exe", "SgrmBroker.exe", "TrustedInstaller.exe",
+            "TiWorker.exe", "WmiPrvSE.exe", "WUDFHost.exe", "dwm.exe", "LogonUI.exe",
+            "audiodg.exe", "dasHost.exe", "vmms.exe", "vmcompute.exe", "vmnat.exe",
+            "vmnetdhcp.exe", "vmware-usbarbitrator64.exe", "vmware-authd.exe", "Sysmon.exe",
+            "Sysmon64.exe", "sqlwriter.exe", "OfficeClickToRun.exe", "expressvpn-service.exe",
+            "armsvc.exe", "ArmouryCrate.Service.exe", "AsusCertService.exe", "AsusFanControlService.exe",
+            "AsusUpdateCheck.exe", "LightingService.exe", "ROGLiveService.exe", "Corsair.Service.exe",
+            "CueLLAccessService.exe", "CueUniwillService.exe", "Everything.exe", "wslservice.exe",
+            "IpOverUsbSvc.exe", "RtkAudUService64.exe", "DTSAPO3Service.exe"
+        };
+        static readonly HashSet<string> WriteOps = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "WriteFile", "SetDispositionInformationFile", "SetRenameInformationFile",
+            "SetBasicInformationFile", "SetEndOfFileInformationFile", "SetAllocationInformationFile",
+            "SetSecurityFile", "RegSetValue", "RegCreateKey", "RegDeleteKey", "RegDeleteValue", "WriteConfig"
+        };
+        static readonly HashSet<string> ReadOps = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "CreateFile", "ReadFile", "QueryDirectory", "QueryBasicInformationFile",
+            "QueryStandardInformationFile", "QueryNameInformationFile", "Load Image",
+            "QueryOpen", "RegQueryValue", "CreateFileMapping", "RegOpenKey", "RegEnumKey",
+            "RegEnumValue", "FileSystemControl"
+        };
+        static readonly string[] TraceArtifacts = new string[] {
+            "\\rawtrace.etl", "\\nativewritablepaths.csv", "\\activeprocessessnapshot.json",
+            "\\writable_paths.json", "\\high_confidence_leads.json", "\\cognitive_review_queue.json",
+            "\\cognitive_review_queue.j", "\\parsing_errors.json", "\\etw_providers.txt",
+            "\\execution_leads_report.md", "\\testtrace.etl"
+        };
+
+        static readonly Regex RxIntegrityDetail = new Regex(@"(?i)Integrity:\s*(System|High|Medium Plus|Medium|Low|Untrusted|Protected Process)", RegexOptions.Compiled);
+        static readonly Regex RxSqos = new Regex(@"(?i)Impersonation(?:\s*Level)?:\s*(Impersonation|Delegation|Identification|Anonymous)", RegexOptions.Compiled);
+        static readonly Regex RxDesiredAccess = new Regex(@"(?i)Desired\s*Access:\s*(.+?)(?:,\s*(?:Disposition|Options|ShareMode|Attributes|AllocationSize|OpenResult|Impersonating|Security\s*QOS):|$)", RegexOptions.Compiled);
+        static readonly Regex RxDisposition = new Regex(@"(?i)Disposition:\s*([^,\r\n]+)", RegexOptions.Compiled);
+        static readonly Regex RxShareMode = new Regex(@"(?i)ShareMode:\s*(.+?)(?:,\s*(?:Attributes|Options|AllocationSize|OpenResult|Impersonating):|$)", RegexOptions.Compiled);
+        static readonly Regex RxDataPath = new Regex(@"(?i)\bData:\s*""?([a-zA-Z]:\\[^""\r\n,;]+|\\\\[^""\r\n,;]+)", RegexOptions.Compiled);
+        static readonly Regex RxCmdLine = new Regex(@"(?i)Command\s*line:\s*(.+?)(?:,\s*Current\s*directory:|,\s*Environment:|\r|\n|$)", RegexOptions.Compiled);
+        static readonly Regex RxImpersonating = new Regex(@"(?i)Impersonating:\s*([^,\r\n]+)", RegexOptions.Compiled);
+        static readonly Regex RxHarddiskVol = new Regex(@"^(?i)(\\Device\\HarddiskVolume\d+)(\\|$)(.*)$", RegexOptions.Compiled);
+        static readonly Regex RxAdminSurface = new Regex(@"(?i)(^HKLM\\SYSTEM\\(CurrentControlSet|ControlSet\d+)\\Services\\[^\\]+(\\(ImagePath|ServiceDll|FailureCommand|Parameters))?$|^HKLM\\SOFTWARE\\(Wow6432Node\\)?Microsoft\\Windows NT\\CurrentVersion\\(Image File Execution Options|AeDebug)|\\(System32|SysWOW64)\\Tasks\\|\\schedule\\taskcache\\tree\\|Crypto\\Keys|Certificate|PKI|AuthRoot|SystemCertificates\\Root|\\ssl\\certs\\|\.(cer|crt|pfx|p12|pem|key|p7b|manifest|local|asar)$)", RegexOptions.Compiled);
+        static readonly Regex RxUserOnlyKeep = new Regex(@"(?i)(\.(exe|dll|sys|cpl|ocx|efi|scr|msi|msp|msc|com|hta|jar|xll|wll|xla|drv|tlb|node|manifest|local|lnk|url|theme|themepack|deskthemepack|bat|ps1|psm1|psd1|vbs|vbe|cmd|wsf|js|jse|wsh|ax|war|pyd|so|cer|crt|pfx|p12|pem|key|p7b)$|\\desktop\.ini$|Startup|\\CurrentVersion\\Run|\\Tasks\\|schedule\\taskcache|wbem\\mof|scripts\\|node_modules|site-packages|vendor\\|gems\\|\.cargo\\registry|inetpub\\wwwroot|xampp\\htdocs|tomcat\\webapps|nginx\\html|machine\.config|web\.config|app\.config|applicationHost\.config|Crypto\\Keys|Certificate|PKI|AuthRoot|SystemCertificates|\\ssl\\certs\\|\\Software\\Classes\\(CLSID|Wow6432Node\\CLSID|Interface)\\\{|\\Environment(\\|$))", RegexOptions.Compiled);
+        static readonly HashSet<string> LolBinProcs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "msbuild.exe", "installutil.exe", "regasm.exe", "regsvcs.exe", "mshta.exe", "rundll32.exe",
+            "regsvr32.exe", "odbcconf.exe", "wscript.exe", "cscript.exe", "msiexec.exe", "cmstp.exe",
+            "certutil.exe", "bitsadmin.exe", "forfiles.exe", "pcalua.exe", "syncappvpublishingserver.exe",
+            "presentationhost.exe", "dfsvc.exe", "xwizard.exe", "hh.exe", "infdefaultinstall.exe", "ieexec.exe"
+        };
+
+        static List<string> ReadCsvRow(StreamReader sr, ref int physicalLines) {
+            string line = sr.ReadLine();
+            if (line == null) return null;
+            physicalLines++;
+            var fields = new List<string>(10);
+            var sb = new StringBuilder();
+            bool inQuotes = false;
+            int i = 0;
+            while (true) {
+                while (i < line.Length) {
+                    char c = line[i];
+                    if (inQuotes) {
+                        if (c == '"') {
+                            if (i + 1 < line.Length && line[i + 1] == '"') {
+                                sb.Append('"');
+                                i += 2;
+                                continue;
+                            } else {
+                                inQuotes = false;
+                            }
+                        } else {
+                            sb.Append(c);
+                        }
+                    } else {
+                        if (c == '"') {
+                            inQuotes = true;
+                        } else if (c == ',') {
+                            fields.Add(sb.ToString());
+                            sb.Length = 0;
+                        } else {
+                            sb.Append(c);
+                        }
+                    }
+                    i++;
+                }
+                if (!inQuotes || sr.EndOfStream) break;
+                string nextLine = sr.ReadLine();
+                if (nextLine == null) break;
+                physicalLines++;
+                sb.Append('\n');
+                line = nextLine;
+                i = 0;
+            }
+            fields.Add(sb.ToString());
+            return fields;
+        }
+
+        static Dictionary<string, string> LoadCompanionIntegrityMap(string csvPath, out bool hasCompanion) {
+            hasCompanion = false;
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try {
+                string dir = Path.GetDirectoryName(csvPath);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return map;
+                string selfName = Path.GetFileName(csvPath);
+                foreach (var f in Directory.GetFiles(dir, "*HighPriv*.CSV")) {
+                    if (string.Equals(Path.GetFileName(f), selfName, StringComparison.OrdinalIgnoreCase)) continue;
+                    using (var sr = new StreamReader(f)) {
+                        string hdr = sr.ReadLine();
+                        if (hdr == null || hdr.IndexOf("\"Integrity\"", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        hasCompanion = true;
+                        string line;
+                        while ((line = sr.ReadLine()) != null) {
+                            if (line.Length < 10 || line[0] != '"') continue;
+                            int p1 = line.IndexOf("\",\"", 1); if (p1 < 0) continue;
+                            int p2 = line.IndexOf("\",\"", p1 + 3); if (p2 < 0) continue;
+                            int p3 = line.IndexOf("\",\"", p2 + 3); if (p3 < 0) continue;
+                            string proc = line.Substring(p1 + 3, p2 - (p1 + 3));
+                            string pid = line.Substring(p2 + 3, p3 - (p2 + 3));
+                            int lq = line.LastIndexOf("\",\"");
+                            if (lq > 0 && line.EndsWith("\"")) {
+                                string val = line.Substring(lq + 3, line.Length - lq - 4);
+                                string key = proc + ":" + pid;
+                                if (!map.ContainsKey(key) && (val == "System" || val == "High" || val == "Medium" || val == "Medium Plus" || val == "Low" || val == "Protected Process")) {
+                                    map[key] = val;
+                                }
+                            }
+                        }
+                    }
+                    if (hasCompanion) break;
+                }
+            } catch {}
+            return map;
+        }
+
+        static string NormalizePath(string raw, IDictionary driveMap) {
+            if (string.IsNullOrWhiteSpace(raw)) return "";
+            string p = raw.Trim();
+            if (p.StartsWith(@"\??\", StringComparison.Ordinal)) p = p.Substring(4);
+            else if (p.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) p = @"\\" + p.Substring(8);
+            else if (p.StartsWith(@"\\?\", StringComparison.Ordinal) && p.Length > 6 && p[5] == ':') p = p.Substring(4);
+            else if (p.StartsWith(@"\Device\NamedPipe\", StringComparison.OrdinalIgnoreCase)) p = @"\\.\pipe\" + p.Substring(18);
+            else if (p.StartsWith(@"\\?\pipe\", StringComparison.OrdinalIgnoreCase)) p = @"\\.\pipe\" + p.Substring(9);
+            else if (p.StartsWith(@"\Device\HarddiskVolume", StringComparison.OrdinalIgnoreCase)) {
+                var m = RxHarddiskVol.Match(p);
+                if (m.Success) {
+                    string vol = m.Groups[1].Value.ToLowerInvariant();
+                    string sep = m.Groups[2].Value;
+                    string rest = m.Groups[3].Value;
+                    if (driveMap != null && driveMap.Contains(vol)) {
+                        string letter = (string)driveMap[vol];
+                        p = !string.IsNullOrEmpty(sep) ? (letter + "\\" + rest) : (letter + "\\");
+                    } else if (driveMap == null || driveMap.Count == 0) {
+                        p = !string.IsNullOrEmpty(sep) ? ("C:\\" + rest) : "C:\\";
+                    }
+                }
+            } else if (p.StartsWith(@"\REGISTRY\MACHINE", StringComparison.OrdinalIgnoreCase)) {
+                p = "HKLM" + p.Substring(17);
+            } else if (p.StartsWith(@"\REGISTRY\USER", StringComparison.OrdinalIgnoreCase)) {
+                p = "HKU" + p.Substring(14);
+            }
+            if (p.EndsWith(@"\*", StringComparison.Ordinal) && p.Length > 4) {
+                p = p.Substring(0, p.Length - 2);
+            }
+            return p;
+        }
+
+        static string CanonicalizePath(string normPath) {
+            if (string.IsNullOrWhiteSpace(normPath)) return "";
+            string p = normPath.TrimEnd();
+            while (p.Length > 3 && (p.EndsWith("\\") || p.EndsWith("/"))) p = p.Substring(0, p.Length - 1);
+            if (p.StartsWith("\\\\")) {
+                p = "\\\\" + Regex.Replace(p.Substring(2), @"\\\\+", "\\");
+            } else {
+                p = Regex.Replace(p, @"\\\\+", "\\");
+            }
+            return p.ToLowerInvariant();
+        }
+
+        static int GetIntegrityRank(string integ) {
+            if (string.IsNullOrEmpty(integ)) return -1;
+            switch (integ.Trim().ToLowerInvariant()) {
+                case "protected process": return 6;
+                case "system": return 5;
+                case "high": return 4;
+                case "medium plus": return 3;
+                case "medium": return 2;
+                case "low": return 1;
+                case "appcontainer": return 1;
+                case "untrusted": return 0;
+                default: return -1;
+            }
+        }
+
+        static string GetOpDir(string op) {
+            if (string.IsNullOrEmpty(op)) return "Read";
+            string t = op.Trim();
+            if (WriteOps.Contains(t)) return "Write";
+            if (ReadOps.Contains(t)) return "Read";
+            if (t.IndexOf("write", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                t.IndexOf("set", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                t.IndexOf("create", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                t.IndexOf("delete", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                t.IndexOf("rename", StringComparison.OrdinalIgnoreCase) >= 0) return "Write";
+            return "Read";
+        }
+
+        public static ParseSummary StreamAndAggregateCsv(string csvPath, string[] excludeProcs, IDictionary driveMap, string userSid, bool isAdminLatent) {
+            var summary = new ParseSummary();
+            var excludeSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (excludeProcs != null) {
+                foreach (var ep in excludeProcs) if (!string.IsNullOrEmpty(ep)) excludeSet.Add(ep.Trim());
+            }
+
+            bool hasCompanion = false;
+            Dictionary<string, string> companionIntMap = null;
+            var pidIntMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            pidIntMap["4"] = "System";
+
+            using (var sr = new StreamReader(csvPath)) {
+                int physLines = 0;
+                var headers = ReadCsvRow(sr, ref physLines);
+                if (headers == null) return summary;
+
+                var hMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < headers.Count; i++) hMap[headers[i].Trim()] = i;
+
+                int idxTime = hMap.ContainsKey("time of day") ? hMap["time of day"] : 0;
+                int idxProc = hMap.ContainsKey("process name") ? hMap["process name"] : 1;
+                int idxPid  = hMap.ContainsKey("pid") ? hMap["pid"] : -1;
+                int idxOp   = hMap.ContainsKey("operation") ? hMap["operation"] : 3;
+                int idxPath = hMap.ContainsKey("path") ? hMap["path"] : 4;
+                int idxRes  = hMap.ContainsKey("result") ? hMap["result"] : 5;
+                int idxDet  = hMap.ContainsKey("detail") ? hMap["detail"] : 6;
+                int idxInt  = hMap.ContainsKey("integrity") ? hMap["integrity"] : -1;
+                int idxImp  = hMap.ContainsKey("impersonating") ? hMap["impersonating"] : -1;
+                int idxCmd  = hMap.ContainsKey("command line") ? hMap["command line"] : -1;
+
+                if (idxInt < 0) {
+                    companionIntMap = LoadCompanionIntegrityMap(csvPath, out hasCompanion);
+                }
+
+                List<string> fields;
+                int rowCount = 0;
+                while ((fields = ReadCsvRow(sr, ref physLines)) != null) {
+                    rowCount++;
+                    if (fields.Count < 5) continue;
+
+                    string procName = (idxProc >= 0 && idxProc < fields.Count) ? fields[idxProc].Trim() : "";
+                    string pidStr   = (idxPid >= 0 && idxPid < fields.Count) ? fields[idxPid].Trim() : "";
+                    string opStr    = (idxOp >= 0 && idxOp < fields.Count) ? fields[idxOp].Trim() : "";
+                    string detStr   = (idxDet >= 0 && idxDet < fields.Count) ? fields[idxDet] : "";
+                    string cmdStr   = (idxCmd >= 0 && idxCmd < fields.Count) ? fields[idxCmd].Trim() : "";
+
+                    if (!string.IsNullOrEmpty(procName)) {
+                        if (!string.IsNullOrEmpty(cmdStr)) {
+                            summary.ProcessLineage[procName] = cmdStr;
+                        } else if (opStr.StartsWith("Process ", StringComparison.OrdinalIgnoreCase) && detStr.IndexOf("Command line:", StringComparison.OrdinalIgnoreCase) >= 0) {
+                            var mCmd = RxCmdLine.Match(detStr);
+                            if (mCmd.Success) summary.ProcessLineage[procName] = mCmd.Groups[1].Value.Trim();
+                        }
+                        if (opStr.Equals("Process Start", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(pidStr)) {
+                            if (detStr.IndexOf(@"config\systemprofile", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                detStr.IndexOf(@"ServiceProfiles\LocalService", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                detStr.IndexOf(@"ServiceProfiles\NetworkService", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                detStr.IndexOf("USERNAME=SYSTEM", StringComparison.OrdinalIgnoreCase) >= 0) {
+                                pidIntMap[pidStr] = "System";
+                            }
+                        }
+                    }
+
+                    string pathOrig = (idxPath >= 0 && idxPath < fields.Count) ? fields[idxPath] : "";
+                    if (string.IsNullOrWhiteSpace(pathOrig)) continue;
+
+                    string pathRaw = NormalizePath(pathOrig, driveMap);
+                    if (string.IsNullOrWhiteSpace(pathRaw)) continue;
+
+                    bool isPipe = pathRaw.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase);
+                    bool isUnc  = !isPipe && pathRaw.StartsWith(@"\\", StringComparison.Ordinal) && !pathRaw.StartsWith(@"\\.\") && !pathRaw.StartsWith(@"\\?\");
+                    bool isDriveFs = (pathRaw.Length >= 3 && char.IsLetter(pathRaw[0]) && pathRaw[1] == ':' && pathRaw[2] == '\\');
+                    bool isFsPath = isDriveFs || isPipe || isUnc;
+                    bool isRegPath = !isFsPath && (
+                        pathRaw.StartsWith("HKCU", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKEY_CURRENT_USER", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKU", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKEY_USERS", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKLM", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKEY_LOCAL_MACHINE", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKCR", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKEY_CLASSES_ROOT", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKCC", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKEY_CURRENT_CONFIG", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKPD", StringComparison.OrdinalIgnoreCase) ||
+                        pathRaw.StartsWith("HKEY_PERFORMANCE_DATA", StringComparison.OrdinalIgnoreCase)
+                    );
+                    if (!isFsPath && !isRegPath) continue;
+
+                    // Self-trace contamination check
+                    if (excludeSet.Contains(procName)) {
+                        summary.SkippedSelfTrace++;
+                        continue;
+                    }
+                    string pl = pathRaw.ToLowerInvariant();
+                    bool isSelfArtifact = false;
+                    for (int a = 0; a < TraceArtifacts.Length; a++) {
+                        if (pl.EndsWith(TraceArtifacts[a], StringComparison.Ordinal)) { isSelfArtifact = true; break; }
+                    }
+                    if (isSelfArtifact || pl.EndsWith("\\procmon.exe") || pl.EndsWith("\\procmon64.exe") ||
+                        pl.EndsWith("\\tracerpt.exe") || pl.EndsWith("\\logman.exe") || pl.EndsWith("\\nativetrace.ps1")) {
+                        summary.SkippedSelfTrace++;
+                        continue;
+                    }
+
+                    string timeStr  = (idxTime >= 0 && idxTime < fields.Count) ? fields[idxTime] : "";
+                    string resStr   = (idxRes >= 0 && idxRes < fields.Count) ? fields[idxRes] : "";
+                    string integStr = (idxInt >= 0 && idxInt < fields.Count) ? fields[idxInt].Trim() : "Unknown";
+                    string impStr   = (idxImp >= 0 && idxImp < fields.Count) ? fields[idxImp].Trim() : "";
+
+                    if (string.IsNullOrEmpty(integStr) || integStr.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) {
+                        if (detStr.IndexOf("Integrity:", StringComparison.OrdinalIgnoreCase) >= 0) {
+                            var mInt = RxIntegrityDetail.Match(detStr);
+                            if (mInt.Success) integStr = mInt.Groups[1].Value;
+                        }
+                        if ((string.IsNullOrEmpty(integStr) || integStr.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) && hasCompanion && companionIntMap != null) {
+                            string cVal;
+                            if (companionIntMap.TryGetValue(procName + ":" + pidStr, out cVal)) integStr = cVal;
+                            else integStr = "Medium";
+                        }
+                        if (string.IsNullOrEmpty(integStr) || integStr.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) {
+                            string pInt;
+                            if (!string.IsNullOrEmpty(pidStr) && pidIntMap.TryGetValue(pidStr, out pInt)) integStr = pInt;
+                            else if (KnownSystemDaemons.Contains(procName)) integStr = "System";
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(impStr) && detStr.IndexOf("Impersonating:", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        var mImp = RxImpersonating.Match(detStr);
+                        if (mImp.Success) {
+                            string candImp = mImp.Groups[1].Value.Trim();
+                            if (!candImp.Equals(@"NT AUTHORITY\SYSTEM", StringComparison.OrdinalIgnoreCase) &&
+                                !candImp.Equals(@"NT AUTHORITY\LOCAL SERVICE", StringComparison.OrdinalIgnoreCase) &&
+                                !candImp.Equals(@"NT AUTHORITY\NETWORK SERVICE", StringComparison.OrdinalIgnoreCase)) {
+                                impStr = candImp;
+                            }
+                        }
+                    }
+
+                    bool isPagingIO  = detStr.IndexOf("Paging I/O", StringComparison.OrdinalIgnoreCase) >= 0 || detStr.IndexOf("Paging IO", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool openRP      = detStr.IndexOf("Open Reparse Point", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool openLink    = detStr.IndexOf("Open Link", StringComparison.OrdinalIgnoreCase) >= 0 || detStr.IndexOf("REG_OPTION_OPEN_LINK", StringComparison.OrdinalIgnoreCase) >= 0 || detStr.IndexOf("OBJ_OPENLINK", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool delOnClose  = detStr.IndexOf("Delete On Close", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool openBackup  = detStr.IndexOf("Open For Backup", StringComparison.OrdinalIgnoreCase) >= 0;
+                    string sqos      = "NotSpecified";
+                    if (detStr.IndexOf("Impersonation", StringComparison.OrdinalIgnoreCase) >= 0 || detStr.IndexOf("Identification", StringComparison.OrdinalIgnoreCase) >= 0 || detStr.IndexOf("Delegation", StringComparison.OrdinalIgnoreCase) >= 0 || detStr.IndexOf("Anonymous", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        var mSqos = RxSqos.Match(detStr);
+                        if (mSqos.Success) sqos = mSqos.Groups[1].Value;
+                    }
+                    string desAcc = "";
+                    if (detStr.IndexOf("Desired Access:", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        var mDa = RxDesiredAccess.Match(detStr);
+                        if (mDa.Success) desAcc = mDa.Groups[1].Value.Trim();
+                    }
+                    string disp = "";
+                    if (detStr.IndexOf("Disposition:", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        var mDp = RxDisposition.Match(detStr);
+                        if (mDp.Success) disp = mDp.Groups[1].Value.Trim();
+                    }
+                    string shareMode = "";
+                    if (detStr.IndexOf("ShareMode:", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        var mSm = RxShareMode.Match(detStr);
+                        if (mSm.Success) shareMode = mSm.Groups[1].Value.Trim();
+                    }
+                    string regDataPath = "";
+                    if (isRegPath && detStr.IndexOf("Data:", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        var mRd = RxDataPath.Match(detStr);
+                        if (mRd.Success) regDataPath = mRd.Groups[1].Value.Trim();
+                    }
+
+                    if (isPagingIO) summary.SkippedPagingIO++;
+                    bool isKernelAttrib = KernelProcs.Contains(procName);
+
+                    string opDir = GetOpDir(opStr);
+                    int intRank = GetIntegrityRank(integStr);
+                    bool isPriv = (intRank >= 4); // High (4), System (5), Protected Process (6)
+
+                    int score = 0;
+                    if (intRank >= 5) score += 220;
+                    else if (intRank == 4) score += 180;
+                    if (opDir == "Write") score += 100;
+                    if (resStr.IndexOf("NAME NOT FOUND", StringComparison.OrdinalIgnoreCase) >= 0) score += 25;
+                    if (resStr.IndexOf("PATH NOT FOUND", StringComparison.OrdinalIgnoreCase) >= 0) score += 20;
+                    if (resStr.IndexOf("REPARSE", StringComparison.OrdinalIgnoreCase) >= 0) score += 10;
+                    if (isPagingIO) score -= 80;
+                    if (isKernelAttrib) score -= 30;
+                    if (openRP) score -= 5;
+                    if (openLink) score -= 5;
+                    if (opStr.Equals("Load Image", StringComparison.OrdinalIgnoreCase)) score += 60;
+
+                    string canonical = CanonicalizePath(pathRaw);
+                    Hashtable rec;
+                    if (!summary.PathMap.TryGetValue(canonical, out rec)) {
+                        var evt = new Hashtable(StringComparer.OrdinalIgnoreCase);
+                        evt["Time"] = timeStr;
+                        evt["Operation"] = opStr;
+                        evt["Result"] = resStr;
+                        evt["Detail"] = detStr;
+                        evt["Integrity"] = integStr;
+                        evt["Impersonating"] = impStr;
+                        evt["ProcessName"] = procName;
+                        evt["IsPagingIO"] = isPagingIO;
+                        evt["OpenReparsePoint"] = openRP;
+                        evt["OpenLink"] = openLink;
+                        evt["DeleteOnClose"] = delOnClose;
+                        evt["OpenForBackup"] = openBackup;
+                        evt["SqosLevel"] = sqos;
+                        evt["DesiredAccess"] = desAcc;
+                        evt["Disposition"] = disp;
+                        evt["ShareMode"] = shareMode;
+                        evt["RegistryDataPath"] = regDataPath;
+                        evt["IsKernelOrCacheManager"] = isKernelAttrib;
+
+                        rec = new Hashtable(StringComparer.OrdinalIgnoreCase);
+                        rec["Path"] = pathRaw;
+                        rec["Processes"] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        rec["Operations"] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        rec["BestEvent"] = evt;
+                        rec["BestScore"] = score;
+                        rec["HighestIntegrity"] = integStr;
+                        rec["HighestIntegrityRank"] = intRank;
+                        rec["EventCount"] = 0;
+                        rec["AnyWrite"] = false;
+                        rec["AnyRead"] = false;
+                        rec["AnyPrivWrite"] = false;
+                        rec["AnyPrivRead"] = false;
+                        rec["AnyImpersonating"] = false;
+                        rec["AnyOpenReparsePoint"] = false;
+                        rec["AllOpenReparsePoint"] = true;
+                        rec["OpenEventCount"] = 0;
+                        rec["AnyOpenLink"] = false;
+                        rec["AllOpenLink"] = true;
+                        rec["RegOpenEventCount"] = 0;
+                        rec["AnyPagingIO"] = false;
+                        rec["HasDeleteOp"] = false;
+                        rec["HasSetSecurityOp"] = false;
+                        rec["HasRenameOp"] = false;
+                        rec["HasOpenForBackup"] = false;
+                        rec["HasBufferOverflow"] = false;
+                        rec["HasSharedWriteOrDelete"] = false;
+                        rec["HasReadOrCheckOp"] = false;
+                        rec["HasLoadOrExecOp"] = false;
+                        rec["HasNameNotFound"] = false;
+                        rec["RegistryDataPaths"] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        rec["NamePrincipals"] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        summary.PathMap[canonical] = rec;
+                    }
+
+                    ((HashSet<string>)rec["Processes"]).Add(procName);
+                    ((HashSet<string>)rec["Operations"]).Add(opStr);
+                    rec["EventCount"] = ((int)rec["EventCount"]) + 1;
+
+                    if (intRank > (int)rec["HighestIntegrityRank"]) {
+                        rec["HighestIntegrityRank"] = intRank;
+                        rec["HighestIntegrity"] = integStr;
+                    }
+                    if (opDir == "Write") rec["AnyWrite"] = true; else rec["AnyRead"] = true;
+                    if (isPriv && opDir == "Write") rec["AnyPrivWrite"] = true;
+                    if (isPriv && opDir == "Read")  rec["AnyPrivRead"] = true;
+                    if (!string.IsNullOrEmpty(impStr) && !impStr.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) {
+                        rec["AnyImpersonating"] = true;
+                        ((HashSet<string>)rec["NamePrincipals"]).Add(impStr);
+                    }
+                    if (openRP) rec["AnyOpenReparsePoint"] = true;
+                    if (isFsPath && (opStr.Equals("CreateFile", StringComparison.OrdinalIgnoreCase) || opStr.Equals("QueryOpen", StringComparison.OrdinalIgnoreCase) || opStr.Equals("OpenFile", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrEmpty(detStr))) {
+                        rec["OpenEventCount"] = ((int)rec["OpenEventCount"]) + 1;
+                        if (!openRP) rec["AllOpenReparsePoint"] = false;
+                    }
+                    if (openLink) rec["AnyOpenLink"] = true;
+                    if (isRegPath && (opStr.Equals("RegOpenKey", StringComparison.OrdinalIgnoreCase) || opStr.Equals("RegCreateKey", StringComparison.OrdinalIgnoreCase) || !string.IsNullOrEmpty(detStr))) {
+                        rec["RegOpenEventCount"] = ((int)rec["RegOpenEventCount"]) + 1;
+                        if (!openLink) rec["AllOpenLink"] = false;
+                    }
+                    if (isPagingIO) rec["AnyPagingIO"] = true;
+
+                    if (isPriv || !string.IsNullOrEmpty(impStr)) {
+                        if (opStr.Equals("SetDispositionInformationFile", StringComparison.OrdinalIgnoreCase) ||
+                            opStr.Equals("SetDispositionInformationEx", StringComparison.OrdinalIgnoreCase) ||
+                            opStr.Equals("RegDeleteKey", StringComparison.OrdinalIgnoreCase) ||
+                            opStr.Equals("RegDeleteValue", StringComparison.OrdinalIgnoreCase) ||
+                            delOnClose) {
+                            rec["HasDeleteOp"] = true;
+                        }
+                        if (opStr.Equals("SetSecurityFile", StringComparison.OrdinalIgnoreCase) ||
+                            opStr.Equals("RegSetKeySecurity", StringComparison.OrdinalIgnoreCase)) {
+                            rec["HasSetSecurityOp"] = true;
+                        }
+                        if (opStr.Equals("SetRenameInformationFile", StringComparison.OrdinalIgnoreCase)) {
+                            rec["HasRenameOp"] = true;
+                        }
+                        if (openBackup) rec["HasOpenForBackup"] = true;
+                        if (resStr.IndexOf("BUFFER OVERFLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            resStr.IndexOf("MORE DATA", StringComparison.OrdinalIgnoreCase) >= 0) {
+                            rec["HasBufferOverflow"] = true;
+                        }
+                    }
+                    if (shareMode.IndexOf("Write", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        shareMode.IndexOf("Delete", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        rec["HasSharedWriteOrDelete"] = true;
+                    }
+                    if (opStr.Equals("ReadFile", StringComparison.OrdinalIgnoreCase) ||
+                        opStr.Equals("QueryBasicInformationFile", StringComparison.OrdinalIgnoreCase) ||
+                        opStr.Equals("QueryOpen", StringComparison.OrdinalIgnoreCase)) {
+                        rec["HasReadOrCheckOp"] = true;
+                    }
+                    if (opStr.Equals("Load Image", StringComparison.OrdinalIgnoreCase) ||
+                        opStr.StartsWith("Process ", StringComparison.OrdinalIgnoreCase)) {
+                        rec["HasLoadOrExecOp"] = true;
+                    }
+                    if (resStr.IndexOf("NAME NOT FOUND", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        resStr.IndexOf("PATH NOT FOUND", StringComparison.OrdinalIgnoreCase) >= 0) {
+                        rec["HasNameNotFound"] = true;
+                    }
+                    if (!string.IsNullOrEmpty(regDataPath)) {
+                        ((HashSet<string>)rec["RegistryDataPaths"]).Add(regDataPath);
+                    }
+
+                    if (score > (int)rec["BestScore"]) {
+                        var evt = new Hashtable(StringComparer.OrdinalIgnoreCase);
+                        evt["Time"] = timeStr;
+                        evt["Operation"] = opStr;
+                        evt["Result"] = resStr;
+                        evt["Detail"] = detStr;
+                        evt["Integrity"] = integStr;
+                        evt["Impersonating"] = impStr;
+                        evt["ProcessName"] = procName;
+                        evt["IsPagingIO"] = isPagingIO;
+                        evt["OpenReparsePoint"] = openRP;
+                        evt["OpenLink"] = openLink;
+                        evt["DeleteOnClose"] = delOnClose;
+                        evt["OpenForBackup"] = openBackup;
+                        evt["SqosLevel"] = sqos;
+                        evt["DesiredAccess"] = desAcc;
+                        evt["Disposition"] = disp;
+                        evt["ShareMode"] = shareMode;
+                        evt["RegistryDataPath"] = regDataPath;
+                        evt["IsKernelOrCacheManager"] = isKernelAttrib;
+                        rec["BestEvent"] = evt;
+                        rec["BestScore"] = score;
+                        rec["Path"] = pathRaw;
+                    }
+                }
+                summary.TotalLines = rowCount;
+            }
+
+            if (summary.PathMap.Count > 1500) {
+                PreFilterLargeTrace(summary.PathMap, userSid);
+            }
+            return summary;
+        }
+
+        static bool IsLowOrUserSid(string sid, string userSid) {
+            if (sid == "S-1-1-0" || sid == "S-1-5-11" || sid == "S-1-5-32-545" ||
+                sid == "S-1-5-4" || sid == "S-1-2-0"  || sid == "S-1-5-32-546" ||
+                sid == "S-1-15-2-1" || sid == "S-1-15-2-2") return true;
+            if (!string.IsNullOrEmpty(userSid) && string.Equals(sid, userSid, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        static int GetFsLowMask(FileSystemSecurity acl, string userSid) {
+            int allow = 0, deny = 0;
+            try {
+                foreach (FileSystemAccessRule r in acl.GetAccessRules(true, true, typeof(SecurityIdentifier))) {
+                    string sid = r.IdentityReference.Value;
+                    if (!IsLowOrUserSid(sid, userSid)) continue;
+                    int bits = (int)r.FileSystemRights;
+                    if (r.AccessControlType == AccessControlType.Deny) deny |= bits;
+                    else allow |= bits;
+                }
+                var owner = acl.GetOwner(typeof(SecurityIdentifier));
+                if (owner != null && IsLowOrUserSid(owner.Value, userSid)) {
+                    allow |= (int)FileSystemRights.ChangePermissions;
+                }
+            } catch {}
+            return allow & ~deny;
+        }
+
+        static bool HasRegLowWrite(RegistrySecurity acl, string userSid) {
+            int mask = (int)(RegistryRights.SetValue | RegistryRights.CreateSubKey | RegistryRights.CreateLink | RegistryRights.ChangePermissions | RegistryRights.TakeOwnership);
+            bool allow = false, deny = false;
+            try {
+                foreach (RegistryAccessRule r in acl.GetAccessRules(true, true, typeof(SecurityIdentifier))) {
+                    string sid = r.IdentityReference.Value;
+                    if (!IsLowOrUserSid(sid, userSid)) continue;
+                    if (((int)r.RegistryRights & mask) != 0) {
+                        if (r.AccessControlType == AccessControlType.Deny) deny = true;
+                        else allow = true;
+                    }
+                }
+                var owner = acl.GetOwner(typeof(SecurityIdentifier));
+                if (owner != null && IsLowOrUserSid(owner.Value, userSid)) allow = true;
+            } catch {}
+            return allow && !deny;
+        }
+
+        static void PreFilterLargeTrace(Dictionary<string, Hashtable> pathMap, string userSid) {
+            int writeOrDacMask = (int)(FileSystemRights.WriteData | FileSystemRights.AppendData | FileSystemRights.WriteExtendedAttributes | FileSystemRights.WriteAttributes | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership);
+            int addFileOrDacMask = (int)(FileSystemRights.WriteData | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership);
+            int addDirOrDacMask = (int)(FileSystemRights.AppendData | FileSystemRights.WriteData | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership);
+            int delChildMask = (int)FileSystemRights.DeleteSubdirectoriesAndFiles;
+
+            var dirMaskCache = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var regLowCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var keysToRemove = new List<string>();
+            var tempBurstBuckets = new Dictionary<string, List<KeyValuePair<string, int>>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var kv in pathMap) {
+                string canonical = kv.Key;
+                Hashtable rec = kv.Value;
+                string p = (string)rec["Path"];
+
+                if (p.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)) continue;
+                var regData = (HashSet<string>)rec["RegistryDataPaths"];
+                if (regData != null && regData.Count > 0) continue;
+                if (RxAdminSurface.IsMatch(p)) continue;
+
+                bool anyPriv = (bool)rec["AnyPrivRead"] || (bool)rec["AnyPrivWrite"] || (bool)rec["AnyImpersonating"];
+                if (!anyPriv) {
+                    bool hasLolBin = false;
+                    var procSet = (HashSet<string>)rec["Processes"];
+                    if (procSet != null) {
+                        foreach (var pr in procSet) {
+                            if (LolBinProcs.Contains(pr)) { hasLolBin = true; break; }
+                        }
+                    }
+                    if (!hasLolBin && !RxUserOnlyKeep.IsMatch(p)) {
+                        keysToRemove.Add(canonical);
+                        continue;
+                    }
+                }
+
+                // Registry check
+                if (p.StartsWith("HK", StringComparison.OrdinalIgnoreCase)) {
+                    if (p.StartsWith("HKCU\\", StringComparison.OrdinalIgnoreCase) ||
+                        p.StartsWith("HKEY_CURRENT_USER\\", StringComparison.OrdinalIgnoreCase) ||
+                        (p.StartsWith("HKU\\", StringComparison.OrdinalIgnoreCase) && !p.StartsWith("HKU\\.DEFAULT", StringComparison.OrdinalIgnoreCase) && !p.StartsWith("HKU\\S-1-5-18", StringComparison.OrdinalIgnoreCase) && !p.StartsWith("HKU\\S-1-5-19", StringComparison.OrdinalIgnoreCase) && !p.StartsWith("HKU\\S-1-5-20", StringComparison.OrdinalIgnoreCase))) {
+                        continue;
+                    }
+                    int fs = p.IndexOf('\\');
+                    if (fs < 0) { keysToRemove.Add(canonical); continue; }
+                    string rootStr = p.Substring(0, fs).ToUpperInvariant();
+                    string sub = p.Substring(fs + 1).TrimEnd('\\');
+                    var bestEvt = (Hashtable)rec["BestEvent"];
+                    string bestOp = (string)bestEvt["Operation"];
+                    if (bestOp == "RegQueryValue" || bestOp == "RegSetValue" || bestOp == "RegDeleteValue" || bestOp == "RegEnumValue") {
+                        int ls = sub.LastIndexOf('\\');
+                        if (ls > 0) sub = sub.Substring(0, ls);
+                    }
+                    string cacheKey = rootStr + "\\" + sub;
+                    bool isRegLow = false;
+                    if (!regLowCache.TryGetValue(cacheKey, out isRegLow)) {
+                        RegistryKey root = null;
+                        if (rootStr == "HKLM" || rootStr == "HKEY_LOCAL_MACHINE") root = Registry.LocalMachine;
+                        else if (rootStr == "HKCR" || rootStr == "HKEY_CLASSES_ROOT") root = Registry.ClassesRoot;
+                        else if (rootStr == "HKU" || rootStr == "HKEY_USERS") root = Registry.Users;
+                        else if (rootStr == "HKCC" || rootStr == "HKEY_CURRENT_CONFIG") root = Registry.CurrentConfig;
+                        if (root != null) {
+                            string probe = sub;
+                            int depth = 0;
+                            while (!string.IsNullOrEmpty(probe) && depth < 16) {
+                                string pk = rootStr + "\\" + probe;
+                                if (regLowCache.TryGetValue(pk, out isRegLow)) break;
+                                try {
+                                    using (var rk = root.OpenSubKey(probe, RegistryKeyPermissionCheck.Default, RegistryRights.ReadPermissions)) {
+                                        if (rk != null) {
+                                            var sec = rk.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+                                            isRegLow = HasRegLowWrite(sec, userSid);
+                                            regLowCache[pk] = isRegLow;
+                                            break;
+                                        }
+                                    }
+                                } catch {
+                                    regLowCache[pk] = false;
+                                    break;
+                                }
+                                int ls = probe.LastIndexOf('\\');
+                                probe = (ls > 0) ? probe.Substring(0, ls) : "";
+                                depth++;
+                            }
+                        }
+                        regLowCache[cacheKey] = isRegLow;
+                    }
+                    if (!isRegLow) keysToRemove.Add(canonical);
+                    continue;
+                }
+
+                // Filesystem check
+                bool keepFs = false;
+                try {
+                    if (File.Exists(p)) {
+                        var acl = File.GetAccessControl(p, AccessControlSections.Access | AccessControlSections.Owner);
+                        int fMask = GetFsLowMask(acl, userSid);
+                        if ((fMask & writeOrDacMask) != 0) keepFs = true;
+                        else {
+                            string imm = Path.GetDirectoryName(p);
+                            if (!string.IsNullOrEmpty(imm) && Directory.Exists(imm)) {
+                                int dMask;
+                                if (!dirMaskCache.TryGetValue(imm, out dMask)) {
+                                    var dAcl = Directory.GetAccessControl(imm, AccessControlSections.Access | AccessControlSections.Owner);
+                                    dMask = GetFsLowMask(dAcl, userSid);
+                                    dirMaskCache[imm] = dMask;
+                                }
+                                if (((fMask & (int)FileSystemRights.Delete) != 0 || (dMask & delChildMask) != 0) && (dMask & addFileOrDacMask) != 0) {
+                                    keepFs = true;
+                                }
+                            }
+                        }
+                    } else if (Directory.Exists(p)) {
+                        int dMask;
+                        if (!dirMaskCache.TryGetValue(p, out dMask)) {
+                            var dAcl = Directory.GetAccessControl(p, AccessControlSections.Access | AccessControlSections.Owner);
+                            dMask = GetFsLowMask(dAcl, userSid);
+                            dirMaskCache[p] = dMask;
+                        }
+                        if ((dMask & writeOrDacMask) != 0) keepFs = true;
+                    } else {
+                        string imm = Path.GetDirectoryName(p);
+                        bool immExists = !string.IsNullOrEmpty(imm) && Directory.Exists(imm);
+                        string dir = imm;
+                        while (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) dir = Path.GetDirectoryName(dir);
+                        if (!string.IsNullOrEmpty(dir)) {
+                            int dMask;
+                            if (!dirMaskCache.TryGetValue(dir, out dMask)) {
+                                var dAcl = Directory.GetAccessControl(dir, AccessControlSections.Access | AccessControlSections.Owner);
+                                dMask = GetFsLowMask(dAcl, userSid);
+                                dirMaskCache[dir] = dMask;
+                            }
+                            int needed = immExists ? addFileOrDacMask : addDirOrDacMask;
+                            if ((dMask & needed) != 0) keepFs = true;
+                        }
+                    }
+                } catch {}
+
+                if (!keepFs) {
+                    keysToRemove.Add(canonical);
+                } else {
+                    // Check if inside Temp or WER burst bucket and not an executable/script/config
+                    bool isTempOrWer = (p.IndexOf(@"\AppData\Local\Temp\", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                                       (p.IndexOf(@"\Windows\WER\", StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (isTempOrWer && !Regex.IsMatch(p, @"(?i)\.(exe|dll|sys|msi|msp|ocx|cpl|scr|bat|cmd|ps1|psm1|vbs|js|hta|wsf|config|xml|json|ini|inf|cer|crt|pfx|lnk|url)$")) {
+                        var bestEvt = (Hashtable)rec["BestEvent"];
+                        string bProc = (string)bestEvt["ProcessName"];
+                        string bKey = bProc + "|" + (p.IndexOf(@"\Windows\WER\", StringComparison.OrdinalIgnoreCase) >= 0 ? "WER" : "TEMP");
+                        List<KeyValuePair<string, int>> list;
+                        if (!tempBurstBuckets.TryGetValue(bKey, out list)) {
+                            list = new List<KeyValuePair<string, int>>();
+                            tempBurstBuckets[bKey] = list;
+                        }
+                        list.Add(new KeyValuePair<string, int>(canonical, (int)rec["BestScore"]));
+                    }
+                }
+            }
+
+            foreach (var k in keysToRemove) pathMap.Remove(k);
+
+            foreach (var bkv in tempBurstBuckets) {
+                var list = bkv.Value;
+                if (list.Count > 10) {
+                    list.Sort((a, b) => b.Value.CompareTo(a.Value));
+                    for (int i = 10; i < list.Count; i++) {
+                        pathMap.Remove(list[i].Key);
+                    }
+                }
+            }
+        }
+    }
 }
-"@ -Language CSharp -ErrorAction SilentlyContinue
+"@ -Language CSharp -ErrorAction Stop
     }
     foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
         if ($drive.DriveType -eq 'Fixed' -or $drive.DriveType -eq 'Removable') {
@@ -244,7 +1001,9 @@ namespace Win32DeviceMap {
             if ($devPath) { $script:_driveMap[$devPath.ToLowerInvariant()] = $letter }
         }
     }
-} catch {}
+} catch {
+    Write-Host "[!] Warning compiling Win32DeviceMap C# accelerator: $($_.Exception.Message)" -ForegroundColor Yellow
+}
 
 function ConvertTo-NormalizedDisplayPath {
     param([string]$Path)
@@ -259,8 +1018,12 @@ function ConvertTo-NormalizedDisplayPath {
         $vol = $matches[1].ToLowerInvariant()
         $sep = $matches[2]
         $rest = $matches[3]
-        $letter = if ($script:_driveMap.ContainsKey($vol)) { $script:_driveMap[$vol] } else { "C:" }
-        $p = if ($sep) { "$letter\$rest" } else { "$letter\" }
+        if ($script:_driveMap.ContainsKey($vol)) {
+            $letter = $script:_driveMap[$vol]
+            $p = if ($sep) { "$letter\$rest" } else { "$letter\" }
+        } elseif ($script:_driveMap.Count -eq 0) {
+            $p = if ($sep) { "C:\$rest" } else { "C:\" }
+        }
     }
     # Kernel registry paths -> standard hive names
     $p = $p -replace '(?i)^\\REGISTRY\\MACHINE(\\|$)', 'HKLM$1'
@@ -406,224 +1169,55 @@ function Get-DetailFlags {
 
 # ── STREAM PARSE ─────────────────────────────────────────────────────────────
 
-$lineCount = 0
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$activeIdentity  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$activePrincipal = New-Object System.Security.Principal.WindowsPrincipal($activeIdentity)
+$currentUserName = $activeIdentity.Name
+$adminSidObj     = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
 
-while (-not $parser.EndOfData) {
-    try {
-        $fields = $parser.ReadFields()
-        $lineCount++
-
-        if ($fields.Length -lt 5) { continue }
-
-        $processName = if ($idxProc -lt $fields.Length) { $fields[$idxProc] } else { "" }
-        $pidVal      = if ($idxPid -ge 0 -and $idxPid -lt $fields.Length) { $fields[$idxPid] } else { "" }
-        $opStr       = if ($idxOp -lt $fields.Length)   { $fields[$idxOp] } else { "" }
-        $detailStr   = if ($idxDet -lt $fields.Length)  { $fields[$idxDet] } else { "" }
-        $cmdColStr   = if ($idxCmdLine -ge 0 -and $idxCmdLine -lt $fields.Length) { $fields[$idxCmdLine] } else { "" }
-
-        # Capture Process Create / Process Start command-line lineage before path filtering
-        if (-not [string]::IsNullOrWhiteSpace($processName)) {
-            if (-not [string]::IsNullOrWhiteSpace($cmdColStr)) {
-                $processLineageMap[$processName] = $cmdColStr.Trim()
-            } elseif ($opStr -match '^(?i)Process\s*(Start|Create)' -and $detailStr -match '(?i)Command\s*line:\s*(.+)$') {
-                $processLineageMap[$processName] = $matches[1].Trim()
-            }
-        }
-
-        $pathRawOrig = if ($idxPath -lt $fields.Length) { $fields[$idxPath] } else { "" }
-        if ([string]::IsNullOrWhiteSpace($pathRawOrig)) { continue }
-
-        # Normalize \??\, \Device\HarddiskVolume<N>, \Device\NamedPipe, \REGISTRY\...
-        $pathRaw = ConvertTo-NormalizedDisplayPath -Path $pathRawOrig
-
-        # Filesystem path or registry hive path
-        $isFsPath  = ($pathRaw -match "^[a-zA-Z]:\\") -or ($pathRaw -match "^\\\\")
-        $isRegPath = ($pathRaw -match "^HKCU") -or ($pathRaw -match "^HKEY_CURRENT_USER") `
-                  -or ($pathRaw -match "^HKU") -or ($pathRaw -match "^HKEY_USERS") `
-                  -or ($pathRaw -match "^HKLM") -or ($pathRaw -match "^HKEY_LOCAL_MACHINE") `
-                  -or ($pathRaw -match "^HKCR") -or ($pathRaw -match "^HKEY_CLASSES_ROOT") `
-                  -or ($pathRaw -match "^HKCC") -or ($pathRaw -match "^HKEY_CURRENT_CONFIG") `
-                  -or ($pathRaw -match "^HKPD") -or ($pathRaw -match "^HKEY_PERFORMANCE_DATA")
-        if (-not ($isFsPath -or $isRegPath)) { continue }
-
-        if (Test-SelfTraceContamination -Path $pathRaw -ProcessName $processName) {
-            $script:skippedSelfTrace++
-            continue
-        }
-
-        $timeStr   = if ($idxTime -lt $fields.Length) { $fields[$idxTime] } else { "" }
-        $resStr    = if ($idxRes -lt $fields.Length)  { $fields[$idxRes] } else { "" }
-        $integStr  = if ($idxInt -ge 0 -and $idxInt -lt $fields.Length) { $fields[$idxInt] } else { "Unknown" }
-        $impStr    = if ($idxImp -ge 0 -and $idxImp -lt $fields.Length) { $fields[$idxImp] } else { "" }
-
-        # Fallback: if Integrity column was absent/Unknown, check Detail for NativeTrace "Integrity: <lvl>"
-        if (($integStr -eq "Unknown" -or [string]::IsNullOrWhiteSpace($integStr)) -and $detailStr -match '(?i)Integrity:\s*(System|High|Medium Plus|Medium|Low|Untrusted|Protected Process)') {
-            $integStr = $matches[1]
-        }
-
-        $detailFlags = Get-DetailFlags -Detail $detailStr
-        if (-not [string]::IsNullOrWhiteSpace($detailFlags.CommandLine) -and -not [string]::IsNullOrWhiteSpace($processName)) {
-            $processLineageMap[$processName] = $detailFlags.CommandLine
-        }
-        $isKernelAttrib = $kernelAttribProcs -contains $processName.Trim()
-
-        # Track Paging-I/O drop count (still index it for the analyzer to know
-        # the path was hit, but mark it). We do NOT drop the row entirely.
-        if ($detailFlags.IsPagingIO) { $script:skippedPagingIO++ }
-
-        $evt = @{
-            Time                   = $timeStr
-            Operation              = $opStr
-            Result                 = $resStr
-            Detail                 = $detailStr
-            Integrity              = $integStr
-            Impersonating          = $impStr
-            ProcessName            = $processName
-            IsPagingIO             = $detailFlags.IsPagingIO
-            OpenReparsePoint       = $detailFlags.OpenReparsePoint
-            OpenLink               = $detailFlags.OpenLink
-            DeleteOnClose          = $detailFlags.DeleteOnClose
-            OpenForBackup          = $detailFlags.OpenForBackup
-            SqosLevel              = $detailFlags.SqosLevel
-            DesiredAccess          = $detailFlags.DesiredAccess
-            Disposition            = $detailFlags.Disposition
-            ShareMode              = $detailFlags.ShareMode
-            RegistryDataPath       = $detailFlags.RegistryDataPath
-            IsKernelOrCacheManager = $isKernelAttrib
-        }
-
-        $canonical = ConvertTo-CanonicalPath -Path $pathRaw
-
-        if (-not $pathProcessMap.ContainsKey($canonical)) {
-            $pathProcessMap[$canonical] = @{
-                Path        = $pathRaw
-                Processes   = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-                Operations  = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-                BestEvent   = $evt
-                BestScore   = Get-EventScore -Evt $evt
-                HighestIntegrity     = $integStr
-                HighestIntegrityRank = Get-IntegrityRank -Integrity $integStr
-                EventCount  = 0
-                AnyWrite    = $false
-                AnyRead     = $false
-                AnyPrivWrite = $false
-                AnyPrivRead  = $false
-                AnyImpersonating = $false
-                AnyOpenReparsePoint = $false
-                AllOpenReparsePoint = $true
-                OpenEventCount      = 0
-                AnyOpenLink = $false
-                AllOpenLink = $true
-                RegOpenEventCount   = 0
-                AnyPagingIO = $false
-                HasDeleteOp = $false
-                HasSetSecurityOp = $false
-                HasRenameOp = $false
-                HasOpenForBackup = $false
-                HasBufferOverflow = $false
-                HasSharedWriteOrDelete = $false
-                HasReadOrCheckOp = $false
-                HasLoadOrExecOp  = $false
-                HasNameNotFound  = $false
-                RegistryDataPaths = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-                NamePrincipals = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-            }
-        }
-
-        $rec = $pathProcessMap[$canonical]
-        [void]$rec.Processes.Add($processName)
-        [void]$rec.Operations.Add($opStr)
-        $rec.EventCount++
-
-        $intRank = Get-IntegrityRank -Integrity $integStr
-        if ($intRank -gt $rec.HighestIntegrityRank) {
-            $rec.HighestIntegrityRank = $intRank
-            $rec.HighestIntegrity     = $integStr
-        }
-
-        $opDir = Get-OperationDirection -Operation $opStr
-        if ($opDir -eq "Write") { $rec.AnyWrite = $true } else { $rec.AnyRead = $true }
-        $isPriv = Test-PrivilegedIntegrity -Integrity $integStr
-        if ($isPriv -and $opDir -eq "Write") { $rec.AnyPrivWrite = $true }
-        if ($isPriv -and $opDir -eq "Read")  { $rec.AnyPrivRead  = $true }
-        if (-not [string]::IsNullOrWhiteSpace($impStr) -and $impStr -ne "Unknown") {
-            $rec.AnyImpersonating = $true
-            [void]$rec.NamePrincipals.Add($impStr)
-        }
-        if ($detailFlags.OpenReparsePoint) { $rec.AnyOpenReparsePoint = $true }
-        if ($isFsPath -and ($opStr -match '^(?i)(CreateFile|QueryOpen|OpenFile)' -or -not [string]::IsNullOrWhiteSpace($detailStr))) {
-            $rec.OpenEventCount++
-            if (-not $detailFlags.OpenReparsePoint) { $rec.AllOpenReparsePoint = $false }
-        }
-        if ($detailFlags.OpenLink) { $rec.AnyOpenLink = $true }
-        if ($isRegPath -and ($opStr -match '^(?i)Reg(Open|Create)Key' -or -not [string]::IsNullOrWhiteSpace($detailStr))) {
-            $rec.RegOpenEventCount++
-            if (-not $detailFlags.OpenLink) { $rec.AllOpenLink = $false }
-        }
-        if ($detailFlags.IsPagingIO) { $rec.AnyPagingIO = $true }
-
-        # Granular operation & Detail flag tracking (rev 3.4)
-        if ($opStr -in @("SetDispositionInformationFile", "SetDispositionInformationEx", "RegDeleteKey", "RegDeleteValue") -or
-            $detailFlags.DeleteOnClose -or ($detailFlags.DesiredAccess -match '(?i)\bDelete\b')) {
-            $rec.HasDeleteOp = $true
-        }
-        if ($opStr -in @("SetSecurityFile", "RegSetInfoKey") -or ($detailFlags.DesiredAccess -match '(?i)Write\s*(DAC|Owner)')) {
-            $rec.HasSetSecurityOp = $true
-        }
-        if ($opStr -eq "SetRenameInformationFile") {
-            $rec.HasRenameOp = $true
-        }
-        if ($detailFlags.OpenForBackup) {
-            $rec.HasOpenForBackup = $true
-        }
-        if ($resStr -match '(?i)BUFFER OVERFLOW|MORE DATA') {
-            $rec.HasBufferOverflow = $true
-        }
-        if ($resStr -match '(?i)NAME NOT FOUND') {
-            $rec.HasNameNotFound = $true
-        }
-        if ($detailFlags.ShareMode -match '(?i)(Write|Delete)') {
-            $rec.HasSharedWriteOrDelete = $true
-        }
-        if ($opStr -in @("ReadFile", "QueryBasicInformationFile", "QueryOpen")) {
-            $rec.HasReadOrCheckOp = $true
-        }
-        if ($opStr -match '(?i)Load\s*Image|Process\s*(Create|Start)') {
-            $rec.HasLoadOrExecOp = $true
-        }
-        if (-not [string]::IsNullOrWhiteSpace($detailFlags.RegistryDataPath)) {
-            [void]$rec.RegistryDataPaths.Add($detailFlags.RegistryDataPath)
-        }
-
-        $score = Get-EventScore -Evt $evt
-        if ($score -gt $rec.BestScore) {
-            $rec.BestEvent = $evt
-            $rec.BestScore = $score
-            # Re-pin display path when the higher-scoring event has a different
-            # capitalization / trailing-slash variant so the report shows the
-            # form most relevant to the lead.
-            $rec.Path = $pathRaw
-        }
-    } catch [Microsoft.VisualBasic.FileIO.MalformedLineException] {
-        $null = $parser.ReadLine()
-        $script:skippedErrors.Add([PSCustomObject]@{ Type = "Parser Error"; Error = "Malformed CSV Line"; Details = $_.Exception.Message })
-    } catch {
-        $null = $parser.ReadLine()
-        $script:skippedErrors.Add([PSCustomObject]@{ Type = "Parser Error"; Error = "Unhandled CSV Row Error"; Details = $_.Exception.Message })
-    }
-
-    $thresh = if ($totalLines -gt 0 -and $totalLines -lt 20000) { 100 } else { 20000 }
-    if ($lineCount % $thresh -eq 0) {
-        Write-Output "[PROGRESS] $lineCount / $totalLines Extracting Target Vectors..."
-    }
+$isAdminLatent = $false
+foreach ($g in $activeIdentity.Groups) {
+    if ($g.Equals($adminSidObj)) { $isAdminLatent = $true; break }
 }
-$parser.Close()
+$isAdminElevated = $activePrincipal.IsInRole($adminSidObj)
+
+$processIntegrity = "Medium"
+try {
+    $wamiOut = & whoami /groups 2>$null
+    foreach ($line in $wamiOut) {
+        if ($line -match 'Mandatory Label\\(\w+) Mandatory Level') {
+            $processIntegrity = $matches[1]
+            break
+        }
+    }
+} catch { }
+
+$userContext = @{
+    UserSid               = $activeIdentity.User.Value
+    UserName              = $currentUserName
+    IsAdminLatent         = $isAdminLatent
+    IsAdminElevated       = $isAdminElevated
+    ProcessIntegrityLevel = $processIntegrity
+}
+
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$parseSummary = [Win32DeviceMap.ProcmonFastParser]::StreamAndAggregateCsv(
+    $CsvPath,
+    [string[]]$ExcludeProcessTraces,
+    $script:_driveMap,
+    $userContext.UserSid,
+    $userContext.IsAdminLatent
+)
 $sw.Stop()
+
+$pathProcessMap          = $parseSummary.PathMap
+$processLineageMap       = $parseSummary.ProcessLineage
+$lineCount               = $parseSummary.TotalLines
+$script:skippedSelfTrace = $parseSummary.SkippedSelfTrace
+$script:skippedPagingIO  = $parseSummary.SkippedPagingIO
 
 $canonicalPaths = [string[]]$pathProcessMap.Keys
 $totalCount = $canonicalPaths.Count
-Write-Host "Parsed $lineCount lines in $($sw.Elapsed.TotalSeconds.ToString('0.00'))s. $totalCount unique canonical paths." -ForegroundColor Cyan
+Write-Host "Parsed $lineCount lines in $($sw.Elapsed.TotalSeconds.ToString('0.00'))s. $totalCount candidate canonical paths retained for deep ACL inspection." -ForegroundColor Cyan
 Write-Host "  - Skipped self-trace contamination rows: $script:skippedSelfTrace" -ForegroundColor DarkGray
 Write-Host "  - Paging-I/O attributions detected (kept, marked): $script:skippedPagingIO" -ForegroundColor DarkGray
 Write-Host "Starting safe permission tests (no destructive writes)..." -ForegroundColor Cyan
@@ -899,6 +1493,8 @@ function Invoke-DaclEvaluation {
     $allowedMed = $false; $deniedMed = $false
     $allowedHigh = $false; $deniedHigh = $false
     $allowedAppContainer = $false; $deniedAppContainer = $false
+    $allowCreateFilesLow = $false; $denyCreateFilesLow = $false
+    $allowCreateDirsLow  = $false; $denyCreateDirsLow  = $false
     $hasOwnerRightsAce = $false
     $flaggedConditionalSids = New-Object System.Collections.Generic.HashSet[string]
     $serviceSids = New-Object System.Collections.Generic.HashSet[string]
@@ -944,6 +1540,15 @@ function Invoke-DaclEvaluation {
             }
             if ($IsRegistry -and (($rights -band $script:_regCreateLinkBit) -ne 0) -and (($rights -band 0x2) -ne 0)) {
                 $Result.CanCreateRegLink = $true
+            }
+        }
+
+        if (-not $IsRegistry -and $IsContainer -and $isLowOrUser) {
+            if ((($rights -band 0x2) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                if ($isDeny) { $denyCreateFilesLow = $true } else { $allowCreateFilesLow = $true }
+            }
+            if ((($rights -band 0x4) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                if ($isDeny) { $denyCreateDirsLow = $true } else { $allowCreateDirsLow = $true }
             }
         }
 
@@ -1009,6 +1614,7 @@ function Invoke-DaclEvaluation {
                 if (($script:_lowPrivSids -contains $ownerSid) -or ($ownerSid -eq $UserContext.UserSid -and -not $UserContext.IsAdminLatent)) {
                     $Result.CanWriteDacOrOwner = $true
                     $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
+                    $allowCreateFilesLow = $true; $allowCreateDirsLow = $true
                 } elseif ($ownerSid -eq $UserContext.UserSid -and $UserContext.IsAdminLatent) {
                     $Result.CanWriteDacOrOwner = $true
                     $allowedMed = $true; $allowedHigh = $true
@@ -1020,6 +1626,8 @@ function Invoke-DaclEvaluation {
     $Result.WritableByLowPriv       = $allowedLow  -and -not $deniedLow
     $Result.WritableByMediumILAdmin = $allowedMed  -and -not $deniedMed
     $Result.WritableByHighILAdmin   = $allowedHigh -and -not $deniedHigh
+    $Result.CanCreateFilesLow       = $allowCreateFilesLow -and -not $denyCreateFilesLow
+    $Result.CanCreateDirsLow        = $allowCreateDirsLow  -and -not $denyCreateDirsLow
     $Result.WritableByAppContainer  = ($allowedAppContainer -or $Result.WritableByLowPriv) -and (-not $deniedAppContainer) -and ($Result.IntegrityLabel -eq "Low")
     if ($serviceSids.Count -gt 0) {
         $Result.WritableServiceSids = @($serviceSids)
@@ -1057,6 +1665,8 @@ function Get-DirectoryWritabilityCached {
         CanWriteDacOrOwner      = $false
         CanDeleteSelf           = $false
         CanDeleteChild          = $false
+        CanCreateFilesLow       = $false
+        CanCreateDirsLow        = $false
         CanCreateRegLink        = $false
         IntegrityLabel          = "Default"
         OwnerSid                = ""
@@ -1092,6 +1702,8 @@ function Get-DirectoryWritabilityCached {
                 $dRes.WritableByMediumILAdmin = $false
                 $dRes.CanDeleteSelf           = $false
                 $dRes.CanDeleteChild          = $false
+                $dRes.CanCreateFilesLow       = $false
+                $dRes.CanCreateDirsLow        = $false
             }
         }
     } catch {}
@@ -1114,6 +1726,8 @@ function Get-PathWritability {
         CanWriteDacOrOwner        = $false
         CanDeleteSelf             = $false
         CanDeleteChild            = $false
+        CanCreateFilesLow         = $false
+        CanCreateDirsLow          = $false
         CanDeleteOrReplace        = $false
         HasWritableAncestor       = $false
         WritableAncestorPath      = ""
@@ -1196,6 +1810,8 @@ function Get-PathWritability {
         # Filesystem: pick the right ACL bearer (100% read-only; NEVER opens or writes to files).
         $aclTarget = $null
         $treatAsExistingFile = $false
+        $immediateParent = [System.IO.Path]::GetDirectoryName($TargetPath)
+        $immExists = (-not [string]::IsNullOrWhiteSpace($immediateParent)) -and [System.IO.Directory]::Exists($immediateParent)
         if ([System.IO.File]::Exists($TargetPath)) {
             $aclTarget = $TargetPath
             $treatAsExistingFile = $true
@@ -1204,7 +1820,7 @@ function Get-PathWritability {
             $aclTarget = $TargetPath
             $r.AclSource = "exact-directory"
         } else {
-            $dir = [System.IO.Path]::GetDirectoryName($TargetPath)
+            $dir = $immediateParent
             while (-not [string]::IsNullOrWhiteSpace($dir) -and -not [System.IO.Directory]::Exists($dir)) {
                 $dir = [System.IO.Path]::GetDirectoryName($dir)
             }
@@ -1258,21 +1874,41 @@ function Get-PathWritability {
                 $r.WritableByMediumILAdmin = $false
                 $r.CanDeleteSelf           = $false
                 $r.CanDeleteChild          = $false
+                $r.CanCreateFilesLow       = $false
+                $r.CanCreateDirsLow        = $false
                 $r.CanWriteDacOrOwner      = $false
+            }
+
+            # When the target does not exist (AclSource = ancestor):
+            # - If its immediate parent directory exists, creating a file directly inside it requires FILE_ADD_FILE (0x2).
+            # - If intermediate directories are missing, creating the missing subdirectory requires FILE_ADD_SUBDIRECTORY (0x4).
+            if ($r.AclSource -eq "ancestor") {
+                if ($immExists) {
+                    if (-not $r.CanCreateFilesLow) {
+                        $r.WritableByLowPriv       = $false
+                        $r.WritableByMediumILAdmin = $false
+                    }
+                } else {
+                    if (-not $r.CanCreateDirsLow) {
+                        $r.WritableByLowPriv       = $false
+                        $r.WritableByMediumILAdmin = $false
+                    } elseif (-not (Test-TopLevelProtectedRoot -DirPath $aclTarget)) {
+                        $r.HasWritableAncestor  = $true
+                        $r.WritableAncestorPath = $aclTarget
+                    }
+                }
             }
         }
 
         # Ancestor-Chain & Parent Delete-Recreate Walk (rev 3.4, 100% read-only):
         # 1. If the target is an existing file that isn't directly writable, check if its
-        #    immediate parent directory allows FILE_ADD_FILE (WritableByLowPriv) AND either
+        #    immediate parent directory allows FILE_ADD_FILE (CanCreateFilesLow) AND either
         #    the file grants DELETE or the parent grants FILE_DELETE_CHILD (0x40).
-        # 2. Walk intermediate ancestor directories (below top-level roots like C:\ProgramData,
-        #    C:\Windows, C:\Program Files, C:\Users\<User>) to detect whether an intermediate
-        #    directory can be modified or replaced with a junction.
-        $immediateParent = [System.IO.Path]::GetDirectoryName($TargetPath)
-        if (-not [string]::IsNullOrWhiteSpace($immediateParent) -and [System.IO.Directory]::Exists($immediateParent) -and -not (Test-TopLevelProtectedRoot -DirPath $immediateParent)) {
+        # 2. Walk existing intermediate ancestor directories (below top-level roots) to detect
+        #    whether an existing intermediate directory can be deleted/renamed and replaced.
+        if ($immExists -and -not (Test-TopLevelProtectedRoot -DirPath $immediateParent)) {
             $parentEval = Get-DirectoryWritabilityCached -DirPath $immediateParent -UserContext $UserContext
-            if ($treatAsExistingFile -and ($r.CanDeleteSelf -or $parentEval.CanDeleteChild) -and $parentEval.WritableByLowPriv) {
+            if ($treatAsExistingFile -and ($r.CanDeleteSelf -or $parentEval.CanDeleteChild) -and $parentEval.CanCreateFilesLow) {
                 $r.CanDeleteOrReplace = $true
                 if (-not $r.WritableByLowPriv) {
                     $r.WritableByLowPriv       = $true
@@ -1288,17 +1924,21 @@ function Get-PathWritability {
         while (-not [string]::IsNullOrWhiteSpace($ancDir) -and $ancDepth -lt 16) {
             if (Test-TopLevelProtectedRoot -DirPath $ancDir) { break }
             if ([System.IO.Directory]::Exists($ancDir)) {
-                $ancEval = Get-DirectoryWritabilityCached -DirPath $ancDir -UserContext $UserContext
-                if ($ancEval.WritableByLowPriv) {
-                    $r.HasWritableAncestor  = $true
-                    $r.WritableAncestorPath = $ancDir
-                    if (-not $r.WritableByLowPriv) {
-                        $r.WritableByLowPriv       = $true
-                        $r.WritableByMediumILAdmin = $true
-                        $r.WritableByHighILAdmin   = $true
-                        $r.AclSource               = "ancestor-dir-replaceable"
+                $ancParent = [System.IO.Path]::GetDirectoryName($ancDir)
+                if (-not [string]::IsNullOrWhiteSpace($ancParent) -and [System.IO.Directory]::Exists($ancParent)) {
+                    $ancEval = Get-DirectoryWritabilityCached -DirPath $ancDir -UserContext $UserContext
+                    $ancParentEval = Get-DirectoryWritabilityCached -DirPath $ancParent -UserContext $UserContext
+                    if (($ancEval.CanDeleteSelf -or $ancParentEval.CanDeleteChild) -and $ancParentEval.CanCreateDirsLow) {
+                        $r.HasWritableAncestor  = $true
+                        $r.WritableAncestorPath = $ancDir
+                        if (-not $r.WritableByLowPriv) {
+                            $r.WritableByLowPriv       = $true
+                            $r.WritableByMediumILAdmin = $true
+                            $r.WritableByHighILAdmin   = $true
+                            $r.AclSource               = "ancestor-dir-replaceable"
+                        }
+                        break
                     }
-                    break
                 }
             }
             $ancDir = [System.IO.Path]::GetDirectoryName($ancDir)
@@ -1327,42 +1967,6 @@ function Get-LowestWritablePerspective {
 $counter = 0
 $results = New-Object System.Collections.Generic.List[PSCustomObject]
 $swTest = [System.Diagnostics.Stopwatch]::StartNew()
-
-$activeIdentity  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$activePrincipal = New-Object System.Security.Principal.WindowsPrincipal($activeIdentity)
-$currentUserName = $activeIdentity.Name
-$adminSidObj     = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
-
-# IsAdminLatent: admin SID is in the token's groups list, even if currently
-# filtered to deny-only. WindowsIdentity.Groups returns groups regardless of
-# Use=DenyOnly status, so iterating Groups detects split-token admins.
-$isAdminLatent = $false
-foreach ($g in $activeIdentity.Groups) {
-    if ($g.Equals($adminSidObj)) { $isAdminLatent = $true; break }
-}
-# IsAdminElevated: admin SID is currently active (Use=Allow) in the token.
-# IsInRole returns false for deny-only, true for active.
-$isAdminElevated = $activePrincipal.IsInRole($adminSidObj)
-
-# Process integrity level via whoami /groups — portable, no P/Invoke.
-$processIntegrity = "Medium"
-try {
-    $wamiOut = & whoami /groups 2>$null
-    foreach ($line in $wamiOut) {
-        if ($line -match 'Mandatory Label\\(\w+) Mandatory Level') {
-            $processIntegrity = $matches[1]
-            break
-        }
-    }
-} catch { }
-
-$userContext = @{
-    UserSid               = $activeIdentity.User.Value
-    UserName              = $currentUserName
-    IsAdminLatent         = $isAdminLatent
-    IsAdminElevated       = $isAdminElevated
-    ProcessIntegrityLevel = $processIntegrity
-}
 
 Write-Host "Current user context:" -ForegroundColor Cyan
 Write-Host "  User:                     $($userContext.UserName) ($($userContext.UserSid))" -ForegroundColor DarkGray
@@ -1405,7 +2009,7 @@ foreach ($canonical in $canonicalPaths) {
     $bestEvt = $rec.BestEvent
     $cmdLineEntries = @()
     foreach ($pn in $rec.Processes) {
-        if ($processLineageMap.ContainsKey($pn)) {
+        if ($null -ne $processLineageMap -and $processLineageMap.ContainsKey($pn)) {
             $cmdLineEntries += "$pn`: $($processLineageMap[$pn])"
         }
     }
