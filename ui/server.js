@@ -20,10 +20,20 @@ if (!fs.existsSync(PROJECTS_DIR)) {
     fs.mkdirSync(PROJECTS_DIR, { recursive: true });
 }
 
+const sanitizeProjectName = (name) => {
+    const raw = String(name || 'Default_Project').trim();
+    return raw.replace(/[^a-zA-Z0-9_-]/g, '_') || 'Default_Project';
+};
+
+const sanitizeFileName = (name) => {
+    const base = path.basename(String(name || 'file'));
+    return base.replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
+};
+
 // Multer config for file uploads
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-    filename: (req, file, cb) => cb(null, `upload_${Date.now()}_${file.originalname}`)
+    filename: (req, file, cb) => cb(null, `upload_${Date.now()}_${sanitizeFileName(file.originalname)}`)
 });
 const upload = multer({ storage });
 
@@ -59,6 +69,21 @@ const readSafeJson = (filePath) => {
     return [];
 };
 
+// Helper to read a JSON object (e.g. _research_state.json) without wrapping it in an array
+const readSafeObject = (filePath) => {
+    try {
+        if (fs.existsSync(filePath)) {
+            const raw = fs.readFileSync(filePath, 'utf8');
+            const cleanRaw = raw.replace(/^\uFEFF/, '').trim();
+            if (!cleanRaw) return null;
+            return JSON.parse(cleanRaw);
+        }
+    } catch (e) {
+        console.error(`Error reading object ${filePath}:`, e);
+    }
+    return null;
+};
+
 // API: List Projects
 app.get('/api/projects', (req, res) => {
     try {
@@ -73,9 +98,9 @@ app.get('/api/projects', (req, res) => {
 
 // API: Create Project
 app.post('/api/projects', (req, res) => {
-    let { name } = req.body;
+    let { name } = req.body || {};
     if (!name) return res.status(400).json({ error: "Name required" });
-    name = name.replace(/[^a-zA-Z0-9_-]/g, '_'); // safe dir name
+    name = sanitizeProjectName(name);
 
     const projPath = path.join(PROJECTS_DIR, name);
     if (!fs.existsSync(projPath)) fs.mkdirSync(projPath, { recursive: true });
@@ -84,9 +109,9 @@ app.post('/api/projects', (req, res) => {
 });
 // API: Delete Project
 app.delete('/api/projects', (req, res) => {
-    let { name } = req.body;
+    let { name } = req.body || {};
     if (!name) return res.status(400).json({ error: "Name required" });
-    name = name.replace(/[^a-zA-Z0-9_-]/g, '_');
+    name = sanitizeProjectName(name);
 
     // Prevent deleting fundamental default framework
     if (name.toLowerCase() === 'default_project') {
@@ -101,8 +126,7 @@ app.delete('/api/projects', (req, res) => {
 });
 // API: Auto-inject existing JSONs from a project
 app.post('/api/auto-inject', (req, res) => {
-    let { project } = req.body;
-    if (!project) project = 'Default_Project';
+    const project = sanitizeProjectName((req.body || {}).project);
 
     const projPath = path.join(PROJECTS_DIR, project);
     const highConf = readSafeJson(path.join(projPath, 'high_confidence_leads.json'));
@@ -124,7 +148,7 @@ app.post('/api/upload', upload.single('reportFile'), (req, res) => {
     const ext = path.extname(req.file.originalname).toLowerCase();
 
     // Identify output project immediately
-    let activeProject = req.body.project || 'Default_Project';
+    const activeProject = sanitizeProjectName(req.body.project);
     const projPath = path.join(PROJECTS_DIR, activeProject);
     if (!fs.existsSync(projPath)) fs.mkdirSync(projPath, { recursive: true });
 
@@ -212,9 +236,17 @@ app.post('/api/upload', upload.single('reportFile'), (req, res) => {
         });
         psParse.stderr.on('data', (data) => console.error(`[Parser Error]: ${data}`));
 
+        psParse.on('error', (err) => {
+            try { fs.unlinkSync(csvPath); } catch (ex) { }
+            if (!res.writableEnded) {
+                res.end(JSON.stringify({ error: `Parser spawn error: ${err.message}` }));
+            }
+        });
+
         psParse.on('close', (code) => {
             if (code !== 0) {
                 console.log(`Parser failed with code ${code}`);
+                try { fs.unlinkSync(csvPath); } catch (ex) { }
                 return res.end(JSON.stringify({ error: "Parser failed" }));
             }
 
@@ -232,14 +264,21 @@ app.post('/api/upload', upload.single('reportFile'), (req, res) => {
 
             psAnalyze.stdout.on('data', (data) => {
                 const str = data.toString();
-                // console.log(`[Analyzer]: ${str.trim()}`);
                 if (str.includes('[STATUS]')) {
                     res.write(JSON.stringify({ status: "streaming", message: str.replace('[STATUS]', '').trim() }) + "\n");
                 }
             });
             psAnalyze.stderr.on('data', (data) => console.error(`[Analyzer Error]: ${data}`));
 
+            psAnalyze.on('error', (err) => {
+                try { fs.unlinkSync(csvPath); } catch (ex) { }
+                if (!res.writableEnded) {
+                    res.end(JSON.stringify({ error: `Analyzer spawn error: ${err.message}` }));
+                }
+            });
+
             psAnalyze.on('close', (acode) => {
+                try { fs.unlinkSync(csvPath); } catch (ex) { } // Cleanup the massive CSV trace on both success and failure
                 if (acode !== 0) {
                     return res.end(JSON.stringify({ error: "Analyzer failed" }));
                 }
@@ -249,8 +288,6 @@ app.post('/api/upload', upload.single('reportFile'), (req, res) => {
                 // Send back final outputs!
                 const highConf = readSafeJson(path.join(projPath, 'high_confidence_leads.json'));
                 const cognitive = readSafeJson(path.join(projPath, 'cognitive_review_queue.json'));
-
-                try { fs.unlinkSync(csvPath); } catch (ex) { } // Cleanup the massive CSV trace
 
                 res.end(JSON.stringify({
                     success: true,
@@ -265,7 +302,7 @@ app.post('/api/upload', upload.single('reportFile'), (req, res) => {
     }
 
     // Unsupported format
-    fs.unlinkSync(req.file.path);
+    try { fs.unlinkSync(req.file.path); } catch (ex) { }
     res.status(400).json({ error: 'Unsupported file format. Please upload .json or .csv' });
 });
 
@@ -304,7 +341,7 @@ app.post('/api/analyze-stream', async (req, res) => {
 
     try {
         const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: modelId || "gemini-1.5-flash" });
+        const model = genAI.getGenerativeModel({ model: modelId || "gemini-2.5-flash" });
 
         // Chunking the queue into larger groups of 150 to heavily preserve rate limits (15 RPM free tier)
         let tokensUsed = 0;
@@ -313,21 +350,25 @@ app.post('/api/analyze-stream', async (req, res) => {
         for (let i = 0; i < queue.length; i += chunkSize) {
             const chunk = queue.slice(i, i + chunkSize);
 
-            const prompt = `You are a skeptical, elite Security Researcher analyzing Sysinternals Procmon telemetry. 
-You are hunting for Local Privilege Escalation (LPE), DLL Hijacking, COM Hijacking, and phantom DLL load vectors. The telemetry provided shows files that a low-privileged user can write to, which have been operated on by higher-privileged processes.
+            const prompt = `You are a skeptical, elite Security Researcher analyzing Sysinternals Procmon / ETW telemetry (rev 3.3 schema).
+You are hunting for Local Privilege Escalation (LPE), UAC Bypasses, Admin-to-SYSTEM escalations, DLL/COM Hijacking, oplock arbitrary-write primitives, and NTLM coercion vectors.
 
 CRITICAL INSTRUCTIONS:
-1. BE CREATIVE BUT SKEPTICAL: Think like a Red Teamer and a Security Researcher. Consider all execution vectors (DLL sideloading, unquoted service paths, arbitrary file writes, WMI, scheduled tasks, file redirection, coerced authentication, etc). However, do NOT simply assume every interaction is a vulnerability.
-2. CALL OUT FALSE POSITIVES: Do not be afraid to be deeply skeptical. High-privileged processes (e.g. MsMpEng.exe, SearchIndexer.exe, svchost.exe) routinely map or read user files purely for scanning, indexing, or telemetry. Just because an EDR maps a DLL does NOT mean it executes it. If it looks like a benign operation or a typical AV scan, explicitly declare it a False Positive and explain why.
-3. CRITICAL INTEGRITY RULE: Verify the 'Integrity' value mathematically strictly! If the Integrity is 'Low', 'Medium', 'Medium Plus', or 'AppContainer', it mathematically CANNOT be a Local Privilege Escalation (LPE) because the executing agent holds zero system elevation! It may be a valid unprivileged code execution/hijacking vulnerability, but you must explicitly state it is NOT an LPE. Only 'High' or 'System' Integrity processes result in Privilege Escalation.
-4. PROVIDE A CONFIDENCE VERDICT: Prefix the beginning of your 'Hint' string with an explicit confidence verdict tag (e.g., "[VERDICT: HIGH CONFIDENCE LPE]", "[VERDICT: HIGH CONFIDENCE HIJACKING]", "[VERDICT: LIKELY FALSE POSITIVE]", or "[VERDICT: AMBIGUOUS - NEEDS REVERSING]").
-5. IMPERSONATION CONTEXT: Use the 'Impersonating' field to determine the true caller context. If a SYSTEM process is NOT impersonating, it is acting with full privileges. If it IS impersonating, it may be acting with the rights of the impersonated user (e.g. standard user), which significantly changes the LPE risk profile.
-6. DEEP CONTEXT: Use the 'Operation' and 'Detail' fields to prove your verdict (e.g., 'CreateFileMapping' with only READ access is likely a scan).
+1. BE CREATIVE BUT SKEPTICAL: Think like a Red Teamer and a Security Researcher. Consider all execution vectors (DLL sideloading, oplock + NTFS junction arbitrary write, REG_LINK redirection, COM hijacking, environment variable hijacking, scheduled tasks, coerced authentication). Do NOT simply assume every interaction is a vulnerability.
+2. CALL OUT FALSE POSITIVES: High-privileged processes (e.g. MsMpEng.exe, SearchIndexer.exe, svchost.exe) routinely map or read user files purely for scanning, indexing, or telemetry. Check 'FilterReason' (e.g. 'PagingIO_or_KernelAttribution', 'OpenReparsePoint_AlwaysSet', 'OpenLink_AlwaysSet', 'BenignReaderOnly', 'Same_Level', 'PrivilegedActor_NoRuleMatched', 'PersistenceBinary_NoPrivilegedConsumer') and 'OpenReparsePoint'/'AllOpenReparsePoint'/'OpenLink'/'AllOpenLink'. If it looks like a benign operation or a typical AV scan, explicitly declare it a False Positive and explain why.
+3. PERSPECTIVE & INTEGRITY RULES: Evaluate 'WritableFrom' ('LowPriv', 'MediumILAdmin', 'HighILAdmin'), 'IntegrityLabel', 'Integrity' / 'HighestIntegrity', and 'EffectivePrincipal'.
+   - 'LowPriv' writable + 'High'/'System' consumer = LPE candidate.
+   - 'MediumILAdmin' writable + 'High' auto-elevating consumer = UAC Bypass candidate.
+   - 'HighILAdmin' writable + 'System' consumer = Admin-to-SYSTEM candidate (NOT a low-priv LPE).
+   - If the consumer Integrity is 'Low', 'Medium', 'Medium Plus', or 'AppContainer' and no privileged actor is involved, state clearly that it is NOT a standalone LPE (unless it is a latent persistence binary that a privileged service/task later loads).
+4. PROVIDE A CONFIDENCE VERDICT: Prefix your analysis string ('Hint' or 'DetailedReason') with an explicit confidence verdict tag: "[VERDICT: HIGH CONFIDENCE LPE]", "[VERDICT: HIGH CONFIDENCE HIJACKING]", "[VERDICT: LIKELY FALSE POSITIVE]", or "[VERDICT: AMBIGUOUS - NEEDS REVERSING]".
+5. IMPERSONATION & SQOS CONTEXT: Use 'Impersonating', 'EffectivePrincipal', 'SqosLevel', 'Operation', 'OperationDirection', and 'Detail' to justify your verdict.
+6. PRESERVE SCHEMA: Keep every input field intact (especially 'OrigIdx' and 'Path') and update 'Hint' (and 'DetailedReason' if present) with your analysis.
 
 Input JSON:
 ${JSON.stringify(chunk)}
 
-Return a raw JSON array of objects with the exact same fields as input, but replace the 'Hint' field with your advanced deductive analysis. Do NOT use markdown codeblock wrappers (\`\`\`json). Return STRICTLY JSON.`;
+Return a raw JSON array of objects with the exact same fields as input, replacing 'Hint' with your advanced deductive analysis. Do NOT use markdown codeblock wrappers (\`\`\`json). Return STRICTLY JSON.`;
 
             let retries = 0;
             let success = false;
@@ -388,23 +429,26 @@ Return a raw JSON array of objects with the exact same fields as input, but repl
 
 // API: Upload .md Report
 app.post('/api/upload-report', upload.single('reportFile'), (req, res) => {
-    let activeProject = req.body.project || 'Default_Project';
+    const activeProject = sanitizeProjectName(req.body.project);
     const projReports = path.join(PROJECTS_DIR, activeProject, 'reports');
     if (!fs.existsSync(projReports)) fs.mkdirSync(projReports, { recursive: true });
 
     if (!req.file || path.extname(req.file.originalname).toLowerCase() !== '.md') {
-        if (req.file) fs.unlinkSync(req.file.path);
+        if (req.file) {
+            try { fs.unlinkSync(req.file.path); } catch (ex) { }
+        }
         return res.status(400).json({ error: 'Must be an .md file' });
     }
 
-    const targetPath = path.join(projReports, req.file.originalname);
+    const safeName = sanitizeFileName(req.file.originalname);
+    const targetPath = path.join(projReports, safeName);
     fs.renameSync(req.file.path, targetPath);
     res.json({ success: true });
 });
 
 // API: Fetch and Parse Reports
 app.post('/api/reports', (req, res) => {
-    let activeProject = req.body.project || 'Default_Project';
+    const activeProject = sanitizeProjectName((req.body || {}).project);
     const projReports = path.join(PROJECTS_DIR, activeProject, 'reports');
 
     if (!fs.existsSync(projReports)) {
@@ -447,11 +491,15 @@ app.post('/api/reports', (req, res) => {
 
 // API: Toggle findings inside the MD natively!
 app.post('/api/toggle-report', (req, res) => {
-    let { project, file, lineIndex, checkState } = req.body;
-    if (!project) project = 'Default_Project';
-
-    const filePath = path.join(PROJECTS_DIR, project, 'reports', file);
-    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+    const { project, file, lineIndex, checkState } = req.body || {};
+    if (!file) return res.status(400).json({ error: 'Missing file name' });
+    const activeProject = sanitizeProjectName(project);
+    const safeFile = sanitizeFileName(file);
+    const reportsRoot = path.join(PROJECTS_DIR, activeProject, 'reports');
+    const filePath = path.join(reportsRoot, safeFile);
+    if (!filePath.startsWith(reportsRoot) || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File not found' });
+    }
 
     const lines = fs.readFileSync(filePath, 'utf8').split('\n');
     if (lineIndex >= 0 && lineIndex < lines.length) {
@@ -580,7 +628,7 @@ app.post('/api/research/stage', (req, res) => {
         return res.status(400).json({ error: 'Both snapshot and guiDriver are required when confirmed:true.' });
     }
 
-    const activeProject = (project || 'Default_Project').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const activeProject = sanitizeProjectName(project);
     const projPath = path.join(PROJECTS_DIR, activeProject);
     const leadsJson = path.join(projPath, 'high_confidence_leads.json');
     if (!fs.existsSync(leadsJson)) {
@@ -592,15 +640,19 @@ app.post('/api/research/stage', (req, res) => {
         return res.status(500).json({ error: 'Research-Lead skill is missing. Did you pull the latest skills/ tree?' });
     }
 
+    const allowedSeverities = ['Critical', 'High', 'Medium', 'Low'];
+    const safeMinSeverity = allowedSeverities.includes(minSeverity) ? minSeverity : 'High';
+    const safeMaxLeads = Math.max(1, Math.min(50, parseInt(maxLeads, 10) || 10));
+
     const args = [
         '-ExecutionPolicy', 'Bypass',
         '-File', script,
         '-LeadsJson', leadsJson,
         '-OutputRoot', projPath,
-        '-MinSeverity', (minSeverity || 'High'),
-        '-MaxLeads', String(maxLeads || 10),
-        '-Snapshot', snapshot,
-        '-GuiDriver', guiDriver,
+        '-MinSeverity', safeMinSeverity,
+        '-MaxLeads', String(safeMaxLeads),
+        '-Snapshot', String(snapshot),
+        '-GuiDriver', String(guiDriver),
         '-Confirmed'
     ];
 
@@ -614,17 +666,18 @@ app.post('/api/research/stage', (req, res) => {
             return res.status(500).json({ error: 'Stage script failed.', code, stdout, stderr });
         }
         const statePath = path.join(projPath, '_research_state.json');
-        const state = fs.existsSync(statePath) ? readSafeJson(statePath) : null;
+        const state = readSafeObject(statePath);
         res.json({ success: true, code, stdout, stderr, state });
     });
 });
 
 // API: Save raw memory states back to disk
 app.post('/api/save-state', (req, res) => {
-    let { project, highConfidence, cognitiveQueue } = req.body;
+    const { project, highConfidence, cognitiveQueue } = req.body || {};
     if (!project) return res.status(400).json({ error: 'Missing project name' });
 
-    const projPath = path.join(PROJECTS_DIR, project);
+    const activeProject = sanitizeProjectName(project);
+    const projPath = path.join(PROJECTS_DIR, activeProject);
     if (!fs.existsSync(projPath)) fs.mkdirSync(projPath, { recursive: true });
 
     if (Array.isArray(highConfidence)) {

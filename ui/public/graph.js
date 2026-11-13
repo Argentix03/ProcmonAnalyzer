@@ -12,21 +12,33 @@
     var _currentType   = 'force';
     var _currentLayout = 'spring';
 
+    function escapeHtml(str) {
+        if (str === null || str === undefined) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
     // Field metadata: base color + display label
     var FIELD_META = {
-        Type:             { color: '#5e6ad2', label: 'Finding Type'      },
-        Processes:        { color: '#50fa7b', label: 'Process'           },
-        Severity:         { color: '#f59f00', label: 'Severity'          },
-        Integrity:        { color: '#f03e3e', label: 'Integrity'         },
-        Operation:        { color: '#bd93f9', label: 'Operation'         },
-        PathFile:         { color: '#ffb86c', label: 'Filename'          },
-        PathExt:          { color: '#08bdbd', label: 'Extension'         },
-        PathDir:          { color: '#ff79c6', label: 'Directory'         },
-        ExploitPrimitive: { color: '#f03e3e', label: 'Exploit Primitive' }
+        Type:               { color: '#5e6ad2', label: 'Finding Type'        },
+        Processes:          { color: '#50fa7b', label: 'Process'             },
+        Severity:           { color: '#f59f00', label: 'Severity'            },
+        Integrity:          { color: '#f03e3e', label: 'Integrity'           },
+        Operation:          { color: '#bd93f9', label: 'Operation'           },
+        PathFile:           { color: '#ffb86c', label: 'Filename'            },
+        PathExt:            { color: '#08bdbd', label: 'Extension'           },
+        PathDir:            { color: '#ff79c6', label: 'Directory'           },
+        ExploitPrimitive:   { color: '#f03e3e', label: 'Exploit Primitive'   },
+        EscalationCategory: { color: '#ff922b', label: 'Escalation Category' },
+        WritableFrom:       { color: '#20c997', label: 'Writable From'       }
     };
 
     var SEV_COLOR   = { critical:'#f03e3e', high:'#f59f00', medium:'#5e6ad2', low:'#50fa7b', unknown:'#444860' };
-    var INTEG_COLOR = { 'system':'#f03e3e','high':'#f59f00','medium plus':'#50fa7b','medium':'#5e6ad2','low':'#8be9fd','appcontainer':'#bd93f9','unknown':'#444860' };
+    var INTEG_COLOR = { 'system':'#f03e3e','protected process':'#e03131','high':'#f59f00','medium plus':'#50fa7b','medium':'#5e6ad2','low':'#8be9fd','appcontainer':'#bd93f9','unknown':'#444860' };
 
     // Shared floating tooltip
     var _tooltip = null;
@@ -75,6 +87,12 @@
         if (field === 'ExploitPrimitive') {
             return [(item.ExploitPrimitive || 'Unknown').trim()];
         }
+        if (field === 'EscalationCategory') {
+            return [(item.EscalationCategory || item.FilterReason || 'Uncategorized').trim()];
+        }
+        if (field === 'WritableFrom') {
+            return [(item.WritableFrom || 'LowPriv').trim()];
+        }
         return ['Unknown'];
     }
 
@@ -84,7 +102,11 @@
         'pipe_hijack':'#d6336c', 'binary_plant_highpriv':'#f59f00', 'binary_plant_userspace':'#fcc419',
         'config_poison':'#bd93f9', 'cert_plant':'#08bdbd', 'autorun_persistence':'#50fa7b',
         'dependency_hijack':'#ff79c6', 'sxs_dotlocal':'#ffb86c', 'webshell_plant':'#e599f7',
-        'lnk_hijack':'#74c0fc', 'lolbin_proxy':'#69db7c'
+        'lnk_hijack':'#74c0fc', 'lolbin_proxy':'#69db7c', 'registry_coercion':'#fa5252',
+        'com_hijack_hkcu':'#fd7e14', 'env_hijack_hkcu':'#fab005', 'appexecalias_plant':'#40c057',
+        'powershell_profile':'#15aabf', 'electron_asartamper':'#be4bdb', 'url_ntlm_coerce':'#339af0',
+        'theme_ntlm_coerce':'#5c7cfa', 'desktopini_coerce':'#22b8cf', 'service_binarypath':'#c92a2a',
+        'ifeo_debugger':'#a61e4d', 'aedebug':'#862e9c', 'scheduledtask_plant':'#d9480f'
     };
 
     function getNodeColor(field, value) {
@@ -271,7 +293,7 @@
         linkSel.on('mousemove',function(ev,d){
             var sn=nodeById(d.source,nodes), tn=nodeById(d.target,nodes);
             var sl=sn?sn.label:labelOf(d.source), tl=tn?tn.label:labelOf(d.target);
-            showTooltip('<strong>'+sl+'</strong> ↔ <strong>'+tl+'</strong><br>Co-occurrences: <strong style="color:#50fa7b">'+d.value+'</strong>',ev.clientX,ev.clientY);
+            showTooltip('<strong>'+escapeHtml(sl)+'</strong> ↔ <strong>'+escapeHtml(tl)+'</strong><br>Co-occurrences: <strong style="color:#50fa7b">'+d.value+'</strong>',ev.clientX,ev.clientY);
         }).on('mouseleave',hideTooltip);
 
         var nodeMap={};
@@ -284,7 +306,7 @@
                 .on('end',  function(ev,d){ if(!ev.active&&_simulation) _simulation.alphaTarget(0); if(!isStatic){d.fx=null;d.fy=null;} })
             )
             .on('click',function(ev,d){ ev.stopPropagation(); highlightNode(d,nodeSel,linkSel); showInfoPanel(d,links,nodeMap); })
-            .on('mousemove',function(ev,d){ showTooltip('<span style="color:'+getNodeColor(d.group,d.label)+'">●</span> <strong>'+d.label+'</strong><br>'+(FIELD_META[d.group]||{label:d.group}).label+' · Count: <strong style="color:#50fa7b">'+d.count.toLocaleString()+'</strong>',ev.clientX,ev.clientY); })
+            .on('mousemove',function(ev,d){ showTooltip('<span style="color:'+getNodeColor(d.group,d.label)+'">●</span> <strong>'+escapeHtml(d.label)+'</strong><br>'+escapeHtml((FIELD_META[d.group]||{label:d.group}).label)+' · Count: <strong style="color:#50fa7b">'+d.count.toLocaleString()+'</strong>',ev.clientX,ev.clientY); })
             .on('mouseleave',hideTooltip);
 
         nodeSel.append('circle')
@@ -338,6 +360,21 @@
         buildMultiLegend(fields);
     }
 
+    // Extract ordered (f0, f1) values from an undirected link regardless of alphabetical field ordering
+    function extractOrderedPair(l, f0, f1) {
+        var sa = String(l.source.id || l.source);
+        var ta = String(l.target.id || l.target);
+        var prefix0 = f0 + '::';
+        var prefix1 = f1 + '::';
+        if (sa.indexOf(prefix0) === 0 && ta.indexOf(prefix1) === 0) {
+            return { s: sa.slice(prefix0.length), t: ta.slice(prefix1.length) };
+        }
+        if (sa.indexOf(prefix1) === 0 && ta.indexOf(prefix0) === 0) {
+            return { s: ta.slice(prefix0.length), t: sa.slice(prefix1.length) };
+        }
+        return null;
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // MATRIX – uses first 2 active fields
     // ═══════════════════════════════════════════════════════════════════════
@@ -348,11 +385,16 @@
         var result=buildMultiFieldGraph(data,[f0,f1],Math.min(maxPerField,20));
         var topSrc=result.topByField[f0]||[], topTgt=result.topByField[f1]||[];
         var pairs={};
-        Object.entries(result.links.reduce(function(o,l){ var si=(l.source.id||l.source).replace(f0+'::',''), ti=(l.target.id||l.target).replace(f1+'::',''); var k=si+'||'+ti; o[k]=(o[k]||0)+l.value; return o; },{})).forEach(function(e){ pairs[e[0]]=e[1]; });
+        result.links.forEach(function(l){
+            var p = extractOrderedPair(l, f0, f1);
+            if (p) {
+                var k = p.s + '||' + p.t;
+                pairs[k] = (pairs[k] || 0) + l.value;
+            }
+        });
         if(!topSrc.length||!topTgt.length){showGraphEmpty(true);return;}
         showGraphEmpty(false);
         var maxVal=0; result.links.forEach(function(l){if(l.value>maxVal)maxVal=l.value;});
-        var col0=FIELD_META[f0]||{color:'#5e6ad2'};
         var datasets=topSrc.map(function(src){
             return {label:src, data:topTgt.map(function(tgt){var v=pairs[src+'||'+tgt]||0;return {x:tgt,y:src,v:v,r:v>0?Math.max(4,(v/maxVal)*28):0};}),
                 backgroundColor:getNodeColor(f0,src)+'cc', borderColor:getNodeColor(f0,src), borderWidth:1};
@@ -383,10 +425,11 @@
         // Rebuild pair counts indexed by (src, tgt)
         var pairs={};
         result.links.forEach(function(l){
-            var sa=(l.source.id||l.source), ta=(l.target.id||l.target);
-            var s=sa.startsWith(f0+'::')?sa.slice(f0.length+2):sa.slice(f1.length+2);
-            var t=ta.startsWith(f1+'::')?ta.slice(f1.length+2):ta.slice(f0.length+2);
-            var k=s+'||'+t; pairs[k]=(pairs[k]||0)+l.value;
+            var p = extractOrderedPair(l, f0, f1);
+            if (p) {
+                var k = p.s + '||' + p.t;
+                pairs[k] = (pairs[k] || 0) + l.value;
+            }
         });
         var datasets=topTgt.map(function(tgt){
             return {label:tgt.length>20?tgt.substring(0,20)+'…':tgt, data:topSrc.map(function(src){return pairs[src+'||'+tgt]||0;}),
@@ -431,13 +474,13 @@
         g.append('g').selectAll('g').data(chord.groups).enter().append('g').each(function(d){
             var node=nodes[d.index];
             d3.select(this).append('path').attr('d',arc).attr('fill',getNodeColor(node.group,node.label)).attr('stroke','rgba(0,0,0,0.2)').attr('fill-opacity',0.9)
-                .on('mousemove',function(ev){showTooltip('<strong>'+node.label+'</strong><br>'+(FIELD_META[node.group]||{label:node.group}).label+' · Total: '+d.value.toLocaleString(),ev.clientX,ev.clientY);}).on('mouseleave',hideTooltip);
+                .on('mousemove',function(ev){showTooltip('<strong>'+escapeHtml(node.label)+'</strong><br>'+escapeHtml((FIELD_META[node.group]||{label:node.group}).label)+' · Total: '+d.value.toLocaleString(),ev.clientX,ev.clientY);}).on('mouseleave',hideTooltip);
             var angle=(d.startAngle+d.endAngle)/2, labelR=outerR+14;
             d3.select(this).append('text').attr('transform','rotate('+((angle*180/Math.PI)-90)+') translate('+labelR+',0)'+(angle>Math.PI?' rotate(180)':'')).attr('text-anchor',angle>Math.PI?'end':'start').attr('font-size','10px').attr('fill','#a0a6b5').text(function(){var l=node.label; return l.length>14?l.substring(0,14)+'…':l;});
         });
         g.append('g').attr('fill-opacity',0.5).selectAll('path').data(chord).enter().append('path').attr('class','g-chord').attr('d',ribbon)
             .attr('fill',function(d){return getNodeColor(nodes[d.source.index].group,nodes[d.source.index].label);}).attr('stroke','rgba(0,0,0,0.15)')
-            .on('mousemove',function(ev,d){showTooltip('<strong>'+nodes[d.source.index].label+'</strong> ↔ <strong>'+nodes[d.target.index].label+'</strong><br>'+d.source.value.toLocaleString(),ev.clientX,ev.clientY);}).on('mouseleave',hideTooltip);
+            .on('mousemove',function(ev,d){showTooltip('<strong>'+escapeHtml(nodes[d.source.index].label)+'</strong> ↔ <strong>'+escapeHtml(nodes[d.target.index].label)+'</strong><br>'+d.source.value.toLocaleString(),ev.clientX,ev.clientY);}).on('mouseleave',hideTooltip);
         buildMultiLegend(fields);
     }
 
@@ -472,7 +515,7 @@
         var panel=document.getElementById('graphInfoPanel'), title=document.getElementById('graphInfoTitle'), body=document.getElementById('graphInfoBody');
         title.textContent=d.label;
         var connections=links.filter(function(l){return (l.source.id||l.source)===d.id||(l.target.id||l.target)===d.id;});
-        var html='<div class="graph-info-row"><span>Field</span><strong style="color:'+getNodeColor(d.group,d.label)+'">'+(FIELD_META[d.group]||{label:d.group}).label+'</strong></div>';
+        var html='<div class="graph-info-row"><span>Field</span><strong style="color:'+getNodeColor(d.group,d.label)+'">'+escapeHtml((FIELD_META[d.group]||{label:d.group}).label)+'</strong></div>';
         html+='<div class="graph-info-row"><span>Appearances</span><strong>'+d.count.toLocaleString()+'</strong></div>';
         html+='<div class="graph-info-row"><span>Connections</span><strong>'+connections.length+'</strong></div>';
         var sorted=connections.slice().sort(function(a,b){return b.value-a.value;}).slice(0,6);
@@ -484,7 +527,8 @@
                 var partnerId=sa===d.id?ta:sa;
                 var pn=nodeMap[partnerId]; var pl=pn?pn.label:labelOf(partnerId);
                 var pc=pn?getNodeColor(pn.group,pn.label):'#a0a6b5';
-                html+='<div class="graph-info-row"><span style="color:'+pc+'">'+( pl.length>18?pl.substring(0,18)+'…':pl)+'</span><strong>'+l.value+'</strong></div>';
+                var shortPl = pl.length>18?pl.substring(0,18)+'…':pl;
+                html+='<div class="graph-info-row"><span style="color:'+pc+'">'+escapeHtml(shortPl)+'</span><strong>'+l.value+'</strong></div>';
             });
         }
         body.innerHTML=html; panel.classList.remove('hidden');

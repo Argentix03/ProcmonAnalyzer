@@ -18,7 +18,7 @@ For each writable path, the parser extracts:
 - **DesiredAccess / SqosLevel** — parsed out of the `Detail` field
 - **IsPagingIO / IsKernelAttribution** — LPE-prompt §2 false-positive markers (Cache-Manager flushes whose Process Name column is whatever thread the Memory Manager scheduled)
 - **OpenReparsePoint / OpenLink** — `FILE_FLAG_OPEN_REPARSE_POINT` / `REG_OPTION_OPEN_LINK` presence on this event
-- **AnyWrite / AnyRead / AnyPrivWrite / AnyPrivRead / AnyImpersonating / AnyOpenReparsePoint / AnyOpenLink / AnyPagingIO** — aggregated across every event for the path
+- **AnyWrite / AnyRead / AnyPrivWrite / AnyPrivRead / AnyImpersonating / AnyOpenReparsePoint / AllOpenReparsePoint / AnyOpenLink / AllOpenLink / AnyPagingIO / HighestIntegrity** — aggregated across every event for the path (`AllOpenReparsePoint` and `AllOpenLink` remain true only when **every** non-paging event on the path carried the flag)
 - **IsUserOnlyConsumer** — if every actor on this path was the current user's own session (LPE prompt §9 "user-already-has-it" filter)
 
 ### Perspective-aware writability (rev 3)

@@ -3,63 +3,22 @@ param(
     [switch]$Stop,
     [string]$TraceName = "NativeRedTeamTrace",
     [string]$OutputPath = "$PSScriptRoot\NativeWritablePaths.csv",
-    [string]$EtlPath = "$PSScriptRoot\RawTrace.etl"
+    [string]$EtlPath = "$PSScriptRoot\RawTrace.etl",
+    [int]$MaxEvents = 0
 )
 
 if (-not $Start -and -not $Stop) {
     Write-Host "Please specify -Start or -Stop." -ForegroundColor Yellow
-    exit
+    exit 1
 }
 
 # Ensure running as Administrator
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "[!] ERROR: This script must be run as Administrator." -ForegroundColor Red
-    exit
+    exit 1
 }
 
-if ($Start) {
-    Write-Host "[+] Initializing Native ETW Telemetry Engine..." -ForegroundColor Cyan
-    $OutDir = Split-Path $EtlPath
-    if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
-    
-    logman stop $TraceName -ets 2>$null
-
-    Write-Host "[+] Generating ETW Provider Manifest..."
-    $ManifestPath = Join-Path $OutDir "etw_providers.txt"
-    $Providers = @(
-        "Microsoft-Windows-Kernel-File 0xffffffffffffffff 0xff"
-        "Microsoft-Windows-Kernel-Process 0xffffffffffffffff 0xff"
-        "Microsoft-Windows-Security-Auditing 0xffffffffffffffff 0xff"
-    )
-    $Providers | Out-File $ManifestPath -Encoding ascii
-
-    Write-Host "[+] Binding Kernel Providers..."
-    $cmd = "logman create trace $TraceName -pf `"$ManifestPath`" -o $EtlPath -ets"
-    Invoke-Expression $cmd
-
-    Write-Host "[+] ETW Trace '$TraceName' is actively running." -ForegroundColor Green
-
-    Add-Type -AssemblyName System.Windows.Forms
-    $balloon = New-Object System.Windows.Forms.NotifyIcon
-    $balloon.Icon = [System.Drawing.SystemIcons]::Information
-    $balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-    $balloon.BalloonTipTitle = "ETW Tracer"
-    $balloon.BalloonTipText = "Native ETW Telemetry Capture has Started!"
-    $balloon.Visible = $true
-    $balloon.ShowBalloonTip(3000)
-    Start-Sleep -Milliseconds 500
-    $balloon.Dispose()
-
-    exit
-}
-
-if ($Stop) {
-    Write-Host "[+] Attempting to terminate trace '$TraceName'..." -ForegroundColor Cyan
-    logman stop $TraceName -ets 2>$null
-    Write-Host "[+] ETW Matrix Socket Closed safely." -ForegroundColor Green
-    
-    # Run the snapshot logic
-    $csharpCode = @"
+$csharpCode = @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -91,31 +50,34 @@ namespace Win32Security {
         static extern IntPtr GetSidSubAuthorityCount(IntPtr pSid);
 
         public static string GetIntegrityLevel(int processId) {
-            IntPtr hProcess = OpenProcess(0x0400, false, processId);
-            if (hProcess == IntPtr.Zero) return `"System`";
+            IntPtr hProcess = OpenProcess(0x1000, false, processId); // PROCESS_QUERY_LIMITED_INFORMATION
+            if (hProcess == IntPtr.Zero) hProcess = OpenProcess(0x0400, false, processId);
+            if (hProcess == IntPtr.Zero) return "System";
             IntPtr hToken;
             if (!OpenProcessToken(hProcess, 0x0008, out hToken)) {
-                CloseHandle(hProcess); return `"Unknown`";
+                CloseHandle(hProcess); return "Unknown";
             }
             uint returnLength = 0;
             GetTokenInformation(hToken, 25, IntPtr.Zero, 0, out returnLength);
+            if (returnLength == 0) {
+                CloseHandle(hToken); CloseHandle(hProcess); return "Unknown";
+            }
             IntPtr tokenInfo = Marshal.AllocHGlobal((int)returnLength);
             bool result = GetTokenInformation(hToken, 25, tokenInfo, returnLength, out returnLength);
-            string integrity = `"Unknown`";
+            string integrity = "Unknown";
             if (result) {
                 IntPtr pSid = Marshal.ReadIntPtr(tokenInfo);
                 IntPtr countPtr = GetSidSubAuthorityCount(pSid);
                 byte count = Marshal.ReadByte(countPtr);
                 IntPtr authPtr = GetSidSubAuthority(pSid, (uint)(count - 1));
                 uint authVal = (uint)Marshal.ReadInt32(authPtr);
-                if (authVal == 0x0000) integrity = `"Untrusted`";
-                else if (authVal == 0x1000) integrity = `"Low`";
-                else if (authVal == 0x2000) integrity = `"Medium`";
-                else if (authVal == 0x2010) integrity = `"Medium Plus`";
-                else if (authVal == 0x3000) integrity = `"High`";
-                else if (authVal == 0x4000) integrity = `"System`";
-                else if (authVal == 0x5000) integrity = `"Protected Process`";
-                else integrity = `"System`";
+                if (authVal == 0x0000) integrity = "Untrusted";
+                else if (authVal < 0x2000) integrity = "Low";
+                else if (authVal < 0x2010) integrity = "Medium";
+                else if (authVal < 0x3000) integrity = "Medium Plus";
+                else if (authVal < 0x4000) integrity = "High";
+                else if (authVal < 0x5000) integrity = "System";
+                else integrity = "Protected Process";
             }
             Marshal.FreeHGlobal(tokenInfo);
             CloseHandle(hToken); CloseHandle(hProcess);
@@ -124,7 +86,100 @@ namespace Win32Security {
     }
 }
 "@
-    try { Add-Type -TypeDefinition $csharpCode -Language CSharp -ErrorAction SilentlyContinue } catch {}
+try { Add-Type -TypeDefinition $csharpCode -Language CSharp -ErrorAction SilentlyContinue } catch {}
+
+function Get-ProcessSnapshotMap {
+    param([hashtable]$Existing = @{})
+    foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
+        $pidStr = $p.Id.ToString()
+        $integrity = "Unknown"
+        try { $integrity = [Win32Security.ProcessToken]::GetIntegrityLevel($p.Id) } catch {}
+        $Existing[$pidStr] = @{
+            "ProcessName" = $p.ProcessName + ".exe"
+            "Integrity"   = $integrity
+        }
+    }
+    return $Existing
+}
+
+function Resolve-EtwOperation {
+    param([string]$Provider, [string]$TaskOrOpcode, [string]$Line)
+    $t = if ($TaskOrOpcode) { $TaskOrOpcode.Trim() } else { "" }
+    if ($Provider -match "Kernel-Registry") {
+        if ($t -match "(?i)(SetValue|69)" -or $Line -match "(?i)SetValue") { return "RegSetValue" }
+        if ($t -match "(?i)(CreateKey|Create|64)" -or $Line -match "(?i)CreateKey") { return "RegCreateKey" }
+        if ($t -match "(?i)(DeleteValue)" -or $Line -match "(?i)DeleteValue") { return "RegDeleteValue" }
+        if ($t -match "(?i)(DeleteKey|Delete)" -or $Line -match "(?i)DeleteKey") { return "RegDeleteKey" }
+        if ($t -match "(?i)(QueryValue)" -or $Line -match "(?i)QueryValue") { return "RegQueryValue" }
+        return "RegOpenKey"
+    }
+    if ($t -match "(?i)(Write|68)") { return "WriteFile" }
+    if ($t -match "(?i)(Create|64)") { return "CreateFile" }
+    if ($t -match "(?i)(Delete|70|SetDelete)") { return "SetDispositionInformationFile" }
+    if ($t -match "(?i)(Rename|72)") { return "SetRenameInformationFile" }
+    if ($t -match "(?i)(SetInfo|69)") { return "SetBasicInformationFile" }
+    if ($t -match "(?i)(DirEnum|75|76)") { return "QueryDirectory" }
+    return "ReadFile"
+}
+
+function Resolve-EtwResult {
+    param([string]$Line)
+    if ($Line -match "(?i)0xC0000034") { return "NAME NOT FOUND" }
+    if ($Line -match "(?i)0xC000003A") { return "PATH NOT FOUND" }
+    if ($Line -match "(?i)0xC0000022") { return "ACCESS DENIED" }
+    if ($Line -match "(?i)0xC0000043") { return "SHARING VIOLATION" }
+    return "SUCCESS"
+}
+
+$OutDir = Split-Path $EtlPath
+if ([string]::IsNullOrWhiteSpace($OutDir)) { $OutDir = $PSScriptRoot }
+$SnapshotPath = Join-Path $OutDir "ActiveProcessesSnapshot.json"
+
+if ($Start) {
+    Write-Host "[+] Initializing Native ETW Telemetry Engine..." -ForegroundColor Cyan
+    if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
+
+    logman stop $TraceName -ets 2>$null | Out-Null
+
+    # Capture initial process snapshot at trace start so processes that exit before -Stop are preserved
+    $InitialSnapshot = Get-ProcessSnapshotMap
+    $InitialSnapshot | ConvertTo-Json -Depth 3 -Compress | Out-File $SnapshotPath -Encoding UTF8
+
+    Write-Host "[+] Generating ETW Provider Manifest..."
+    $ManifestPath = Join-Path $OutDir "etw_providers.txt"
+    $Providers = @(
+        "Microsoft-Windows-Kernel-File 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-Kernel-Process 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-Security-Auditing 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-Kernel-Registry 0xffffffffffffffff 0xff"
+    )
+    $Providers | Out-File $ManifestPath -Encoding ascii
+
+    Write-Host "[+] Binding Kernel Providers..."
+    & logman.exe create trace $TraceName -pf "$ManifestPath" -o "$EtlPath" -ets | Out-Null
+
+    Write-Host "[+] ETW Trace '$TraceName' is actively running." -ForegroundColor Green
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        $balloon = New-Object System.Windows.Forms.NotifyIcon
+        $balloon.Icon = [System.Drawing.SystemIcons]::Information
+        $balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+        $balloon.BalloonTipTitle = "ETW Tracer"
+        $balloon.BalloonTipText = "Native ETW Telemetry Capture has Started!"
+        $balloon.Visible = $true
+        $balloon.ShowBalloonTip(3000)
+        Start-Sleep -Milliseconds 500
+        $balloon.Dispose()
+    } catch {}
+
+    exit 0
+}
+
+if ($Stop) {
+    Write-Host "[+] Attempting to terminate trace '$TraceName'..." -ForegroundColor Cyan
+    logman stop $TraceName -ets 2>$null | Out-Null
+    Write-Host "[+] ETW Matrix Socket Closed safely." -ForegroundColor Green
 
     $DriveMap = @{}
     foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
@@ -137,22 +192,28 @@ namespace Win32Security {
         }
     }
 
-    $AllProcs = Get-Process
     $Snapshot = @{}
-    foreach ($p in $AllProcs) {
-        $integrity = "Unknown"
-        try { $integrity = [Win32Security.ProcessToken]::GetIntegrityLevel($p.Id) } catch { }
-        $Snapshot[$p.Id.ToString()] = @{ "ProcessName" = $p.ProcessName + ".exe"; "Integrity" = $integrity }
+    if (Test-Path $SnapshotPath) {
+        try {
+            $loaded = Get-Content $SnapshotPath -Raw | ConvertFrom-Json
+            foreach ($prop in $loaded.PSObject.Properties) {
+                $Snapshot[$prop.Name] = @{
+                    "ProcessName" = $prop.Value.ProcessName
+                    "Integrity"   = $prop.Value.Integrity
+                }
+            }
+        } catch {}
     }
-    
-    # Parse ETL
+    $Snapshot = Get-ProcessSnapshotMap -Existing $Snapshot
+    $Snapshot | ConvertTo-Json -Depth 3 -Compress | Out-File $SnapshotPath -Encoding UTF8
+
     if (-not (Test-Path $EtlPath)) {
         Write-Host "[!] ERROR: Trace file not found at $EtlPath" -ForegroundColor Red
-        exit
+        exit 1
     }
 
     $RawCsvPath = ($EtlPath -replace '\.etl$', '.raw.csv')
-    Write-Host "[+] Running tracerpt to decompile \`.etl\` binary..."
+    Write-Host "[+] Running tracerpt to decompile .etl binary..."
     $pinfo = New-Object System.Diagnostics.ProcessStartInfo
     $pinfo.FileName = "tracerpt.exe"
     $pinfo.Arguments = "`"$EtlPath`" -o `"$RawCsvPath`" -of CSV -y"
@@ -164,7 +225,7 @@ namespace Win32Security {
 
     if (-not (Test-Path $RawCsvPath)) {
         Write-Host "[!] ERROR: Failed to generate CSV from ETL." -ForegroundColor Red
-        exit
+        exit 1
     }
 
     Write-Host "[+] Processing raw I/O Stream natively..."
@@ -173,44 +234,73 @@ namespace Win32Security {
     $MatchCount = 0
 
     while ($null -ne ($line = $reader.ReadLine())) {
-        if (-not $line.StartsWith("Microsoft-Windows-Kernel-File")) { continue }
-        if ($line -match "\\Device\\HarddiskVolume\d+\\([\w\.\-\\]+)" -or $line -match "([A-Z]:\\[\w\.\-\\]+)") {
-            $RawPath = $matches[0]
-            if ($RawPath.StartsWith("\Device")) {
-                if ($RawPath -match "^(\\Device\\HarddiskVolume\d+)(.*)$") {
+        if ($line.StartsWith("Microsoft-Windows-Kernel-Process")) {
+            # Capture short-lived process creations from Kernel-Process events
+            if ($line -match '([^\\,"]+\.exe)') {
+                $exeName = $matches[1]
+                $blocks = $line -split ","
+                if ($blocks.Count -gt 9) {
+                    try {
+                        $procPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                        if (-not $Snapshot.ContainsKey($procPid)) {
+                            $Snapshot[$procPid] = @{ "ProcessName" = $exeName; "Integrity" = "Medium" }
+                        }
+                    } catch {}
+                }
+            }
+            continue
+        }
+
+        $isFileEvent = $line.StartsWith("Microsoft-Windows-Kernel-File")
+        $isRegEvent  = $line.StartsWith("Microsoft-Windows-Kernel-Registry")
+        if (-not $isFileEvent -and -not $isRegEvent) { continue }
+
+        if ($line -match '(\\Device\\HarddiskVolume\d+\\[^",\r\n]+|[A-Za-z]:\\[^",\r\n]+|\\REGISTRY\\[^",\r\n]+)') {
+            $RawPath = $matches[1].Trim()
+            if ($RawPath.StartsWith("\Device\HarddiskVolume", [System.StringComparison]::OrdinalIgnoreCase)) {
+                if ($RawPath -match "^(\\Device\\HarddiskVolume\d+)(\\.*)?$") {
                     $volumePart = $matches[1]
-                    $restPart = $matches[2]
+                    $restPart = if ($matches[2]) { $matches[2] } else { "\" }
                     if ($DriveMap.ContainsKey($volumePart)) {
                         $RawPath = $DriveMap[$volumePart] + $restPart
                     } else {
-                        $RawPath = $RawPath -replace "^\\Device\\HarddiskVolume\d+", "C:"
+                        $RawPath = "C:" + $restPart
                     }
                 }
+            } elseif ($RawPath -match "(?i)^\\REGISTRY\\MACHINE\\(.*)$") {
+                $RawPath = "HKLM\" + $matches[1]
+            } elseif ($RawPath -match "(?i)^\\REGISTRY\\USER\\(.*)$") {
+                $RawPath = "HKU\" + $matches[1]
             }
-            
+
             $blocks = $line -split ","
-            $hexPid = $blocks[9].Trim()
-            $TestPID = "System"
+            $taskField = if ($blocks.Count -gt 3) { "$($blocks[1]) $($blocks[2]) $($blocks[3])" } else { "" }
+            $tsField   = if ($blocks.Count -gt 6 -and $blocks[6].Trim()) { $blocks[6].Trim() } else { (Get-Date).ToString("hh:mm:ss.fffffff tt") }
+            $hexPid    = if ($blocks.Count -gt 9) { $blocks[9].Trim() } else { "0" }
+            $TestPID   = "4"
             try { $TestPID = [Convert]::ToInt32($hexPid, 16).ToString() } catch {}
 
-            $MappedName = if ($Snapshot.ContainsKey($TestPID)) { $Snapshot[$TestPID].ProcessName } else { "Unknown.exe" }
+            $MappedName      = if ($Snapshot.ContainsKey($TestPID)) { $Snapshot[$TestPID].ProcessName } else { "Unknown.exe" }
             $MappedIntegrity = if ($Snapshot.ContainsKey($TestPID)) { $Snapshot[$TestPID].Integrity } else { "Unknown" }
+            $MappedOp        = Resolve-EtwOperation -Provider $blocks[0] -TaskOrOpcode $taskField -Line $line
+            $MappedResult    = Resolve-EtwResult -Line $line
 
             $obj = [PSCustomObject]@{
-                "Time of Day"  = (Get-Date).ToString("hh:mm:ss.fffffff AM")
-                "Process Name" = $MappedName
-                "PID"          = $TestPID
-                "Operation"    = "ReadFile"
-                "Path"         = $RawPath
-                "Result"       = "SUCCESS"
-                "Integrity"    = $MappedIntegrity
-                "Detail"       = "Native File IO"
+                "Time of Day"   = $tsField
+                "Process Name"  = $MappedName
+                "PID"           = $TestPID
+                "Operation"     = $MappedOp
+                "Path"          = $RawPath
+                "Result"        = $MappedResult
+                "Integrity"     = $MappedIntegrity
+                "Detail"        = "Integrity: $MappedIntegrity | Native ETW IO"
+                "Impersonating" = "Unknown"
             }
             $ProcmonEvents.Add($obj)
             $MatchCount++
-            
-            if ($MatchCount -ge 5000) {
-                Write-Host "[!] Reached 5,000 threshold. Truncating for speed." -ForegroundColor Yellow
+
+            if ($MaxEvents -gt 0 -and $MatchCount -ge $MaxEvents) {
+                Write-Host "[!] Reached MaxEvents ($MaxEvents) threshold." -ForegroundColor Yellow
                 break
             }
         }
@@ -218,16 +308,18 @@ namespace Win32Security {
     $reader.Close()
 
     $ProcmonEvents | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-    Write-Host "[+] Pipeline Complete! Output: $OutputPath" -ForegroundColor Green
+    Write-Host "[+] Pipeline Complete! Exported $MatchCount events to: $OutputPath" -ForegroundColor Green
 
-    Add-Type -AssemblyName System.Windows.Forms
-    $balloon = New-Object System.Windows.Forms.NotifyIcon
-    $balloon.Icon = [System.Drawing.SystemIcons]::Information
-    $balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
-    $balloon.BalloonTipTitle = "ETW Tracer"
-    $balloon.BalloonTipText = "ETW Capture Stopped Successfully!`nData parsed and written to: $($OutputPath)"
-    $balloon.Visible = $true
-    $balloon.ShowBalloonTip(3000)
-    Start-Sleep -Milliseconds 500
-    $balloon.Dispose()
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        $balloon = New-Object System.Windows.Forms.NotifyIcon
+        $balloon.Icon = [System.Drawing.SystemIcons]::Information
+        $balloon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+        $balloon.BalloonTipTitle = "ETW Tracer"
+        $balloon.BalloonTipText = "ETW Capture Stopped Successfully!`nData parsed and written to: $($OutputPath)"
+        $balloon.Visible = $true
+        $balloon.ShowBalloonTip(3000)
+        Start-Sleep -Milliseconds 500
+        $balloon.Dispose()
+    } catch {}
 }

@@ -24,3 +24,6 @@ Execution_Leads_Report.md
 Security_Research_Addendum.md
 Execution_Lead_*/
 _research_state.json
+research/
+ui_uploads/
+*.etl

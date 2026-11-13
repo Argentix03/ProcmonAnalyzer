@@ -133,8 +133,10 @@ if (-not (Test-Path $LeadsJson)) {
     exit 1
 }
 
-$leads = Get-Content $LeadsJson -Raw | ConvertFrom-Json
-if (-not $leads) {
+$rawLeadsContent = Get-Content $LeadsJson -Raw
+$parsedLeads = if (-not [string]::IsNullOrWhiteSpace($rawLeadsContent)) { $rawLeadsContent | ConvertFrom-Json } else { $null }
+$leads = @($parsedLeads | Where-Object { $null -ne $_ })
+if ($leads.Count -eq 0) {
     Write-Host "[!] Empty leads file." -ForegroundColor Yellow
     exit 0
 }
@@ -142,10 +144,12 @@ if (-not $leads) {
 $severityRank = @{ 'Critical' = 1; 'High' = 2; 'Medium' = 3; 'Low' = 4 }
 $threshold    = $severityRank[$MinSeverity]
 
-$filtered = $leads |
+$filtered = @(
+    $leads |
     Where-Object { $severityRank[$_.Severity] -le $threshold } |
     Sort-Object { $severityRank[$_.Severity] }, ExploitPrimitive |
     Select-Object -First $MaxLeads
+)
 
 Write-Host ""
 Write-Host "Candidate leads at or above [$MinSeverity] (showing $($filtered.Count) / $($leads.Count)):" -ForegroundColor Cyan

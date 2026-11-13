@@ -151,20 +151,89 @@ function Test-PrivilegedIntegrity {
     return ($i -eq "system" -or $i -eq "high" -or $i -eq "protected process")
 }
 
+function Get-IntegrityRank {
+    param([string]$Integrity)
+    $i = if ($Integrity) { $Integrity.Trim().ToLower() } else { "" }
+    switch ($i) {
+        "protected process" { return 6 }
+        "system"            { return 5 }
+        "high"              { return 4 }
+        "medium plus"       { return 3 }
+        "medium"            { return 2 }
+        "low"               { return 1 }
+        "appcontainer"      { return 1 }
+        "untrusted"         { return 0 }
+        default             { return -1 }
+    }
+}
+
+# Build volume device -> drive letter map once for \Device\HarddiskVolume<N> normalization.
+$script:_driveMap = @{}
+try {
+    if (-not ("Win32DeviceMap.DosDeviceHelper" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace Win32DeviceMap {
+    public class DosDeviceHelper {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
+        public static string GetDevicePath(string driveLetter) {
+            StringBuilder sb = new StringBuilder(1000);
+            uint result = QueryDosDevice(driveLetter, sb, 1000);
+            if (result > 0) return sb.ToString();
+            return "";
+        }
+    }
+}
+"@ -Language CSharp -ErrorAction SilentlyContinue
+    }
+    foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+        if ($drive.DriveType -eq 'Fixed' -or $drive.DriveType -eq 'Removable') {
+            $letter = $drive.Name.TrimEnd('\')
+            $devPath = [Win32DeviceMap.DosDeviceHelper]::GetDevicePath($letter)
+            if ($devPath) { $script:_driveMap[$devPath.ToLowerInvariant()] = $letter }
+        }
+    }
+} catch {}
+
+function ConvertTo-NormalizedDisplayPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    $p = $Path.Trim()
+    # \??\X: -> X:
+    $p = $p -replace '^\\\?\?\\', ''
+    # \Device\NamedPipe\foo -> \\.\pipe\foo
+    $p = $p -replace '(?i)^\\Device\\NamedPipe\\', '\\.\pipe\'
+    # \Device\HarddiskVolume<N>\... -> <Drive>:\...
+    if ($p -match '^(?i)(\\Device\\HarddiskVolume\d+)(\\|$)(.*)$') {
+        $vol = $matches[1].ToLowerInvariant()
+        $sep = $matches[2]
+        $rest = $matches[3]
+        $letter = if ($script:_driveMap.ContainsKey($vol)) { $script:_driveMap[$vol] } else { "C:" }
+        $p = if ($sep) { "$letter\$rest" } else { "$letter\" }
+    }
+    # Kernel registry paths -> standard hive names
+    $p = $p -replace '(?i)^\\REGISTRY\\MACHINE(\\|$)', 'HKLM$1'
+    $p = $p -replace '(?i)^\\REGISTRY\\USER(\\|$)', 'HKU$1'
+    return $p
+}
+
 # Path canonicalization for deduplication purposes only — original path preserved.
 function ConvertTo-CanonicalPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
-    $p = $Path
-    # \??\X: → X:
-    $p = $p -replace '^\\\?\?\\', ''
-    # \Device\HarddiskVolume<N>\ → C:\ (best-effort; Native ETW lookup happens upstream)
-    $p = $p -replace '^\\Device\\HarddiskVolume\d+', 'C:'
+    $p = ConvertTo-NormalizedDisplayPath -Path $Path
     # Collapse trailing whitespace/separator
     $p = $p.TrimEnd()
     while ($p.Length -gt 3 -and ($p.EndsWith("\") -or $p.EndsWith("/"))) { $p = $p.Substring(0, $p.Length - 1) }
-    # Collapse double-separators
-    $p = $p -replace '\\\\+', '\'
+    # Collapse double-separators (except leading UNC \\)
+    if ($p.StartsWith("\\")) {
+        $p = "\\" + (($p.Substring(2)) -replace '\\\\+', '\')
+    } else {
+        $p = $p -replace '\\\\+', '\'
+    }
     return $p.ToLowerInvariant()
 }
 
@@ -211,16 +280,22 @@ $script:_excludeProcSet = @($ExcludeProcessTraces | ForEach-Object { $_.ToLowerI
 
 # Best-event scoring. Higher score = stronger evidence.
 # Prioritization rationale (LPE prompt §2 + §6):
+#   * SYSTEM/High > Medium IL (privileged consumer must never be buried by a
+#     Medium-IL write on the same path)
 #   * Privileged WRITE > Privileged READ (write-what-where is the strongest primitive)
 #   * NAME NOT FOUND > SUCCESS (planting without race condition)
-#   * SYSTEM/High > Medium IL
 #   * Open Reparse Point present is a NEGATIVE signal but not a kill (LPE §2)
 function Get-EventScore {
     param([hashtable]$Evt)
     $s = 0
     $opDir = Get-OperationDirection -Operation $Evt.Operation
+    $intLower = if ($Evt.Integrity) { $Evt.Integrity.Trim().ToLowerInvariant() } else { "" }
+    if ($intLower -eq "system" -or $intLower -eq "protected process") {
+        $s += 220
+    } elseif ($intLower -eq "high") {
+        $s += 180
+    }
     if ($opDir -eq "Write") { $s += 100 }
-    if (Test-PrivilegedIntegrity -Integrity $Evt.Integrity) { $s += 50 }
     if ($Evt.Result -match "(?i)NAME NOT FOUND")      { $s += 25 }
     if ($Evt.Result -match "(?i)PATH NOT FOUND")      { $s += 20 }
     if ($Evt.Result -match "(?i)REPARSE")             { $s += 10 }
@@ -228,7 +303,7 @@ function Get-EventScore {
     if ($Evt.IsKernelOrCacheManager) { $s -= 30 }
     if ($Evt.OpenReparsePoint)  { $s -= 5 }    # informative not disqualifying
     if ($Evt.OpenLink)          { $s -= 5 }
-    if ($Evt.Operation -match "(?i)Load Image") { $s += 40 } # Load Image strong signal
+    if ($Evt.Operation -match "(?i)Load Image") { $s += 60 } # Load Image strong signal
     return $s
 }
 
@@ -273,16 +348,21 @@ while (-not $parser.EndOfData) {
         if ($fields.Length -lt 5) { continue }
 
         $processName = if ($idxProc -lt $fields.Length) { $fields[$idxProc] } else { "" }
-        $pathRaw     = if ($idxPath -lt $fields.Length) { $fields[$idxPath] } else { "" }
+        $pathRawOrig = if ($idxPath -lt $fields.Length) { $fields[$idxPath] } else { "" }
 
-        if ([string]::IsNullOrWhiteSpace($pathRaw)) { continue }
+        if ([string]::IsNullOrWhiteSpace($pathRawOrig)) { continue }
+
+        # Normalize \??\, \Device\HarddiskVolume<N>, \Device\NamedPipe, \REGISTRY\...
+        $pathRaw = ConvertTo-NormalizedDisplayPath -Path $pathRawOrig
 
         # Filesystem path or registry hive path
         $isFsPath  = ($pathRaw -match "^[a-zA-Z]:\\") -or ($pathRaw -match "^\\\\")
         $isRegPath = ($pathRaw -match "^HKCU") -or ($pathRaw -match "^HKEY_CURRENT_USER") `
                   -or ($pathRaw -match "^HKU") -or ($pathRaw -match "^HKEY_USERS") `
                   -or ($pathRaw -match "^HKLM") -or ($pathRaw -match "^HKEY_LOCAL_MACHINE") `
-                  -or ($pathRaw -match "^HKCR") -or ($pathRaw -match "^HKEY_CLASSES_ROOT")
+                  -or ($pathRaw -match "^HKCR") -or ($pathRaw -match "^HKEY_CLASSES_ROOT") `
+                  -or ($pathRaw -match "^HKCC") -or ($pathRaw -match "^HKEY_CURRENT_CONFIG") `
+                  -or ($pathRaw -match "^HKPD") -or ($pathRaw -match "^HKEY_PERFORMANCE_DATA")
         if (-not ($isFsPath -or $isRegPath)) { continue }
 
         if (Test-SelfTraceContamination -Path $pathRaw -ProcessName $processName) {
@@ -296,6 +376,11 @@ while (-not $parser.EndOfData) {
         $detailStr = if ($idxDet -lt $fields.Length)  { $fields[$idxDet] } else { "" }
         $integStr  = if ($idxInt -ge 0 -and $idxInt -lt $fields.Length) { $fields[$idxInt] } else { "Unknown" }
         $impStr    = if ($idxImp -ge 0 -and $idxImp -lt $fields.Length) { $fields[$idxImp] } else { "" }
+
+        # Fallback: if Integrity column was absent/Unknown, check Detail for NativeTrace "Integrity: <lvl>"
+        if (($integStr -eq "Unknown" -or [string]::IsNullOrWhiteSpace($integStr)) -and $detailStr -match '(?i)Integrity:\s*(System|High|Medium Plus|Medium|Low|Untrusted|Protected Process)') {
+            $integStr = $matches[1]
+        }
 
         $detailFlags = Get-DetailFlags -Detail $detailStr
         $isKernelAttrib = $kernelAttribProcs -contains $processName.Trim()
@@ -329,6 +414,8 @@ while (-not $parser.EndOfData) {
                 Operations  = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
                 BestEvent   = $evt
                 BestScore   = Get-EventScore -Evt $evt
+                HighestIntegrity     = $integStr
+                HighestIntegrityRank = Get-IntegrityRank -Integrity $integStr
                 EventCount  = 0
                 AnyWrite    = $false
                 AnyRead     = $false
@@ -336,7 +423,11 @@ while (-not $parser.EndOfData) {
                 AnyPrivRead  = $false
                 AnyImpersonating = $false
                 AnyOpenReparsePoint = $false
+                AllOpenReparsePoint = $true
+                OpenEventCount      = 0
                 AnyOpenLink = $false
+                AllOpenLink = $true
+                RegOpenEventCount   = 0
                 AnyPagingIO = $false
                 NamePrincipals = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
             }
@@ -346,6 +437,12 @@ while (-not $parser.EndOfData) {
         [void]$rec.Processes.Add($processName)
         [void]$rec.Operations.Add($opStr)
         $rec.EventCount++
+
+        $intRank = Get-IntegrityRank -Integrity $integStr
+        if ($intRank -gt $rec.HighestIntegrityRank) {
+            $rec.HighestIntegrityRank = $intRank
+            $rec.HighestIntegrity     = $integStr
+        }
 
         $opDir = Get-OperationDirection -Operation $opStr
         if ($opDir -eq "Write") { $rec.AnyWrite = $true } else { $rec.AnyRead = $true }
@@ -357,8 +454,16 @@ while (-not $parser.EndOfData) {
             [void]$rec.NamePrincipals.Add($impStr)
         }
         if ($detailFlags.OpenReparsePoint) { $rec.AnyOpenReparsePoint = $true }
-        if ($detailFlags.OpenLink)         { $rec.AnyOpenLink = $true }
-        if ($detailFlags.IsPagingIO)       { $rec.AnyPagingIO = $true }
+        if ($isFsPath -and ($opStr -match '^(?i)(CreateFile|QueryOpen|OpenFile)' -or -not [string]::IsNullOrWhiteSpace($detailStr))) {
+            $rec.OpenEventCount++
+            if (-not $detailFlags.OpenReparsePoint) { $rec.AllOpenReparsePoint = $false }
+        }
+        if ($detailFlags.OpenLink) { $rec.AnyOpenLink = $true }
+        if ($isRegPath -and ($opStr -match '^(?i)Reg(Open|Create)Key' -or -not [string]::IsNullOrWhiteSpace($detailStr))) {
+            $rec.RegOpenEventCount++
+            if (-not $detailFlags.OpenLink) { $rec.AllOpenLink = $false }
+        }
+        if ($detailFlags.IsPagingIO) { $rec.AnyPagingIO = $true }
 
         $score = Get-EventScore -Evt $evt
         if ($score -gt $rec.BestScore) {
@@ -443,14 +548,14 @@ $script:_adminSids = @(
     'S-1-5-32-544',     # BUILTIN\Administrators
     'S-1-5-32-548',     # BUILTIN\Account Operators
     'S-1-5-32-549',     # BUILTIN\Server Operators
-    'S-1-5-32-551',     # BUILTIN\Backup Operators
-    'S-1-5-19',         # LOCAL SERVICE
-    'S-1-5-20'          # NETWORK SERVICE
+    'S-1-5-32-551'      # BUILTIN\Backup Operators
 )
-# SYSTEM/TI grants reach paths that even high-IL admin can't write without
-# impersonation tricks — irrelevant to all three of our perspectives.
+# SYSTEM/TI/Service grants reach paths that neither low-priv nor admin tokens
+# hold directly without service/SYSTEM impersonation.
 $script:_systemSids = @(
     'S-1-5-18',         # SYSTEM
+    'S-1-5-19',         # LOCAL SERVICE
+    'S-1-5-20',         # NETWORK SERVICE
     'S-1-5-32-552',     # BUILTIN\Replicators
     'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'  # NT SERVICE\TrustedInstaller
 )
@@ -604,6 +709,11 @@ function Invoke-DaclEvaluation {
     $unconditionalDenySids  = New-Object System.Collections.Generic.HashSet[string]
     $conditionalDenySids    = New-Object System.Collections.Generic.HashSet[string]
     if (-not [string]::IsNullOrWhiteSpace($sddl)) {
+        # Check SACL for an explicit Mandatory Label (HI = High, SI = System) if present in SDDL
+        if ($sddl -match 'S:\([^)]*ML[^)]*;;;(HI|SI|S-1-16-12288|S-1-16-16384)\)') {
+            $mlToken = $matches[1]
+            $Result.IntegrityLabel = if ($mlToken -eq 'SI' -or $mlToken -eq 'S-1-16-16384') { "System" } else { "High" }
+        }
         try {
             $csd = New-Object System.Security.AccessControl.CommonSecurityDescriptor(
                 $IsContainer, $false, $sddl)
@@ -695,10 +805,13 @@ function Invoke-DaclEvaluation {
         }
 
         if ($script:_adminSids -contains $sid) {
+            # In a UAC-filtered medium-IL admin token, BUILTIN\Administrators is
+            # SE_GROUP_USE_FOR_DENY_ONLY: Deny ACEs apply to MediumILAdmin, but
+            # Allow ACEs only grant access when elevated (HighILAdmin).
             if ($isDeny) {
                 $deniedMed = $true; $deniedHigh = $true
             } else {
-                $allowedMed = $true; $allowedHigh = $true
+                $allowedHigh = $true
             }
             continue
         }
@@ -754,26 +867,31 @@ function Get-PathWritability {
     }
 
     try {
-        # Registry — proper DACL parse (rev 3.2). Was a coarse heuristic in
-        # rev 3.1 that just stamped HKLM as admin-writable / HKCU as
-        # everyone-writable without looking at the actual ACL; this silently
-        # under-reported real low-priv-writable HKLM subkeys (vendor-installed
-        # keys with permissive ACLs, misconfigured Performance subkeys) and
-        # missed conditional ACEs on HKLM entirely. Now we open the key via
-        # the appropriate hive (ancestor walk for value-paths and missing
-        # keys) and run Invoke-DaclEvaluation, the same evaluator the FS
-        # path uses. Falls back to the old heuristic only if DACL read fails.
+        # Named pipe namespace (\\.\pipe\...): read-only check.
+        # Standard users have FILE_CREATE_PIPE_INSTANCE on \Device\NamedPipe\
+        # by default, allowing pipe server planting when a pipe is unbound or
+        # permissively DACL'd.
+        if ($TargetPath -match '^\\\\\.\\pipe\\') {
+            $r.WritableByLowPriv       = $true
+            $r.WritableByMediumILAdmin = $true
+            $r.WritableByHighILAdmin   = $true
+            $r.AclSource               = "named-pipe-namespace"
+            return $r
+        }
+
+        # Registry — proper DACL parse (rev 3.2/3.3).
+        # Opens the key read-only via ReadPermissions (ancestor walk for
+        # value-paths and missing keys) and runs Invoke-DaclEvaluation.
+        # Registry keys without an explicit High/System SACL mandatory label
+        # default to Medium IL in Windows MIC, so we trust the parsed DACL
+        # unless Invoke-DaclEvaluation detected an explicit High/System ML ACE.
         if ($TargetPath -match '^(HKLM|HKCU|HKCR|HKU|HKCC|HKPD|HKEY_)') {
             $regResult = Get-RegistryDaclForPath -Path $TargetPath
             $r.AclSource = $regResult.Source
-            # Machine-scope hives are High-IL labeled; user hives are not.
-            if ($regResult.RootName -in @('HKLM','HKCR','HKCC','HKPD')) {
-                $r.IntegrityLabel = "High"
-            }
             if ($null -ne $regResult.Sec) {
                 Invoke-DaclEvaluation -Acl $regResult.Sec -Result $r `
                     -UserContext $UserContext -IsContainer $true -IsRegistry $true
-                # MIC NW: lower-IL tokens can't write up to High-IL labeled keys.
+                # MIC NW: lower-IL tokens can't write up to explicitly High/System-labeled keys.
                 if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
                     $r.WritableByLowPriv       = $false
                     $r.WritableByMediumILAdmin = $false
@@ -787,13 +905,15 @@ function Get-PathWritability {
                     $r.WritableByMediumILAdmin = $true
                     $r.WritableByHighILAdmin   = $true
                 } else {
-                    $r.WritableByHighILAdmin   = $true
+                    $r.IntegrityLabel        = "High"
+                    $r.WritableByHighILAdmin = $true
                 }
             }
             return $r
         }
 
-        # Filesystem: pick the right ACL bearer.
+        # Filesystem: pick the right ACL bearer (100% read-only; NEVER opens
+        # or writes to files).
         #
         # Distinction matters: writability of an EXISTING file requires
         # WriteData on the file itself (not on the parent). Walking up to the
@@ -971,6 +1091,8 @@ foreach ($canonical in $canonicalPaths) {
     # own session and no privileged actor touches the path. The redirect
     # cannot reach anywhere the user couldn't reach already.
     $userOnlyConsumer = (-not $rec.AnyPrivWrite) -and (-not $rec.AnyPrivRead)
+    $allOpenRP   = ($rec.OpenEventCount -gt 0) -and $rec.AllOpenReparsePoint
+    $allOpenLink = ($rec.RegOpenEventCount -gt 0) -and $rec.AllOpenLink
 
     $results.Add([PSCustomObject]@{
         Path                    = $displayPath
@@ -985,6 +1107,7 @@ foreach ($canonical in $canonicalPaths) {
         Result                  = $bestEvt.Result
         Detail                  = $bestEvt.Detail
         Integrity               = $bestEvt.Integrity
+        HighestIntegrity        = $rec.HighestIntegrity
         Impersonating           = $bestEvt.Impersonating
         BestProcess             = $bestEvt.ProcessName
         DesiredAccess           = $bestEvt.DesiredAccess
@@ -999,7 +1122,9 @@ foreach ($canonical in $canonicalPaths) {
         AnyPrivRead             = $rec.AnyPrivRead
         AnyImpersonating        = $rec.AnyImpersonating
         AnyOpenReparsePoint     = $rec.AnyOpenReparsePoint
+        AllOpenReparsePoint     = [bool]$allOpenRP
         AnyOpenLink             = $rec.AnyOpenLink
+        AllOpenLink             = [bool]$allOpenLink
         AnyPagingIO             = $rec.AnyPagingIO
         IsUserOnlyConsumer      = $userOnlyConsumer
         # Perspective-aware writability (rev 3)
@@ -1032,30 +1157,34 @@ Write-Progress -Activity "Testing Permissions" -Completed
 $swTest.Stop()
 
 Write-Host "Process Complete in $($swTest.Elapsed.TotalSeconds.ToString('0.00'))s. $( $results.Count ) writable paths found." -ForegroundColor Green
-$conditionalCount = ($results | Where-Object { $_.HasConditionalACE }).Count
+$conditionalCount = @($results | Where-Object { $_.HasConditionalACE }).Count
 if ($conditionalCount -gt 0) {
     Write-Host "  - $conditionalCount path(s) had conditional/callback ACEs (Microsoft-restricted by SKU/capability/AppID). See HasConditionalACE / ConditionalACEPrincipals / ConditionalACESddl." -ForegroundColor DarkYellow
 }
 
-if ($results.Count -gt 0) {
-    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $pluginDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $scriptDir))
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$pluginDir = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $scriptDir))
+$outFolder = if (-not [string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath } else { $pluginDir }
+if (-not (Test-Path $outFolder)) { New-Item -ItemType Directory -Force -Path $outFolder | Out-Null }
 
-    $outFolder = if (-not [string]::IsNullOrWhiteSpace($OutputPath)) { $OutputPath } else { $pluginDir }
-    $jsonPath = Join-Path $outFolder "writable_paths.json"
-    $results | ConvertTo-Json -Depth 4 | Out-File $jsonPath -Encoding UTF8
+$jsonPath = Join-Path $outFolder "writable_paths.json"
+if ($results.Count -eq 0) {
+    "[]" | Out-File $jsonPath -Encoding UTF8
+    Write-Host "No writable paths found. Exported empty array to $jsonPath" -ForegroundColor Yellow
+} else {
+    ConvertTo-Json -InputObject @($results) -Depth 4 | Out-File $jsonPath -Encoding UTF8
     Write-Host "Exported RAW results to $jsonPath" -ForegroundColor Green
-
-    if ($script:skippedErrors.Count -gt 0) {
-        $errJsonPath = Join-Path $outFolder "parsing_errors.json"
-        $uniqueErrors = $script:skippedErrors | Group-Object Error | Select-Object Name, Count, @{Name="SampleDetails"; Expression={$_.Group[0].Details}}, @{Name="SamplePath"; Expression={$_.Group[0].Path}}, @{Name="Type"; Expression={$_.Group[0].Type}}
-        $uniqueErrors | ConvertTo-Json -Depth 3 | Out-File $errJsonPath -Encoding UTF8
-        Write-Host "[!] Logged $($script:skippedErrors.Count) unhandled errors (grouped to $($uniqueErrors.Count) unique patterns) to $errJsonPath" -ForegroundColor Yellow
-    }
-
-    if (-not $Silent) {
-        $results | Out-GridView -Title "RAW Writable Paths and Associated Processes"
-    }
-
-    Write-Host "[!] INSTRUCTION: Writable paths extracted. Agent should invoke 'Analyze-ExecutionLeads' skill now." -ForegroundColor Magenta
 }
+
+if ($script:skippedErrors.Count -gt 0) {
+    $errJsonPath = Join-Path $outFolder "parsing_errors.json"
+    $uniqueErrors = @($script:skippedErrors | Group-Object Error | Select-Object Name, Count, @{Name="SampleDetails"; Expression={$_.Group[0].Details}}, @{Name="SamplePath"; Expression={$_.Group[0].Path}}, @{Name="Type"; Expression={$_.Group[0].Type}})
+    ConvertTo-Json -InputObject $uniqueErrors -Depth 3 | Out-File $errJsonPath -Encoding UTF8
+    Write-Host "[!] Logged $($script:skippedErrors.Count) unhandled errors (grouped to $($uniqueErrors.Count) unique patterns) to $errJsonPath" -ForegroundColor Yellow
+}
+
+if ($results.Count -gt 0 -and -not $Silent) {
+    $results | Out-GridView -Title "RAW Writable Paths and Associated Processes"
+}
+
+Write-Host "[!] INSTRUCTION: Writable paths extracted. Agent should invoke 'Analyze-ExecutionLeads' skill now." -ForegroundColor Magenta

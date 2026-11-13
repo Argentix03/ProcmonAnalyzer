@@ -1,20 +1,51 @@
 param(
     [string]$EtlPath = "C:\Temp\RawTrace.etl",
-    [string]$OutputPath = "C:\Temp\NativeWritablePaths.csv"
+    [string]$OutputPath = "C:\Temp\NativeWritablePaths.csv",
+    [int]$MaxEvents = 0
 )
 
 Write-Host "[+] Initializing Standalone ETW Parser Pipeline..." -ForegroundColor Cyan
 
-$CsvPath = ($EtlPath -replace '\.etl$', '.csv')
+$CsvPath = ($EtlPath -replace '\.etl$', '.raw.csv')
 $SnapshotPath = Join-Path (Split-Path $EtlPath) "ActiveProcessesSnapshot.json"
 
 if (-not (Test-Path $EtlPath)) {
     Write-Host "[!] ERROR: Trace file not found at $EtlPath" -ForegroundColor Red
-    exit
+    exit 1
+}
+
+$csharpCode = @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+namespace Win32Security {
+    public class DosDeviceHelper {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
+        public static string GetDevicePath(string driveLetter) {
+            StringBuilder sb = new StringBuilder(1000);
+            uint result = QueryDosDevice(driveLetter, sb, 1000);
+            if (result > 0) return sb.ToString();
+            return "";
+        }
+    }
+}
+"@
+try { Add-Type -TypeDefinition $csharpCode -Language CSharp -ErrorAction SilentlyContinue } catch {}
+
+$DriveMap = @{}
+foreach ($drive in [System.IO.DriveInfo]::GetDrives()) {
+    if ($drive.DriveType -eq 'Fixed' -or $drive.DriveType -eq 'Removable') {
+        $letter = $drive.Name.TrimEnd('\')
+        try {
+            $devicePath = [Win32Security.DosDeviceHelper]::GetDevicePath($letter)
+            if ($devicePath) { $DriveMap[$devicePath] = $letter }
+        } catch {}
+    }
 }
 
 # Step 1: Decompile binary ETW to CSV
-Write-Host "[+] Running tracerpt OS tool to decompile `.etl` binary..."
+Write-Host "[+] Running tracerpt OS tool to decompile .etl binary..."
 $pinfo = New-Object System.Diagnostics.ProcessStartInfo
 $pinfo.FileName = "tracerpt.exe"
 $pinfo.Arguments = "`"$EtlPath`" -o `"$CsvPath`" -of CSV -y"
@@ -26,7 +57,7 @@ $p.WaitForExit()
 
 if (-not (Test-Path $CsvPath)) {
     Write-Host "[!] ERROR: Failed to generate CSV from ETL." -ForegroundColor Red
-    exit
+    exit 1
 }
 Write-Host "[+] ETW Binary decompiled successfully to $CsvPath." -ForegroundColor Green
 
@@ -35,107 +66,121 @@ $ProcessMap = @{}
 if (Test-Path $SnapshotPath) {
     Write-Host "[+] Ingesting Master Hybrid Execution Snapshot ($SnapshotPath)..."
     $SnapshotRaw = Get-Content $SnapshotPath -Raw | ConvertFrom-Json
-    foreach ($pidKey in $SnapshotRaw.psobject.properties.name) {
+    foreach ($pidKey in $SnapshotRaw.PSObject.Properties.Name) {
         $ProcessMap[$pidKey] = $SnapshotRaw.$pidKey
     }
 } else {
-    Write-Host "[!] WARNING: ActiveProcessesSnapshot.json not found! Long-running PID mapping will fail." -ForegroundColor Yellow
+    Write-Host "[!] WARNING: ActiveProcessesSnapshot.json not found! Falling back to Kernel-Process events only." -ForegroundColor Yellow
 }
 
-# Step 3: Setup Opcode Dictionaries (Translate Hex to Procmon Text)
-$OpcodeLookup = @{
-    "64" = "CreateFile"
-    "65" = "CreateFileMapping"
-    "67" = "ReadFile"
-    "68" = "WriteFile"
-    "70" = "DeleteFile"
-    "72" = "RenameFile"
+function Resolve-EtwOperation {
+    param([string]$Provider, [string]$TaskOrOpcode, [string]$Line)
+    $t = if ($TaskOrOpcode) { $TaskOrOpcode.Trim() } else { "" }
+    if ($Provider -match "Kernel-Registry") {
+        if ($t -match "(?i)(SetValue|69)" -or $Line -match "(?i)SetValue") { return "RegSetValue" }
+        if ($t -match "(?i)(CreateKey|Create|64)" -or $Line -match "(?i)CreateKey") { return "RegCreateKey" }
+        if ($t -match "(?i)(DeleteValue)" -or $Line -match "(?i)DeleteValue") { return "RegDeleteValue" }
+        if ($t -match "(?i)(DeleteKey|Delete)" -or $Line -match "(?i)DeleteKey") { return "RegDeleteKey" }
+        if ($t -match "(?i)(QueryValue)" -or $Line -match "(?i)QueryValue") { return "RegQueryValue" }
+        return "RegOpenKey"
+    }
+    if ($t -match "(?i)(Write|68)") { return "WriteFile" }
+    if ($t -match "(?i)(Create|64)") { return "CreateFile" }
+    if ($t -match "(?i)(Delete|70|SetDelete)") { return "SetDispositionInformationFile" }
+    if ($t -match "(?i)(Rename|72)") { return "SetRenameInformationFile" }
+    if ($t -match "(?i)(SetInfo|69)") { return "SetBasicInformationFile" }
+    if ($t -match "(?i)(DirEnum|75|76)") { return "QueryDirectory" }
+    return "ReadFile"
 }
 
-$NtStatusLookup = @{
-    "0x00000000" = "SUCCESS"
-    "0xC0000022" = "ACCESS DENIED"
-    "0xC000003A" = "PATH NOT FOUND"
-    "0xC0000034" = "NAME NOT FOUND"
-    "0xC0000043" = "SHARING VIOLATION"
+function Resolve-EtwResult {
+    param([string]$Line)
+    if ($Line -match "(?i)0xC0000034") { return "NAME NOT FOUND" }
+    if ($Line -match "(?i)0xC000003A") { return "PATH NOT FOUND" }
+    if ($Line -match "(?i)0xC0000022") { return "ACCESS DENIED" }
+    if ($Line -match "(?i)0xC0000043") { return "SHARING VIOLATION" }
+    return "SUCCESS"
 }
 
-# Step 4: Parse the massive CSV sequentially
+# Step 3: Parse the CSV sequentially
 Write-Host "[+] Commencing deep telemetry normalization phase..." -ForegroundColor Cyan
-
-# (NOTE: Tracerpt CSV headers change dynamically depending on the OS build. 
-# We implement a skeletal streaming parser here assuming standard Windows Event format)
-
 $ProcmonEvents = New-Object System.Collections.Generic.List[object]
+$reader = [System.IO.File]::OpenText($CsvPath)
 $LineCount = 0
+$MatchCount = 0
 
-# Dummy example hook to demonstrate the data structure merging:
-# In production, we'd regex through the UserData block of Tracerpt CSV.
-# This loop simulates processing the mapped ETW stream.
+while ($null -ne ($line = $reader.ReadLine())) {
+    $LineCount++
 
-$SimRead = $false # Switched to PHYSICAL parsing!
-
-if ($SimRead) {
-    # Dummy block skipped
-} else {
-    Write-Host "[+] Processing raw I/O Stream natively... (this may take a moment for large traces)"
-    $reader = [System.IO.File]::OpenText($CsvPath)
-    $LineCount = 0
-    $MatchCount = 0
-
-    while ($null -ne ($line = $reader.ReadLine())) {
-        $LineCount++
-        
-        # Fast filter: care about Kernel File and Kernel Registry telemetry
-        if (-not $line.StartsWith("Microsoft-Windows-Kernel-File") -and -not $line.StartsWith("Microsoft-Windows-Kernel-Registry")) { continue }
-        
-        # Heuristic fast-path extraction:
-        # We are looking for any logged line containing a physical drive path or registry path
-        if ($line -match "\\Device\\HarddiskVolume\d+\\([\w\.\-\\]+)" -or $line -match "([A-Z]:\\[\w\.\-\\]+)" -or $line -match "\\REGISTRY\\[\w\.\-\\]+") {
-            
-            $RawPath = $matches[0]
-            if ($RawPath.StartsWith("\Device")) {
-                # Attempt an arbitrary conversion to C:\ for UI normalization
-                $RawPath = $RawPath -replace "^\\Device\\HarddiskVolume\d+", "C:"
-            }
-            
-            # Very basic extraction from tracerpt chaos format
-            # PID is natively column 9. Let's do a safe string check:
+    if ($line.StartsWith("Microsoft-Windows-Kernel-Process")) {
+        if ($line -match '([^\\,"]+\.exe)') {
+            $exeName = $matches[1]
             $blocks = $line -split ","
-            $hexPid = $blocks[9].Trim()
-            $TestPID = "System"
-            try { $TestPID = [Convert]::ToInt32($hexPid, 16).ToString() } catch {}
-
-            $MappedName = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].ProcessName } else { "Unknown.exe" }
-            $MappedIntegrity = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].Integrity } else { "Unknown" }
-
-            $SimOp = "ReadFile"
-            if ($line.StartsWith("Microsoft-Windows-Kernel-Registry")) {
-                $SimOp = "RegOpenKey"
-            }
-
-            $obj = [PSCustomObject]@{
-                "Time of Day"  = (Get-Date).ToString("hh:mm:ss.fffffff AM") # Simplification for demo
-                "Process Name" = $MappedName
-                "PID"          = $TestPID
-                "Operation"    = $SimOp
-                "Path"         = $RawPath
-                "Result"       = "SUCCESS"
-                "Detail"       = "Integrity: $MappedIntegrity | Native IO"
-                "Impersonating" = "Unknown"
-            }
-            $ProcmonEvents.Add($obj)
-            $MatchCount++
-            
-            if ($MatchCount -ge 5000) {
-                Write-Host "[!] Reached 5,000 threshold. Truncating for speed." -ForegroundColor Yellow
-                break
+            if ($blocks.Count -gt 9) {
+                try {
+                    $procPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                    if (-not $ProcessMap.ContainsKey($procPid)) {
+                        $ProcessMap[$procPid] = [PSCustomObject]@{ "ProcessName" = $exeName; "Integrity" = "Medium" }
+                    }
+                } catch {}
             }
         }
+        continue
     }
-    $reader.Close()
-}
 
-# Export directly to Procmon CSV Format instead of JSON!
+    if (-not $line.StartsWith("Microsoft-Windows-Kernel-File") -and -not $line.StartsWith("Microsoft-Windows-Kernel-Registry")) { continue }
+
+    if ($line -match '(\\Device\\HarddiskVolume\d+\\[^",\r\n]+|[A-Za-z]:\\[^",\r\n]+|\\REGISTRY\\[^",\r\n]+)') {
+        $RawPath = $matches[1].Trim()
+        if ($RawPath.StartsWith("\Device\HarddiskVolume", [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($RawPath -match "^(\\Device\\HarddiskVolume\d+)(\\.*)?$") {
+                $volumePart = $matches[1]
+                $restPart = if ($matches[2]) { $matches[2] } else { "\" }
+                if ($DriveMap.ContainsKey($volumePart)) {
+                    $RawPath = $DriveMap[$volumePart] + $restPart
+                } else {
+                    $RawPath = "C:" + $restPart
+                }
+            }
+        } elseif ($RawPath -match "(?i)^\\REGISTRY\\MACHINE\\(.*)$") {
+            $RawPath = "HKLM\" + $matches[1]
+        } elseif ($RawPath -match "(?i)^\\REGISTRY\\USER\\(.*)$") {
+            $RawPath = "HKU\" + $matches[1]
+        }
+
+        $blocks = $line -split ","
+        $taskField = if ($blocks.Count -gt 3) { "$($blocks[1]) $($blocks[2]) $($blocks[3])" } else { "" }
+        $tsField   = if ($blocks.Count -gt 6 -and $blocks[6].Trim()) { $blocks[6].Trim() } else { (Get-Date).ToString("hh:mm:ss.fffffff tt") }
+        $hexPid    = if ($blocks.Count -gt 9) { $blocks[9].Trim() } else { "0" }
+        $TestPID   = "4"
+        try { $TestPID = [Convert]::ToInt32($hexPid, 16).ToString() } catch {}
+
+        $MappedName      = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].ProcessName } else { "Unknown.exe" }
+        $MappedIntegrity = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].Integrity } else { "Unknown" }
+        $SimOp           = Resolve-EtwOperation -Provider $blocks[0] -TaskOrOpcode $taskField -Line $line
+        $SimResult       = Resolve-EtwResult -Line $line
+
+        $obj = [PSCustomObject]@{
+            "Time of Day"   = $tsField
+            "Process Name"  = $MappedName
+            "PID"           = $TestPID
+            "Operation"     = $SimOp
+            "Path"          = $RawPath
+            "Result"        = $SimResult
+            "Integrity"     = $MappedIntegrity
+            "Detail"        = "Integrity: $MappedIntegrity | Native ETW IO"
+            "Impersonating" = "Unknown"
+        }
+        $ProcmonEvents.Add($obj)
+        $MatchCount++
+
+        if ($MaxEvents -gt 0 -and $MatchCount -ge $MaxEvents) {
+            Write-Host "[!] Reached MaxEvents ($MaxEvents) threshold." -ForegroundColor Yellow
+            break
+        }
+    }
+}
+$reader.Close()
+
 $ProcmonEvents | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-Write-Host "[+] Pipeline Complete! Cross-referenced output generated as native CSV: $OutputPath" -ForegroundColor Green
+Write-Host "[+] Pipeline Complete! Cross-referenced output generated ($MatchCount events) as native CSV: $OutputPath" -ForegroundColor Green

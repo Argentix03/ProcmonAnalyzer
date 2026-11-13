@@ -99,6 +99,22 @@ document.addEventListener('DOMContentLoaded', () => {
     let savedApiKey = localStorage.getItem('gemini_api_key') || '';
     let tokensUsed = parseInt(localStorage.getItem('gemini_tokens_used')) || 0;
 
+    function escapeHtml(str) {
+        if (str === null || str === undefined) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function renderSafeMarkdownInline(text) {
+        return escapeHtml(text)
+            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+            .replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">$1</code>');
+    }
+
     // Fetch models if connected
     function loadModels(key) {
         if (!key) return;
@@ -118,7 +134,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     
                     if (preferredModel && m.id === preferredModel) {
                         opt.selected = true;
-                    } else if (!preferredModel && (m.id === 'gemini-1.5-flash' || m.id === 'gemini-2.0-flash-exp')) {
+                    } else if (!preferredModel && (m.id === 'gemini-2.5-flash' || m.id === 'gemini-2.0-flash' || m.id === 'gemini-1.5-flash')) {
                         opt.selected = true;
                     }
                     
@@ -395,7 +411,7 @@ document.addEventListener('DOMContentLoaded', () => {
         countHighConf.textContent = dataHighConf.length;
         countCognitive.textContent = dataCognitive.length;
 
-        renderList(highConfList, dataHighConf, false);
+        applyHighConfFilters();
         renderList(cognitiveList, dataCognitive, true);
 
         // Notify analytics panel
@@ -423,17 +439,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 div.id = `high-item-${item.OrigIdx}`;
             }
             
-            const severityClass = item.Severity ? item.Severity.toLowerCase() : 'medium';
-            const displaySeverity = isCognitive && item.Severity ? item.Severity : isCognitive ? 'Cognitive Target' : item.Severity;
+            const severityClass = escapeHtml(item.Severity ? item.Severity.toLowerCase() : 'medium');
+            const displaySeverity = escapeHtml(isCognitive && item.Severity ? item.Severity : isCognitive ? 'Cognitive Target' : item.Severity);
 
             const catBadge = item.EscalationCategory
-                ? `<span style="background:rgba(245,159,0,0.15); color:#f59f00; padding:1px 7px; border-radius:3px; font-size:0.7rem; font-family:monospace; margin-left:6px;">${item.EscalationCategory}</span>`
+                ? `<span style="background:rgba(245,159,0,0.15); color:#f59f00; padding:1px 7px; border-radius:3px; font-size:0.7rem; font-family:monospace; margin-left:6px;">${escapeHtml(item.EscalationCategory)}</span>`
                 : '';
             div.innerHTML = `
                 <div class="badge ${severityClass}">${displaySeverity}</div>
                 <div class="item-details">
-                    <span class="item-type">${item.Type || 'Ambiguous Signature'}${catBadge}</span>
-                    <span class="item-path">${item.Path}</span>
+                    <span class="item-type">${escapeHtml(item.Type || 'Ambiguous Signature')}${catBadge}</span>
+                    <span class="item-path">${escapeHtml(item.Path)}</span>
                 </div>
             `;
 
@@ -463,19 +479,28 @@ document.addEventListener('DOMContentLoaded', () => {
         procsContainer.innerHTML = '';
         (item.Processes || "").split(',').forEach(p => {
             const trimmed = p.trim();
-            if(trimmed) procsContainer.innerHTML += `<span class="process-tag">${trimmed}</span>`;
+            if (trimmed) {
+                const span = document.createElement('span');
+                span.className = 'process-tag';
+                span.textContent = trimmed;
+                procsContainer.appendChild(span);
+            }
         });
 
-        document.getElementById('modalReason').innerHTML = isCognitive
-            ? `<strong>Agent Hint:</strong> ${item.Hint}`
-            : `<strong>Rule Matched:</strong> ${item.DetailedReason}`;
+        if (isCognitive) {
+            document.getElementById('modalReason').innerHTML = `<strong>Agent Hint:</strong> ${escapeHtml(item.Hint)}`;
+        } else if (item.Hint) {
+            document.getElementById('modalReason').innerHTML = `<strong>Rule Matched:</strong> ${escapeHtml(item.DetailedReason)}<br><br><strong>AI Analysis:</strong> ${escapeHtml(item.Hint)}`;
+        } else {
+            document.getElementById('modalReason').innerHTML = `<strong>Rule Matched:</strong> ${escapeHtml(item.DetailedReason)}`;
+        }
 
         // Effective principal (LPE prompt §6 — whose NTLM hits the wire)
         const effPrinEl = document.getElementById('modalEffectivePrincipal');
         if (effPrinEl) {
             if (item.EffectivePrincipal) {
                 effPrinEl.style.display = 'block';
-                effPrinEl.innerHTML = '<strong style="color:var(--accent);">Effective Principal:</strong> ' + item.EffectivePrincipal;
+                effPrinEl.innerHTML = '<strong style="color:var(--accent);">Effective Principal:</strong> ' + escapeHtml(item.EffectivePrincipal);
             } else {
                 effPrinEl.style.display = 'none';
             }
@@ -502,9 +527,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (item.ExploitPrimitive || item.SqosLevel) {
                     extraCtx.style.display = 'block';
                     extraCtx.innerHTML = '';
-                    if (item.ExploitPrimitive) extraCtx.innerHTML += '<div class="modal-row"><span>Exploit Primitive</span><strong>' + item.ExploitPrimitive + '</strong></div>';
-                    if (item.SqosLevel) extraCtx.innerHTML += '<div class="modal-row"><span>SQOS Level</span><strong>' + item.SqosLevel + '</strong></div>';
-                    if (item.OperationDirection) extraCtx.innerHTML += '<div class="modal-row"><span>Operation Direction</span><strong>' + item.OperationDirection + '</strong></div>';
+                    if (item.ExploitPrimitive) extraCtx.innerHTML += '<div class="modal-row"><span>Exploit Primitive</span><strong>' + escapeHtml(item.ExploitPrimitive) + '</strong></div>';
+                    if (item.SqosLevel) extraCtx.innerHTML += '<div class="modal-row"><span>SQOS Level</span><strong>' + escapeHtml(item.SqosLevel) + '</strong></div>';
+                    if (item.OperationDirection) extraCtx.innerHTML += '<div class="modal-row"><span>Operation Direction</span><strong>' + escapeHtml(item.OperationDirection) + '</strong></div>';
                 } else {
                     extraCtx.style.display = 'none';
                 }
@@ -516,9 +541,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (item.EscalationCategory || item.WritableFrom) {
                     escCtx.style.display = 'block';
                     escCtx.innerHTML = '';
-                    if (item.EscalationCategory) escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Escalation Category</span><strong>' + item.EscalationCategory + '</strong></div>';
-                    if (item.WritableFrom)       escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Writable From</span><strong>' + item.WritableFrom + '</strong></div>';
-                    if (item.IntegrityLabel)     escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Integrity Label</span><strong>' + item.IntegrityLabel + '</strong></div>';
+                    if (item.EscalationCategory) escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Escalation Category</span><strong>' + escapeHtml(item.EscalationCategory) + '</strong></div>';
+                    if (item.WritableFrom)       escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Writable From</span><strong>' + escapeHtml(item.WritableFrom) + '</strong></div>';
+                    if (item.IntegrityLabel)     escCtx.innerHTML += '<div class="modal-row"><span style="color:#f59f00;">Integrity Label</span><strong>' + escapeHtml(item.IntegrityLabel) + '</strong></div>';
                     if (typeof item.WritableByLowPriv !== 'undefined' || typeof item.WritableByMediumILAdmin !== 'undefined' || typeof item.WritableByHighILAdmin !== 'undefined') {
                         var marks = [];
                         if (item.WritableByLowPriv)        marks.push('Low');
@@ -659,14 +684,14 @@ document.addEventListener('DOMContentLoaded', () => {
                     const pMain = document.createElement('div');
                     pMain.style.fontWeight = '600';
                     pMain.style.fontSize = '0.9rem';
-                    // Strip the raw markdown syntax so it renders gracefully
-                    pMain.innerHTML = find.text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">$1</code>');
+                    // Escape HTML first and render safe inline Markdown
+                    pMain.innerHTML = renderSafeMarkdownInline(find.text);
                     
                     const pSub = document.createElement('div');
                     pSub.style.fontSize = '0.8rem';
                     pSub.style.color = 'var(--text-muted)';
                     pSub.style.marginTop = '5px';
-                    pSub.innerHTML = find.details.join('<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/`(.*?)`/g, '<code style="background:rgba(255,255,255,0.1); padding:2px 4px; border-radius:3px;">$1</code>');
+                    pSub.innerHTML = (find.details || []).map(renderSafeMarkdownInline).join('<br>');
                     
                     txtBlock.appendChild(pMain);
                     if (find.details.length > 0) txtBlock.appendChild(pSub);
@@ -1090,21 +1115,35 @@ document.addEventListener('DOMContentLoaded', () => {
                         if (payload.type === 'chunk') {
                             
                             for (let i = 0; i < payload.items.length; i++) {
-                                const resolvedItem = payload.items[i];
+                                const resolvedItem = payload.items[i] || {};
                                 
-                                // Guaranteed deterministic mapping back to original memory slot
-                                const targetIdx = aiAnalysisQueue[domIndex].OrigIdx;
-                                const isHighConfTarget = aiAnalysisQueue[domIndex]._isHighConf;
-                                
-                                resolvedItem.OrigIdx = targetIdx; 
-                                resolvedItem._isHighConf = isHighConfTarget;
+                                // Match by OrigIdx first, falling back to positional domIndex with bounds check
+                                let queueEntry = null;
+                                if (typeof resolvedItem.OrigIdx === 'number') {
+                                    queueEntry = aiAnalysisQueue.find(q => q.OrigIdx === resolvedItem.OrigIdx && Boolean(q._isHighConf) === Boolean(resolvedItem._isHighConf))
+                                              || aiAnalysisQueue.find(q => q.OrigIdx === resolvedItem.OrigIdx);
+                                }
+                                if (!queueEntry && domIndex < aiAnalysisQueue.length) {
+                                    queueEntry = aiAnalysisQueue[domIndex];
+                                }
+                                domIndex++;
+                                if (!queueEntry) continue;
+
+                                const targetIdx = queueEntry.OrigIdx;
+                                const isHighConfTarget = Boolean(queueEntry._isHighConf);
+                                const mergedItem = {
+                                    ...queueEntry,
+                                    ...resolvedItem,
+                                    OrigIdx: targetIdx,
+                                    _isHighConf: isHighConfTarget
+                                };
                                 
                                 let targetDiv;
                                 if (isHighConfTarget) {
-                                    dataHighConf[targetIdx] = resolvedItem; // override HighConf memory array
+                                    dataHighConf[targetIdx] = mergedItem; // preserve HighConf properties + AI Hint
                                     targetDiv = document.getElementById('high-item-' + targetIdx);
                                 } else {
-                                    dataCognitive[targetIdx] = resolvedItem; // override Cognitive memory array
+                                    dataCognitive[targetIdx] = mergedItem; // override Cognitive memory array
                                     targetDiv = document.getElementById('cog-item-' + targetIdx);
                                 }
                                 
@@ -1114,25 +1153,23 @@ document.addEventListener('DOMContentLoaded', () => {
                                     targetDiv.style.borderLeft = "3px solid #50fa7b";
                                     targetDiv.style.transform = "scale(1.02)";
                                     
+                                    const summaryText = mergedItem.Hint && mergedItem.Hint.length > 60
+                                        ? mergedItem.Hint.substring(0, 60) + '...'
+                                        : (mergedItem.Hint || 'Deduction logged');
                                     targetDiv.innerHTML = `
                                         <div class="badge" style="background:rgba(80, 250, 123, 0.2); color:#50fa7b; border:1px solid #50fa7b;">AI Analyzed</div>
                                         <div class="item-details">
-                                            <span class="item-type" style="color:#fff;">${resolvedItem.Hint && resolvedItem.Hint.length > 60 ? resolvedItem.Hint.substring(0,60)+'...' : resolvedItem.Hint || 'Deduction logged'}</span>
-                                            <span class="item-path">${resolvedItem.Path}</span>
+                                            <span class="item-type" style="color:#fff;">${escapeHtml(summaryText)}</span>
+                                            <span class="item-path">${escapeHtml(mergedItem.Path)}</span>
                                         </div>
                                     `;
                                     // animate reset
                                     setTimeout(() => { targetDiv.style.transform = "scale(1)"; targetDiv.style.background = "var(--bg-card)"; }, 400);
 
-                                    // Need to re-bind modal click so it shows the new resolution
-                                    targetDiv.onclick = () => openModal(resolvedItem, true);
+                                    // Re-bind modal click preserving whether this was a High-Confidence or Cognitive item
+                                    targetDiv.onclick = () => openModal(mergedItem, !isHighConfTarget);
                                 }
-                                domIndex++;
                             }
-                            
-                            // Track Tokens natively!
-                            let curTokens = parseInt(localStorage.getItem('gemini_tokens_used')) || 0;
-                            curTokens += payload.currentTokensUsed; 
                         } else if (payload.type === 'error') {
                             console.error("Stream Error:", payload.message);
                             alert("AI Stream Error: " + payload.message + "\n\nPlease check DevTools console for raw details.");

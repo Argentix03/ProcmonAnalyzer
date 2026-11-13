@@ -9,7 +9,7 @@ This skill processes ProcMon/ETW path dumps using a hybrid Script + Agent model.
 ## Workflow
 
 1. **Invoke the heuristic triage script:** Execute `scripts/AnalyzeExecutionLeads.ps1 -JsonFeed writable_paths.json` to evaluate structurally obvious primitives.
-2. **Review high-confidence baseline:** `high_confidence_leads.json` — each finding includes `ExploitPrimitive`, `OperationDirection`, `SqosLevel`, `EffectivePrincipal`, `OpenReparsePoint`, `OpenLink`, `AnyPrivRead`, `AnyPrivWrite`, `Severity`, `Type`, `DetailedReason`.
+2. **Review high-confidence baseline:** `high_confidence_leads.json` — each finding includes `ExploitPrimitive`, `OperationDirection`, `SqosLevel`, `EffectivePrincipal`, `OpenReparsePoint`, `AllOpenReparsePoint`, `OpenLink`, `AllOpenLink`, `HighestIntegrity`, `AnyPrivRead`, `AnyPrivWrite`, `Severity`, `Type`, `DetailedReason`.
 3. **Cognitive agent evaluation:** ambiguous items go to `cognitive_review_queue.json`. **YOUR JOB AS THE AGENT:**
    - Read `cognitive_review_queue.json` in chunks (≤500 lines).
    - Evaluate each entry against the **Exploitation Primitive Taxonomy** below.
