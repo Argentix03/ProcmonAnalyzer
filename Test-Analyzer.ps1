@@ -292,6 +292,82 @@ $mockData = @(
         WritableByMediumILAdmin = $true
         WritableByHighILAdmin = $true
         WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "C:\ProgramData\VendorService\check_then_open.dat"
+        RelatedProcesses = "VendorService.exe"
+        Operation = "CreateFile"
+        Result = "SUCCESS"
+        Detail = "Desired Access: Generic Write"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AnyOpenReparsePoint = $true
+        AllOpenReparsePoint = $false
+        HasReparseCheckThenUse = $true
+        AnyPrivWrite = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "HKLM\SOFTWARE\Classes\CLSID\{11111111-2222-3333-4444-555555555555}\InprocServer32\(Default)"
+        RelatedProcesses = "svchost.exe"
+        Operation = "RegQueryValue"
+        Result = "SUCCESS"
+        Detail = "Type: REG_SZ, Length: 64, Data: C:\ProgramData\VendorCOM\MissingServer.dll"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        RegistryDataPath = "C:\ProgramData\VendorCOM\MissingServer.dll"
+        RegistryDataTarget = "C:\ProgramData\VendorCOM\MissingServer.dll"
+        RegistryDataTargetWritableByLowPriv = $true
+        RegistryDataTargetWritableByMediumILAdmin = $true
+        RegistryDataTargetWritableFrom = "LowPriv"
+        RegistryDataTargetAclSource = "ancestor"
+        RegistryDataTargetHasWritableAncestor = $true
+        RegistryDataTargetWritableAncestorPath = "C:\ProgramData\VendorCOM"
+        AnyPrivRead = $true
+        WritableByLowPriv = $false
+        WritableByMediumILAdmin = $false
+        WritableByHighILAdmin = $true
+        WritableFrom = "HighILAdmin"
+    },
+    [PSCustomObject]@{
+        Path = "HKLM\SOFTWARE\VendorSuite\AgentConfig\PluginPath"
+        RelatedProcesses = "VendorAgent.exe"
+        Operation = "RegQueryValue"
+        Result = "SUCCESS"
+        Detail = "Type: REG_SZ, Data: C:\ProgramData\VendorSuite\Plugins\custom_hook.dll"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        RegistryDataPath = "C:\ProgramData\VendorSuite\Plugins\custom_hook.dll"
+        RegistryDataTarget = "C:\ProgramData\VendorSuite\Plugins\custom_hook.dll"
+        RegistryDataTargetWritableByLowPriv = $true
+        RegistryDataTargetWritableByMediumILAdmin = $true
+        RegistryDataTargetWritableFrom = "LowPriv"
+        RegistryDataTargetAclSource = "parent-delete-recreate"
+        RegistryDataTargetCanDeleteOrReplace = $true
+        AnyPrivRead = $true
+        WritableByLowPriv = $false
+        WritableByMediumILAdmin = $false
+        WritableByHighILAdmin = $true
+        WritableFrom = "HighILAdmin"
+    },
+    [PSCustomObject]@{
+        Path = "C:\Users\Alice\AppData\Local\Packages\VendorPkg\LocalState\broker_ipc.json"
+        RelatedProcesses = "VendorBrokerService.exe"
+        Operation = "CreateFile"
+        Result = "SUCCESS"
+        Detail = "Desired Access: Generic Read"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "exact"
+        AnyPrivRead = $true
+        WritableByLowPriv = $false
+        WritableByAppContainer = $true
+        WritableByMediumILAdmin = $false
+        WritableByHighILAdmin = $true
+        WritableFrom = "AppContainer"
     }
 )
 
@@ -334,7 +410,11 @@ if (Test-Path $analyzerScript) {
         "Pipe_Client_IPC_Sink",
         "Registry_BufferOverflow_TOCTOU",
         "Signature_TOCTOU_Bypass",
-        "BackupSemantics_DACL_Bypass"
+        "BackupSemantics_DACL_Bypass",
+        "CheckThenUse_Reparse_TOCTOU",
+        "COM_HKLM_Hijack",
+        "Registry_Data_Path_Reference",
+        "AppContainer_Sandbox_Escape"
     )
     $allPassed = $true
     foreach ($ep in $expectedPrimitives) {

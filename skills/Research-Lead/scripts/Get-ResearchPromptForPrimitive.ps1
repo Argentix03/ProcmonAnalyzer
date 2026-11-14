@@ -48,8 +48,15 @@ $ResearchPromptCatalog = @(
             'SxS_DotLocal','Dependency_Hijack','Config_Poison','AppExecAlias_Plant',
             'PowerShell_Profile','Electron_AsarTamper','ACL_WriteDac_WriteOwner',
             'Arbitrary_DACL_Overwrite','Arbitrary_Delete_ConfigMsi_LPE','Arbitrary_Move_FileRename',
-            'Parent_Directory_Reparse_Bypass','BackupSemantics_DACL_Bypass','Signature_TOCTOU_Bypass'
+            'Parent_Directory_Reparse_Bypass','BackupSemantics_DACL_Bypass','Signature_TOCTOU_Bypass',
+            'CheckThenUse_Reparse_TOCTOU','COM_HKLM_Hijack'
         )
+    },
+    [PSCustomObject]@{
+        Id = 'sandbox_escape'
+        Title = 'Sandbox Escape (AppContainer / LPAC / Low-IL)'
+        File = 'SandboxEscape_Research_Prompt.md'
+        Primitives = @('AppContainer_Sandbox_Escape')
     },
     [PSCustomObject]@{
         Id = 'uac'

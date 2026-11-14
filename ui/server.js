@@ -535,8 +535,16 @@ const RESEARCH_PROMPTS = [
             'SxS_DotLocal', 'Dependency_Hijack', 'Config_Poison', 'AppExecAlias_Plant',
             'PowerShell_Profile', 'Electron_AsarTamper', 'ACL_WriteDac_WriteOwner',
             'Arbitrary_DACL_Overwrite', 'Arbitrary_Delete_ConfigMsi_LPE', 'Arbitrary_Move_FileRename',
-            'Parent_Directory_Reparse_Bypass', 'BackupSemantics_DACL_Bypass', 'Signature_TOCTOU_Bypass'
+            'Parent_Directory_Reparse_Bypass', 'BackupSemantics_DACL_Bypass', 'Signature_TOCTOU_Bypass',
+            'CheckThenUse_Reparse_TOCTOU', 'COM_HKLM_Hijack'
         ]
+    },
+    {
+        id: 'sandbox_escape',
+        title: 'Sandbox Escape (AppContainer / LPAC / Low-IL)',
+        file: 'SandboxEscape_Research_Prompt.md',
+        description: 'AppContainer (S-1-15-2-1), LPAC (S-1-15-2-2), Capability SID (S-1-15-3-*), and Low-IL escape surfaces into Medium/High/System consumers.',
+        primitives: ['AppContainer_Sandbox_Escape']
     },
     {
         id: 'uac',

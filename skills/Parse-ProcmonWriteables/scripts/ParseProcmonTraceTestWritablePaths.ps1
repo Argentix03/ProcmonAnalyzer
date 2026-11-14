@@ -258,7 +258,8 @@ namespace Win32DeviceMap {
         static readonly Regex RxDesiredAccess = new Regex(@"(?i)Desired\s*Access:\s*(.+?)(?:,\s*(?:Disposition|Options|ShareMode|Attributes|AllocationSize|OpenResult|Impersonating|Security\s*QOS):|$)", RegexOptions.Compiled);
         static readonly Regex RxDisposition = new Regex(@"(?i)Disposition:\s*([^,\r\n]+)", RegexOptions.Compiled);
         static readonly Regex RxShareMode = new Regex(@"(?i)ShareMode:\s*(.+?)(?:,\s*(?:Attributes|Options|AllocationSize|OpenResult|Impersonating):|$)", RegexOptions.Compiled);
-        static readonly Regex RxDataPath = new Regex(@"(?i)\bData:\s*""?([a-zA-Z]:\\[^""\r\n,;]+|\\\\[^""\r\n,;]+)", RegexOptions.Compiled);
+        static readonly Regex RxDataRaw = new Regex(@"(?i)\bData:\s*([^\r\n;]+)", RegexOptions.Compiled);
+        static readonly Regex RxDataExeSplit = new Regex(@"^(?i)([a-zA-Z]:\\.+?\.(?:exe|dll|sys|bat|cmd|ps1|psm1|vbs|js|wsf|hta|msi|msp|ocx|cpl|scr|msc|com|jar|config|xml|json|ini|inf|cer|crt|pfx|lnk|url)|\\\\.+?\.(?:exe|dll|sys|bat|cmd|ps1|psm1|vbs|js|wsf|hta|msi|msp|ocx|cpl|scr|msc|com|jar|config|xml|json|ini|inf|cer|crt|pfx|lnk|url))(?:\s+.*)?$", RegexOptions.Compiled);
         static readonly Regex RxCmdLine = new Regex(@"(?i)Command\s*line:\s*(.+?)(?:,\s*Current\s*directory:|,\s*Environment:|\r|\n|$)", RegexOptions.Compiled);
         static readonly Regex RxImpersonating = new Regex(@"(?i)Impersonating:\s*([^,\r\n]+)", RegexOptions.Compiled);
         static readonly Regex RxHarddiskVol = new Regex(@"^(?i)(\\Device\\HarddiskVolume\d+)(\\|$)(.*)$", RegexOptions.Compiled);
@@ -360,6 +361,53 @@ namespace Win32DeviceMap {
                 p = Regex.Replace(p, @"\\\\+", "\\");
             }
             return p.ToLowerInvariant();
+        }
+
+        static string ExtractCleanPathFromRegistryData(string detStr, IDictionary driveMap) {
+            if (string.IsNullOrEmpty(detStr) || detStr.IndexOf("Data:", StringComparison.OrdinalIgnoreCase) < 0) return "";
+            var m = RxDataRaw.Match(detStr);
+            if (!m.Success) return "";
+            string val = m.Groups[1].Value.Trim();
+            if (string.IsNullOrEmpty(val)) return "";
+
+            if (val.StartsWith("\"", StringComparison.Ordinal)) {
+                int endQ = val.IndexOf('"', 1);
+                if (endQ > 1) val = val.Substring(1, endQ - 1).Trim();
+                else val = val.Trim('"').Trim();
+            } else {
+                int commaField = val.IndexOf(", ", StringComparison.Ordinal);
+                if (commaField > 0 && val.Substring(commaField).IndexOf(':') > 0) {
+                    val = val.Substring(0, commaField).Trim();
+                }
+            }
+
+            if (val.StartsWith(@"\SystemRoot\", StringComparison.OrdinalIgnoreCase)) {
+                string sysRoot = Environment.GetEnvironmentVariable("SystemRoot") ?? @"C:\Windows";
+                val = sysRoot.TrimEnd('\\') + @"\" + val.Substring(12);
+            } else if (val.StartsWith(@"System32\", StringComparison.OrdinalIgnoreCase) || val.StartsWith(@"SysWOW64\", StringComparison.OrdinalIgnoreCase)) {
+                string sysRoot = Environment.GetEnvironmentVariable("SystemRoot") ?? @"C:\Windows";
+                val = sysRoot.TrimEnd('\\') + @"\" + val;
+            }
+            if (val.IndexOf('%') >= 0) {
+                try { val = Environment.ExpandEnvironmentVariables(val); } catch {}
+            }
+            val = NormalizePath(val, driveMap);
+            var mExe = RxDataExeSplit.Match(val);
+            if (mExe.Success) {
+                val = mExe.Groups[1].Value.Trim();
+            } else {
+                int swIdx = val.IndexOf(" /", StringComparison.Ordinal);
+                if (swIdx < 0) swIdx = val.IndexOf(" -", StringComparison.Ordinal);
+                if (swIdx > 3) val = val.Substring(0, swIdx).Trim();
+            }
+            val = val.Trim('"', '\'', ' ', '\t', '\0');
+            if (val.Length < 4) return "";
+            bool isDrive = (char.IsLetter(val[0]) && val[1] == ':' && val[2] == '\\');
+            bool isUnc   = (val.StartsWith(@"\\", StringComparison.Ordinal) && !val.StartsWith(@"\\.\") && !val.StartsWith(@"\\?\"));
+            if (!isDrive && !isUnc) return "";
+            if (val.IndexOfAny(Path.GetInvalidPathChars()) >= 0) return "";
+            if (val.IndexOf(':') > 2 || val.IndexOf('*') >= 0 || val.IndexOf('?') >= 0) return "";
+            return val;
         }
 
         static int GetIntegrityRank(string integ) {
@@ -568,8 +616,7 @@ namespace Win32DeviceMap {
                     }
                     string regDataPath = "";
                     if (isRegPath && detStr.IndexOf("Data:", StringComparison.OrdinalIgnoreCase) >= 0) {
-                        var mRd = RxDataPath.Match(detStr);
-                        if (mRd.Success) regDataPath = mRd.Groups[1].Value.Trim();
+                        regDataPath = ExtractCleanPathFromRegistryData(detStr, driveMap);
                     }
 
                     if (isPagingIO) summary.SkippedPagingIO++;
@@ -644,6 +691,10 @@ namespace Win32DeviceMap {
                         rec["HasSharedWriteOrDelete"] = false;
                         rec["HasReadOrCheckOp"] = false;
                         rec["HasLoadOrExecOp"] = false;
+                        rec["SeenPrivReparseCheck"] = false;
+                        rec["HasReparseCheckThenUse"] = false;
+                        rec["SeenPrivReadOrVerify"] = false;
+                        rec["HasVerifyThenLoad"] = false;
                         rec["HasNameNotFound"] = false;
                         rec["RegistryDataPaths"] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                         rec["NamePrincipals"] = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -696,6 +747,41 @@ namespace Win32DeviceMap {
                         if (resStr.IndexOf("BUFFER OVERFLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
                             resStr.IndexOf("MORE DATA", StringComparison.OrdinalIgnoreCase) >= 0) {
                             rec["HasBufferOverflow"] = true;
+                        }
+
+                        // Temporal sequence tracking for CheckThenUse_Reparse_TOCTOU & Signature_TOCTOU_Bypass
+                        if (isFsPath) {
+                            if ((bool)rec["SeenPrivReparseCheck"] && !openRP && (
+                                opStr.Equals("CreateFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("OpenFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("WriteFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("Load Image", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("SetDispositionInformationFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("SetRenameInformationFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("SetSecurityFile", StringComparison.OrdinalIgnoreCase))) {
+                                rec["HasReparseCheckThenUse"] = true;
+                            }
+                            if (openRP && (
+                                opStr.Equals("CreateFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("QueryOpen", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("QueryBasicInformationFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("QueryAttributeTagFile", StringComparison.OrdinalIgnoreCase))) {
+                                rec["SeenPrivReparseCheck"] = true;
+                            }
+                            if ((bool)rec["SeenPrivReadOrVerify"] && (
+                                opStr.Equals("Load Image", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.StartsWith("Process ", StringComparison.OrdinalIgnoreCase))) {
+                                rec["HasVerifyThenLoad"] = true;
+                            }
+                            if (opStr.Equals("ReadFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("QueryBasicInformationFile", StringComparison.OrdinalIgnoreCase) ||
+                                opStr.Equals("QueryOpen", StringComparison.OrdinalIgnoreCase) ||
+                                (opStr.Equals("CreateFile", StringComparison.OrdinalIgnoreCase) && (
+                                    desAcc.IndexOf("Read", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    shareMode.IndexOf("Write", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    shareMode.IndexOf("Delete", StringComparison.OrdinalIgnoreCase) >= 0))) {
+                                rec["SeenPrivReadOrVerify"] = true;
+                            }
                         }
                     }
                     if (shareMode.IndexOf("Write", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -754,10 +840,20 @@ namespace Win32DeviceMap {
         }
 
         static bool IsLowOrUserSid(string sid, string userSid) {
-            if (sid == "S-1-1-0" || sid == "S-1-5-11" || sid == "S-1-5-32-545" ||
+            if (sid == "S-1-1-0" || sid == "S-1-5-7" || sid == "S-1-5-11" || sid == "S-1-5-32-545" ||
                 sid == "S-1-5-4" || sid == "S-1-2-0"  || sid == "S-1-5-32-546" ||
                 sid == "S-1-15-2-1" || sid == "S-1-15-2-2") return true;
+            if (sid.StartsWith("S-1-15-3-", StringComparison.OrdinalIgnoreCase)) return true;
             if (!string.IsNullOrEmpty(userSid) && string.Equals(sid, userSid, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        static bool IsTopLevelProtectedRootFast(string dirPath) {
+            if (string.IsNullOrWhiteSpace(dirPath)) return true;
+            string d = dirPath.TrimEnd('\\');
+            if (d.Length == 2 && d[1] == ':') return true;
+            if (Regex.IsMatch(d, @"^(?i)[a-zA-Z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Users|System Volume Information|\$Recycle\.Bin)$")) return true;
+            if (Regex.IsMatch(d, @"^(?i)[a-zA-Z]:\\Users\\[^\\]+$")) return true;
             return false;
         }
 
@@ -777,6 +873,82 @@ namespace Win32DeviceMap {
                 }
             } catch {}
             return allow & ~deny;
+        }
+
+        static int GetDirMaskCachedFast(string dirPath, string userSid, Dictionary<string, int> dirMaskCache) {
+            if (string.IsNullOrEmpty(dirPath)) return 0;
+            int dMask;
+            if (!dirMaskCache.TryGetValue(dirPath, out dMask)) {
+                dMask = 0;
+                try {
+                    if (Directory.Exists(dirPath)) {
+                        var dAcl = Directory.GetAccessControl(dirPath, AccessControlSections.Access | AccessControlSections.Owner);
+                        dMask = GetFsLowMask(dAcl, userSid);
+                    }
+                } catch {}
+                dirMaskCache[dirPath] = dMask;
+            }
+            return dMask;
+        }
+
+        static bool IsFsPathControllableFast(string p, string userSid, int writeOrDacMask, int addFileOrDacMask, int addDirOrDacMask, int delChildMask, Dictionary<string, int> dirMaskCache) {
+            if (string.IsNullOrEmpty(p)) return false;
+            if (p.StartsWith(@"\\", StringComparison.Ordinal) && !p.StartsWith(@"\\.\") && !p.StartsWith(@"\\?\")) return true;
+            int dacMask = (int)(FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership);
+            try {
+                string imm = Path.GetDirectoryName(p);
+                bool immExists = !string.IsNullOrEmpty(imm) && Directory.Exists(imm);
+                if (File.Exists(p)) {
+                    var acl = File.GetAccessControl(p, AccessControlSections.Access | AccessControlSections.Owner);
+                    int fMask = GetFsLowMask(acl, userSid);
+                    if ((fMask & writeOrDacMask) != 0) return true;
+                    if (immExists && !IsTopLevelProtectedRootFast(imm)) {
+                        int dMask = GetDirMaskCachedFast(imm, userSid, dirMaskCache);
+                        if (((fMask & (int)FileSystemRights.Delete) != 0 || (dMask & (delChildMask | dacMask)) != 0) && (dMask & addFileOrDacMask) != 0) {
+                            return true;
+                        }
+                    }
+                } else if (Directory.Exists(p)) {
+                    int dMask = GetDirMaskCachedFast(p, userSid, dirMaskCache);
+                    if ((dMask & writeOrDacMask) != 0) return true;
+                    if (immExists && !IsTopLevelProtectedRootFast(p)) {
+                        int pMask = GetDirMaskCachedFast(imm, userSid, dirMaskCache);
+                        if (((dMask & (int)FileSystemRights.Delete) != 0 || (pMask & (delChildMask | dacMask)) != 0) && (pMask & addDirOrDacMask) != 0) {
+                            return true;
+                        }
+                    }
+                } else {
+                    string dir = imm;
+                    while (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) dir = Path.GetDirectoryName(dir);
+                    if (!string.IsNullOrEmpty(dir)) {
+                        int dMask = GetDirMaskCachedFast(dir, userSid, dirMaskCache);
+                        int needed = immExists ? addFileOrDacMask : addDirOrDacMask;
+                        if ((dMask & needed) != 0) return true;
+                    }
+                }
+
+                // Walk existing intermediate ancestor directories for replaceability / in-place reparse
+                string anc = imm;
+                int ancDepth = 0;
+                while (!string.IsNullOrEmpty(anc) && ancDepth < 8) {
+                    if (IsTopLevelProtectedRootFast(anc)) break;
+                    if (Directory.Exists(anc)) {
+                        int aMask = GetDirMaskCachedFast(anc, userSid, dirMaskCache);
+                        if ((aMask & dacMask) != 0) return true;
+                        if ((aMask & delChildMask) != 0 && (aMask & addFileOrDacMask) != 0) return true;
+                        string ancParent = Path.GetDirectoryName(anc);
+                        if (!string.IsNullOrEmpty(ancParent) && Directory.Exists(ancParent)) {
+                            int apMask = GetDirMaskCachedFast(ancParent, userSid, dirMaskCache);
+                            if (((aMask & (int)FileSystemRights.Delete) != 0 || (apMask & (delChildMask | dacMask)) != 0) && (apMask & addDirOrDacMask) != 0) {
+                                return true;
+                            }
+                        }
+                    }
+                    anc = Path.GetDirectoryName(anc);
+                    ancDepth++;
+                }
+            } catch {}
+            return false;
         }
 
         static bool HasRegLowWrite(RegistrySecurity acl, string userSid) {
@@ -815,7 +987,16 @@ namespace Win32DeviceMap {
 
                 if (p.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)) continue;
                 var regData = (HashSet<string>)rec["RegistryDataPaths"];
-                if (regData != null && regData.Count > 0) continue;
+                if (regData != null && regData.Count > 0) {
+                    bool anyControllableDataTarget = false;
+                    foreach (var rdp in regData) {
+                        if (IsFsPathControllableFast(rdp, userSid, writeOrDacMask, addFileOrDacMask, addDirOrDacMask, delChildMask, dirMaskCache)) {
+                            anyControllableDataTarget = true;
+                            break;
+                        }
+                    }
+                    if (anyControllableDataTarget) continue;
+                }
                 if (RxAdminSurface.IsMatch(p)) continue;
 
                 bool anyPriv = (bool)rec["AnyPrivRead"] || (bool)rec["AnyPrivWrite"] || (bool)rec["AnyImpersonating"];
@@ -833,7 +1014,7 @@ namespace Win32DeviceMap {
                     }
                 }
 
-                // Registry check
+                // Registry check (leaf + ancestor walk)
                 if (p.StartsWith("HK", StringComparison.OrdinalIgnoreCase)) {
                     if (p.StartsWith("HKCU\\", StringComparison.OrdinalIgnoreCase) ||
                         p.StartsWith("HKEY_CURRENT_USER\\", StringComparison.OrdinalIgnoreCase) ||
@@ -861,21 +1042,34 @@ namespace Win32DeviceMap {
                         if (root != null) {
                             string probe = sub;
                             int depth = 0;
-                            while (!string.IsNullOrEmpty(probe) && depth < 16) {
+                            bool foundExisting = false;
+                            while (!string.IsNullOrEmpty(probe) && depth < 12) {
+                                if (probe.Equals("SOFTWARE", StringComparison.OrdinalIgnoreCase) ||
+                                    probe.Equals("SYSTEM", StringComparison.OrdinalIgnoreCase) ||
+                                    probe.Equals(@"SOFTWARE\Microsoft", StringComparison.OrdinalIgnoreCase) ||
+                                    probe.Equals(@"SOFTWARE\Classes", StringComparison.OrdinalIgnoreCase) ||
+                                    probe.Equals(@"SYSTEM\CurrentControlSet", StringComparison.OrdinalIgnoreCase)) {
+                                    if (foundExisting) break;
+                                }
                                 string pk = rootStr + "\\" + probe;
-                                if (regLowCache.TryGetValue(pk, out isRegLow)) break;
-                                try {
-                                    using (var rk = root.OpenSubKey(probe, RegistryKeyPermissionCheck.Default, RegistryRights.ReadPermissions)) {
-                                        if (rk != null) {
-                                            var sec = rk.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
-                                            isRegLow = HasRegLowWrite(sec, userSid);
-                                            regLowCache[pk] = isRegLow;
-                                            break;
+                                bool pkLow;
+                                if (regLowCache.TryGetValue(pk, out pkLow)) {
+                                    if (pkLow) { isRegLow = true; break; }
+                                    if (!foundExisting) foundExisting = true;
+                                } else {
+                                    try {
+                                        using (var rk = root.OpenSubKey(probe, RegistryKeyPermissionCheck.Default, RegistryRights.ReadPermissions)) {
+                                            if (rk != null) {
+                                                foundExisting = true;
+                                                var sec = rk.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+                                                pkLow = HasRegLowWrite(sec, userSid);
+                                                regLowCache[pk] = pkLow;
+                                                if (pkLow) { isRegLow = true; break; }
+                                            }
                                         }
+                                    } catch {
+                                        regLowCache[pk] = false;
                                     }
-                                } catch {
-                                    regLowCache[pk] = false;
-                                    break;
                                 }
                                 int ls = probe.LastIndexOf('\\');
                                 probe = (ls > 0) ? probe.Substring(0, ls) : "";
@@ -888,52 +1082,8 @@ namespace Win32DeviceMap {
                     continue;
                 }
 
-                // Filesystem check
-                bool keepFs = false;
-                try {
-                    if (File.Exists(p)) {
-                        var acl = File.GetAccessControl(p, AccessControlSections.Access | AccessControlSections.Owner);
-                        int fMask = GetFsLowMask(acl, userSid);
-                        if ((fMask & writeOrDacMask) != 0) keepFs = true;
-                        else {
-                            string imm = Path.GetDirectoryName(p);
-                            if (!string.IsNullOrEmpty(imm) && Directory.Exists(imm)) {
-                                int dMask;
-                                if (!dirMaskCache.TryGetValue(imm, out dMask)) {
-                                    var dAcl = Directory.GetAccessControl(imm, AccessControlSections.Access | AccessControlSections.Owner);
-                                    dMask = GetFsLowMask(dAcl, userSid);
-                                    dirMaskCache[imm] = dMask;
-                                }
-                                if (((fMask & (int)FileSystemRights.Delete) != 0 || (dMask & delChildMask) != 0) && (dMask & addFileOrDacMask) != 0) {
-                                    keepFs = true;
-                                }
-                            }
-                        }
-                    } else if (Directory.Exists(p)) {
-                        int dMask;
-                        if (!dirMaskCache.TryGetValue(p, out dMask)) {
-                            var dAcl = Directory.GetAccessControl(p, AccessControlSections.Access | AccessControlSections.Owner);
-                            dMask = GetFsLowMask(dAcl, userSid);
-                            dirMaskCache[p] = dMask;
-                        }
-                        if ((dMask & writeOrDacMask) != 0) keepFs = true;
-                    } else {
-                        string imm = Path.GetDirectoryName(p);
-                        bool immExists = !string.IsNullOrEmpty(imm) && Directory.Exists(imm);
-                        string dir = imm;
-                        while (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) dir = Path.GetDirectoryName(dir);
-                        if (!string.IsNullOrEmpty(dir)) {
-                            int dMask;
-                            if (!dirMaskCache.TryGetValue(dir, out dMask)) {
-                                var dAcl = Directory.GetAccessControl(dir, AccessControlSections.Access | AccessControlSections.Owner);
-                                dMask = GetFsLowMask(dAcl, userSid);
-                                dirMaskCache[dir] = dMask;
-                            }
-                            int needed = immExists ? addFileOrDacMask : addDirOrDacMask;
-                            if ((dMask & needed) != 0) keepFs = true;
-                        }
-                    }
-                } catch {}
+                // Filesystem check (leaf, parent delete-recreate, missing target creation, and ancestor walk)
+                bool keepFs = IsFsPathControllableFast(p, userSid, writeOrDacMask, addFileOrDacMask, addDirOrDacMask, delChildMask, dirMaskCache);
 
                 if (!keepFs) {
                     keysToRemove.Add(canonical);
@@ -1338,14 +1488,21 @@ function Get-RegistryHiveAndSubkey {
 # "-hive-root" / "-denied" / "-bad-path"), and the resolved root name so the
 # caller can decide IntegrityLabel + fallback behavior.
 function Get-RegistryDaclForPath {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [string]$Operation = ""
+    )
     $parts = Get-RegistryHiveAndSubkey -Path $Path
     if ($null -eq $parts) {
-        return @{ Sec = $null; Source = "registry-bad-path"; RootName = "" }
+        return @{ Sec = $null; Source = "registry-bad-path"; RootName = ""; Hive = $null; ResolvedSubkey = "" }
     }
 
     $sub = $parts.Subkey
     while ($sub.EndsWith('\')) { $sub = $sub.Substring(0, $sub.Length - 1) }
+    if ($Operation -in @("RegQueryValue", "RegSetValue", "RegDeleteValue", "RegEnumValue")) {
+        $valSlash = $sub.LastIndexOf('\')
+        if ($valSlash -gt 0) { $sub = $sub.Substring(0, $valSlash) }
+    }
     $exact = $true
     $depth = 0
 
@@ -1356,9 +1513,9 @@ function Get-RegistryDaclForPath {
             try {
                 $sec = $parts.Hive.GetAccessControl()
                 $src = if ($exact) { "registry-hive-root" } else { "registry-ancestor" }
-                return @{ Sec = $sec; Source = $src; RootName = $parts.RootName }
+                return @{ Sec = $sec; Source = $src; RootName = $parts.RootName; Hive = $parts.Hive; ResolvedSubkey = "" }
             } catch {
-                return @{ Sec = $null; Source = "registry-denied"; RootName = $parts.RootName }
+                return @{ Sec = $null; Source = "registry-denied"; RootName = $parts.RootName; Hive = $parts.Hive; ResolvedSubkey = "" }
             }
         }
         try {
@@ -1370,7 +1527,7 @@ function Get-RegistryDaclForPath {
                 try {
                     $sec = $key.GetAccessControl()
                     $src = if ($exact) { "registry-exact" } else { "registry-ancestor" }
-                    return @{ Sec = $sec; Source = $src; RootName = $parts.RootName }
+                    return @{ Sec = $sec; Source = $src; RootName = $parts.RootName; Hive = $parts.Hive; ResolvedSubkey = $sub }
                 } finally {
                     $key.Close()
                 }
@@ -1383,27 +1540,10 @@ function Get-RegistryDaclForPath {
         $exact = $false
         $depth++
     }
-    return @{ Sec = $null; Source = "registry-denied"; RootName = $parts.RootName }
+    return @{ Sec = $null; Source = "registry-denied"; RootName = $parts.RootName; Hive = $parts.Hive; ResolvedSubkey = "" }
 }
 
-# ── SHARED DACL EVALUATION (rev 3.2) ─────────────────────────────────────────
-#
-# Single-source-of-truth for the rules loop + conditional-ACE detection +
-# writability flag computation. Used by both the FS and Registry branches of
-# Get-PathWritability. The $Result hashtable is mutated in place — its
-# WritableByLowPriv / WritableByMediumILAdmin / WritableByHighILAdmin /
-# HasConditionalACE / ConditionalACEPrincipals / ConditionalACESddl fields
-# are populated.
-#
-# Caller is responsible for:
-#   * Determining the ACL object ($Acl) — FileSecurity or RegistrySecurity
-#   * Choosing IsContainer correctly (true for directories and registry keys,
-#     false for individual files)
-#   * Setting IsRegistry so the rights extractor picks RegistryRights vs
-#     FileSystemRights (the underlying mask bits coincide for plant rights,
-#     but using the wrong concrete property would throw)
-#   * Pre-setting Result.AclSource / Result.IntegrityLabel as appropriate
-#   * Applying MIC NW (no-write-up) at the end if IntegrityLabel is High/System
+# ── SHARED DACL EVALUATION (rev 3.2 / rev 3.4) ──────────────────────────────
 function Invoke-DaclEvaluation {
     param(
         [Parameter(Mandatory=$true)] $Acl,
@@ -1477,6 +1617,10 @@ function Invoke-DaclEvaluation {
     $allowedAppContainer = $false; $deniedAppContainer = $false
     $allowCreateFilesLow = $false; $denyCreateFilesLow = $false
     $allowCreateDirsLow  = $false; $denyCreateDirsLow  = $false
+    $allowCreateFilesMed = $false; $denyCreateFilesMed = $false
+    $allowCreateDirsMed  = $false; $denyCreateDirsMed  = $false
+    $allowCreateSubKeyLow = $false; $denyCreateSubKeyLow = $false
+    $allowCreateSubKeyMed = $false; $denyCreateSubKeyMed = $false
     $hasOwnerRightsAce = $false
     $flaggedConditionalSids = New-Object System.Collections.Generic.HashSet[string]
     $serviceSids = New-Object System.Collections.Generic.HashSet[string]
@@ -1500,10 +1644,13 @@ function Invoke-DaclEvaluation {
             continue
         }
 
-        # Track AppContainer SIDs (S-1-15-2-1 / S-1-15-2-2)
-        if ($script:_appContainerSids -contains $sid -and (($rights -band $effectiveWriteMask) -ne 0)) {
+        # Track AppContainer SIDs (S-1-15-2-1, S-1-15-2-2, S-1-15-3-*)
+        if ((($script:_appContainerSids -contains $sid) -or ($sid -match '^S-1-15-3-')) -and (($rights -band $effectiveWriteMask) -ne 0)) {
             if ($isDeny) { $deniedAppContainer = $true }
-            else         { $allowedAppContainer = $true }
+            else {
+                $allowedAppContainer = $true
+                $Result.HasExplicitAppContainerAce = $true
+            }
         }
 
         $isLowOrUser = ($script:_lowPrivSids -contains $sid) -or ($sid -eq $UserContext.UserSid -and -not $UserContext.IsAdminLatent)
@@ -1513,24 +1660,46 @@ function Invoke-DaclEvaluation {
         if (-not $isDeny -and ($isLowOrUser -or $isMedUser)) {
             if (($rights -band $script:_dacOwnerBits) -ne 0) {
                 $Result.CanWriteDacOrOwner = $true
+                if ($isLowOrUser) { $Result.CanWriteDacOrOwnerLow = $true }
             }
-            if (-not $IsRegistry -and (($rights -band $script:_deleteBit) -ne 0)) {
+            if (($rights -band $script:_deleteBit) -ne 0) {
                 $Result.CanDeleteSelf = $true
+                if ($isLowOrUser) { $Result.CanDeleteSelfLow = $true }
             }
             if (-not $IsRegistry -and $IsContainer -and (($rights -band $script:_deleteChildBit) -ne 0)) {
                 $Result.CanDeleteChild = $true
+                if ($isLowOrUser) { $Result.CanDeleteChildLow = $true }
             }
             if ($IsRegistry -and (($rights -band $script:_regCreateLinkBit) -ne 0) -and (($rights -band 0x2) -ne 0)) {
                 $Result.CanCreateRegLink = $true
             }
         }
 
-        if (-not $IsRegistry -and $IsContainer -and $isLowOrUser) {
-            if ((($rights -band 0x2) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
-                if ($isDeny) { $denyCreateFilesLow = $true } else { $allowCreateFilesLow = $true }
+        if (-not $IsRegistry -and $IsContainer) {
+            if ($isLowOrUser) {
+                if ((($rights -band 0x2) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                    if ($isDeny) { $denyCreateFilesLow = $true; $denyCreateFilesMed = $true } else { $allowCreateFilesLow = $true; $allowCreateFilesMed = $true }
+                }
+                if ((($rights -band 0x4) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                    if ($isDeny) { $denyCreateDirsLow = $true; $denyCreateDirsMed = $true } else { $allowCreateDirsLow = $true; $allowCreateDirsMed = $true }
+                }
+            } elseif ($isMedUser) {
+                if ((($rights -band 0x2) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                    if ($isDeny) { $denyCreateFilesMed = $true } else { $allowCreateFilesMed = $true }
+                }
+                if ((($rights -band 0x4) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                    if ($isDeny) { $denyCreateDirsMed = $true } else { $allowCreateDirsMed = $true }
+                }
             }
-            if ((($rights -band 0x4) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
-                if ($isDeny) { $denyCreateDirsLow = $true } else { $allowCreateDirsLow = $true }
+        } elseif ($IsRegistry) {
+            if ($isLowOrUser) {
+                if ((($rights -band 0x4) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                    if ($isDeny) { $denyCreateSubKeyLow = $true; $denyCreateSubKeyMed = $true } else { $allowCreateSubKeyLow = $true; $allowCreateSubKeyMed = $true }
+                }
+            } elseif ($isMedUser) {
+                if ((($rights -band 0x4) -ne 0) -or (($rights -band $script:_dacOwnerBits) -ne 0)) {
+                    if ($isDeny) { $denyCreateSubKeyMed = $true } else { $allowCreateSubKeyMed = $true }
+                }
             }
         }
 
@@ -1594,12 +1763,17 @@ function Invoke-DaclEvaluation {
                 $ownerSid = $ownerRef.Value
                 $Result.OwnerSid = $ownerSid
                 if (($script:_lowPrivSids -contains $ownerSid) -or ($ownerSid -eq $UserContext.UserSid -and -not $UserContext.IsAdminLatent)) {
-                    $Result.CanWriteDacOrOwner = $true
+                    $Result.CanWriteDacOrOwner    = $true
+                    $Result.CanWriteDacOrOwnerLow = $true
                     $allowedLow = $true; $allowedMed = $true; $allowedHigh = $true
                     $allowCreateFilesLow = $true; $allowCreateDirsLow = $true
+                    $allowCreateFilesMed = $true; $allowCreateDirsMed = $true
+                    $allowCreateSubKeyLow = $true; $allowCreateSubKeyMed = $true
                 } elseif ($ownerSid -eq $UserContext.UserSid -and $UserContext.IsAdminLatent) {
                     $Result.CanWriteDacOrOwner = $true
                     $allowedMed = $true; $allowedHigh = $true
+                    $allowCreateFilesMed = $true; $allowCreateDirsMed = $true
+                    $allowCreateSubKeyMed = $true
                 }
             }
         } catch {}
@@ -1610,6 +1784,10 @@ function Invoke-DaclEvaluation {
     $Result.WritableByHighILAdmin   = $allowedHigh -and -not $deniedHigh
     $Result.CanCreateFilesLow       = $allowCreateFilesLow -and -not $denyCreateFilesLow
     $Result.CanCreateDirsLow        = $allowCreateDirsLow  -and -not $denyCreateDirsLow
+    $Result.CanCreateFilesMed       = $allowCreateFilesMed -and -not $denyCreateFilesMed
+    $Result.CanCreateDirsMed        = $allowCreateDirsMed  -and -not $denyCreateDirsMed
+    $Result.CanCreateSubKeyLow      = $allowCreateSubKeyLow -and -not $denyCreateSubKeyLow
+    $Result.CanCreateSubKeyMed      = $allowCreateSubKeyMed -and -not $denyCreateSubKeyMed
     $Result.WritableByAppContainer  = ($allowedAppContainer -or $Result.WritableByLowPriv) -and (-not $deniedAppContainer) -and ($Result.IntegrityLabel -eq "Low")
     if ($serviceSids.Count -gt 0) {
         $Result.WritableServiceSids = @($serviceSids)
@@ -1630,6 +1808,15 @@ function Test-TopLevelProtectedRoot {
     return $false
 }
 
+function Test-TopLevelProtectedRegistryKey {
+    param([string]$Subkey)
+    if ([string]::IsNullOrWhiteSpace($Subkey)) { return $true }
+    $s = $Subkey.Trim('\')
+    if ($s -match '^(?i)(SOFTWARE|SYSTEM|SAM|SECURITY|HARDWARE)$') { return $true }
+    if ($s -match '^(?i)(SOFTWARE\\Microsoft|SOFTWARE\\Classes|SOFTWARE\\Policies|SOFTWARE\\Wow6432Node|SOFTWARE\\Wow6432Node\\Microsoft|SOFTWARE\\Wow6432Node\\Classes|SYSTEM\\CurrentControlSet|SYSTEM\\ControlSet\d+|SYSTEM\\CurrentControlSet\\Services|SYSTEM\\ControlSet\d+\\Services)$') { return $true }
+    return $false
+}
+
 function Get-DirectoryWritabilityCached {
     param(
         [Parameter(Mandatory=$true)] [string]$DirPath,
@@ -1640,22 +1827,30 @@ function Get-DirectoryWritabilityCached {
         return $script:_dirEvalCache[$key]
     }
     $dRes = @{
-        WritableByLowPriv       = $false
-        WritableByMediumILAdmin = $false
-        WritableByHighILAdmin   = $false
-        WritableByAppContainer  = $false
-        CanWriteDacOrOwner      = $false
-        CanDeleteSelf           = $false
-        CanDeleteChild          = $false
-        CanCreateFilesLow       = $false
-        CanCreateDirsLow        = $false
-        CanCreateRegLink        = $false
-        IntegrityLabel          = "Default"
-        OwnerSid                = ""
-        WritableServiceSids     = @()
-        HasConditionalACE       = $false
-        ConditionalACEPrincipals = @()
-        ConditionalACESddl      = ""
+        WritableByLowPriv         = $false
+        WritableByMediumILAdmin   = $false
+        WritableByHighILAdmin     = $false
+        WritableByAppContainer    = $false
+        HasExplicitAppContainerAce = $false
+        CanWriteDacOrOwner        = $false
+        CanWriteDacOrOwnerLow     = $false
+        CanDeleteSelf             = $false
+        CanDeleteSelfLow          = $false
+        CanDeleteChild            = $false
+        CanDeleteChildLow         = $false
+        CanCreateFilesLow         = $false
+        CanCreateDirsLow          = $false
+        CanCreateFilesMed         = $false
+        CanCreateDirsMed          = $false
+        CanCreateSubKeyLow        = $false
+        CanCreateSubKeyMed        = $false
+        CanCreateRegLink          = $false
+        IntegrityLabel            = "Default"
+        OwnerSid                  = ""
+        WritableServiceSids       = @()
+        HasConditionalACE         = $false
+        ConditionalACEPrincipals  = @()
+        ConditionalACESddl        = ""
     }
     try {
         foreach ($pat in $script:_highILPathPatterns) {
@@ -1676,16 +1871,28 @@ function Get-DirectoryWritabilityCached {
                     $mlTok = $matches[1]
                     if ($mlTok -eq 'SI' -or $mlTok -eq 'S-1-16-16384') { $dRes.IntegrityLabel = "System" }
                     elseif ($mlTok -eq 'HI' -or $mlTok -eq 'S-1-16-12288') { $dRes.IntegrityLabel = "High" }
-                    elseif ($mlTok -eq 'LW' -or $mlTok -eq 'S-1-16-4096') { $dRes.IntegrityLabel = "Low" }
+                    elseif ($mlTok -eq 'LW' -or $mlTok -eq 'S-1-16-4096') {
+                        $dRes.IntegrityLabel = "Low"
+                        if ($dRes.WritableByLowPriv -or $dRes.HasExplicitAppContainerAce) {
+                            $dRes.WritableByAppContainer = $true
+                        }
+                    }
                 }
             }
             if ($dRes.IntegrityLabel -eq "High" -or $dRes.IntegrityLabel -eq "System") {
                 $dRes.WritableByLowPriv       = $false
                 $dRes.WritableByMediumILAdmin = $false
+                $dRes.WritableByAppContainer  = $false
                 $dRes.CanDeleteSelf           = $false
+                $dRes.CanDeleteSelfLow        = $false
                 $dRes.CanDeleteChild          = $false
+                $dRes.CanDeleteChildLow       = $false
                 $dRes.CanCreateFilesLow       = $false
                 $dRes.CanCreateDirsLow        = $false
+                $dRes.CanCreateFilesMed       = $false
+                $dRes.CanCreateDirsMed        = $false
+                $dRes.CanWriteDacOrOwner      = $false
+                $dRes.CanWriteDacOrOwnerLow   = $false
             }
         }
     } catch {}
@@ -1697,7 +1904,8 @@ function Get-PathWritability {
     param(
         [Parameter(Mandatory=$true)] [string]$TargetPath,
         [Parameter(Mandatory=$true)] [hashtable]$UserContext,
-        [bool]$HasNameNotFound = $false
+        [bool]$HasNameNotFound = $false,
+        [string]$Operation = ""
     )
 
     $r = @{
@@ -1705,11 +1913,19 @@ function Get-PathWritability {
         WritableByMediumILAdmin   = $false
         WritableByHighILAdmin     = $false
         WritableByAppContainer    = $false
+        HasExplicitAppContainerAce = $false
         CanWriteDacOrOwner        = $false
+        CanWriteDacOrOwnerLow     = $false
         CanDeleteSelf             = $false
+        CanDeleteSelfLow          = $false
         CanDeleteChild            = $false
+        CanDeleteChildLow         = $false
         CanCreateFilesLow         = $false
         CanCreateDirsLow          = $false
+        CanCreateFilesMed         = $false
+        CanCreateDirsMed          = $false
+        CanCreateSubKeyLow        = $false
+        CanCreateSubKeyMed        = $false
         CanDeleteOrReplace        = $false
         HasWritableAncestor       = $false
         WritableAncestorPath      = ""
@@ -1735,6 +1951,7 @@ function Get-PathWritability {
                 $pipeRules = $pipeAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
                 $allowInstLow = $false; $denyInstLow = $false
                 $allowWriteLow = $false; $denyWriteLow = $false
+                $allowPipeAC = $false; $denyPipeAC = $false
                 foreach ($pr in $pipeRules) {
                     $pSid = $pr.IdentityReference.Value
                     $pRights = [int]$pr.FileSystemRights
@@ -1747,12 +1964,18 @@ function Get-PathWritability {
                             if ($pDeny) { $denyWriteLow = $true } else { $allowWriteLow = $true }
                         }
                     }
+                    if (($script:_appContainerSids -contains $pSid) -or ($pSid -match '^S-1-15-3-')) {
+                        if (($pRights -band ($script:_pipeCreateInstBit -bor $script:_pipeClientWriteBit)) -ne 0) {
+                            if ($pDeny) { $denyPipeAC = $true } else { $allowPipeAC = $true }
+                        }
+                    }
                 }
-                $r.CanCreatePipeInstance = ($allowInstLow -and -not $denyInstLow) -or $HasNameNotFound
-                $r.CanWritePipeClient    = ($allowWriteLow -and -not $denyWriteLow)
-                $r.WritableByLowPriv     = ($r.CanCreatePipeInstance -or $r.CanWritePipeClient)
+                $r.CanCreatePipeInstance  = ($allowInstLow -and -not $denyInstLow) -or $HasNameNotFound
+                $r.CanWritePipeClient     = ($allowWriteLow -and -not $denyWriteLow)
+                $r.WritableByLowPriv      = ($r.CanCreatePipeInstance -or $r.CanWritePipeClient)
                 $r.WritableByMediumILAdmin = $r.WritableByLowPriv
-                $r.AclSource             = if ($HasNameNotFound) { "named-pipe-unbound-in-trace" } else { "named-pipe-live-dacl" }
+                $r.WritableByAppContainer = ($allowPipeAC -and -not $denyPipeAC)
+                $r.AclSource              = if ($HasNameNotFound) { "named-pipe-unbound-in-trace" } else { "named-pipe-live-dacl" }
             } else {
                 $r.CanCreatePipeInstance   = $true
                 $r.CanWritePipeClient      = $true
@@ -1763,17 +1986,111 @@ function Get-PathWritability {
             return $r
         }
 
-        # Registry — proper DACL parse (rev 3.2/3.4).
+        # Registry — proper DACL parse + parent delete-recreate + ancestor walk (rev 3.2/3.4).
         if ($TargetPath -match '^(HKLM|HKCU|HKCR|HKU|HKCC|HKPD|HKEY_)') {
-            $regResult = Get-RegistryDaclForPath -Path $TargetPath
+            $regResult = Get-RegistryDaclForPath -Path $TargetPath -Operation $Operation
             $r.AclSource = $regResult.Source
             if ($null -ne $regResult.Sec) {
                 Invoke-DaclEvaluation -Acl $regResult.Sec -Result $r `
                     -UserContext $UserContext -IsContainer $true -IsRegistry $true
+                if ($r.HasExplicitAppContainerAce -and $r.IntegrityLabel -ne "High" -and $r.IntegrityLabel -ne "System") {
+                    $r.WritableByAppContainer = $true
+                }
                 if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
                     $r.WritableByLowPriv       = $false
                     $r.WritableByMediumILAdmin = $false
+                    $r.WritableByAppContainer  = $false
                     $r.CanCreateRegLink        = $false
+                }
+
+                # If a registry key is not directly writable (or to populate HasWritableAncestor / CanDeleteOrReplace):
+                # 1. Check if the key itself can be deleted (CanDeleteSelf) and recreated via its parent key (CanCreateSubKey).
+                # 2. Walk ancestor keys up to protected hive/system roots to detect writable/replaceable ancestor keys.
+                $resolvedSub = $regResult.ResolvedSubkey
+                if ($regResult.Source -eq "registry-ancestor" -and ($r.WritableByLowPriv -or $r.WritableByMediumILAdmin) -and -not (Test-TopLevelProtectedRegistryKey -Subkey $resolvedSub)) {
+                    $r.HasWritableAncestor  = $true
+                    $r.WritableAncestorPath = "$($regResult.RootName)\$resolvedSub"
+                } elseif ($null -ne $regResult.Hive -and -not [string]::IsNullOrEmpty($resolvedSub) -and $regResult.RootName -ne "HKCU") {
+                    $ancSub = $resolvedSub
+                    $ancDepth = 0
+                    $checkedImmediateParent = $false
+                    while (-not [string]::IsNullOrEmpty($ancSub) -and $ancDepth -lt 12) {
+                        $ls = $ancSub.LastIndexOf('\')
+                        $parentSub = if ($ls -gt 0) { $ancSub.Substring(0, $ls) } else { "" }
+                        if ([string]::IsNullOrEmpty($parentSub) -or (Test-TopLevelProtectedRegistryKey -Subkey $parentSub)) { break }
+                        try {
+                            $pKey = $regResult.Hive.OpenSubKey(
+                                $parentSub,
+                                [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree,
+                                [System.Security.AccessControl.RegistryRights]::ReadPermissions)
+                            if ($pKey) {
+                                try {
+                                    $pSec = $pKey.GetAccessControl()
+                                    $pEval = @{
+                                        WritableByLowPriv         = $false
+                                        WritableByMediumILAdmin   = $false
+                                        WritableByHighILAdmin     = $false
+                                        WritableByAppContainer    = $false
+                                        HasExplicitAppContainerAce = $false
+                                        CanWriteDacOrOwner        = $false
+                                        CanWriteDacOrOwnerLow     = $false
+                                        CanDeleteSelf             = $false
+                                        CanDeleteSelfLow          = $false
+                                        CanDeleteChild            = $false
+                                        CanDeleteChildLow         = $false
+                                        CanCreateFilesLow         = $false
+                                        CanCreateDirsLow          = $false
+                                        CanCreateFilesMed         = $false
+                                        CanCreateDirsMed          = $false
+                                        CanCreateSubKeyLow        = $false
+                                        CanCreateSubKeyMed        = $false
+                                        CanCreateRegLink          = $false
+                                        IntegrityLabel            = "Default"
+                                        OwnerSid                  = ""
+                                        WritableServiceSids       = @()
+                                        HasConditionalACE         = $false
+                                        ConditionalACEPrincipals  = @()
+                                        ConditionalACESddl        = ""
+                                    }
+                                    Invoke-DaclEvaluation -Acl $pSec -Result $pEval -UserContext $UserContext -IsContainer $true -IsRegistry $true
+                                    if (-not $checkedImmediateParent) {
+                                        $checkedImmediateParent = $true
+                                        if (($r.CanDeleteSelfLow -or $pEval.CanWriteDacOrOwnerLow) -and ($pEval.CanCreateSubKeyLow -or $pEval.CanWriteDacOrOwnerLow)) {
+                                            $r.CanDeleteOrReplace = $true
+                                            if (-not $r.WritableByLowPriv) {
+                                                $r.WritableByLowPriv       = $true
+                                                $r.WritableByMediumILAdmin = $true
+                                                $r.WritableByHighILAdmin   = $true
+                                                $r.AclSource               = "registry-parent-delete-recreate"
+                                            }
+                                        } elseif (($r.CanDeleteSelf -or $pEval.CanWriteDacOrOwner) -and ($pEval.CanCreateSubKeyMed -or $pEval.CanCreateSubKeyLow -or $pEval.CanWriteDacOrOwner)) {
+                                            $r.CanDeleteOrReplace = $true
+                                            if (-not $r.WritableByMediumILAdmin) {
+                                                $r.WritableByMediumILAdmin = $true
+                                                $r.WritableByHighILAdmin   = $true
+                                                $r.AclSource               = "registry-parent-delete-recreate"
+                                            }
+                                        }
+                                    }
+                                    if ($pEval.WritableByLowPriv -or $pEval.CanWriteDacOrOwnerLow -or $pEval.CanCreateRegLink) {
+                                        $r.HasWritableAncestor  = $true
+                                        $r.WritableAncestorPath = "$($regResult.RootName)\$parentSub"
+                                        if (-not $r.WritableByLowPriv) {
+                                            $r.WritableByLowPriv       = $true
+                                            $r.WritableByMediumILAdmin = $true
+                                            $r.WritableByHighILAdmin   = $true
+                                            $r.AclSource               = "registry-ancestor-replaceable"
+                                        }
+                                        break
+                                    }
+                                } finally {
+                                    $pKey.Close()
+                                }
+                            }
+                        } catch {}
+                        $ancSub = $parentSub
+                        $ancDepth++
+                    }
                 }
             } else {
                 if ($regResult.RootName -eq 'HKCU' -or $regResult.RootName -eq 'HKU') {
@@ -1792,6 +2109,7 @@ function Get-PathWritability {
         # Filesystem: pick the right ACL bearer (100% read-only; NEVER opens or writes to files).
         $aclTarget = $null
         $treatAsExistingFile = $false
+        $treatAsExistingDir  = $false
         $immediateParent = [System.IO.Path]::GetDirectoryName($TargetPath)
         $immExists = (-not [string]::IsNullOrWhiteSpace($immediateParent)) -and [System.IO.Directory]::Exists($immediateParent)
         if ([System.IO.File]::Exists($TargetPath)) {
@@ -1800,6 +2118,7 @@ function Get-PathWritability {
             $r.AclSource = "exact-file"
         } elseif ([System.IO.Directory]::Exists($TargetPath)) {
             $aclTarget = $TargetPath
+            $treatAsExistingDir = $true
             $r.AclSource = "exact-directory"
         } else {
             $dir = $immediateParent
@@ -1845,7 +2164,7 @@ function Get-PathWritability {
                         elseif ($mlTok -eq 'HI' -or $mlTok -eq 'S-1-16-12288') { $r.IntegrityLabel = "High" }
                         elseif ($mlTok -eq 'LW' -or $mlTok -eq 'S-1-16-4096') {
                             $r.IntegrityLabel = "Low"
-                            if ($r.WritableByLowPriv) { $r.WritableByAppContainer = $true }
+                            if ($r.WritableByLowPriv -or $r.HasExplicitAppContainerAce) { $r.WritableByAppContainer = $true }
                         }
                     }
                 } catch {}
@@ -1854,11 +2173,17 @@ function Get-PathWritability {
             if ($r.IntegrityLabel -eq "High" -or $r.IntegrityLabel -eq "System") {
                 $r.WritableByLowPriv       = $false
                 $r.WritableByMediumILAdmin = $false
+                $r.WritableByAppContainer  = $false
                 $r.CanDeleteSelf           = $false
+                $r.CanDeleteSelfLow        = $false
                 $r.CanDeleteChild          = $false
+                $r.CanDeleteChildLow       = $false
                 $r.CanCreateFilesLow       = $false
                 $r.CanCreateDirsLow        = $false
+                $r.CanCreateFilesMed       = $false
+                $r.CanCreateDirsMed        = $false
                 $r.CanWriteDacOrOwner      = $false
+                $r.CanWriteDacOrOwnerLow   = $false
             }
 
             # When the target does not exist (AclSource = ancestor):
@@ -1866,37 +2191,80 @@ function Get-PathWritability {
             # - If intermediate directories are missing, creating the missing subdirectory requires FILE_ADD_SUBDIRECTORY (0x4).
             if ($r.AclSource -eq "ancestor") {
                 if ($immExists) {
-                    if (-not $r.CanCreateFilesLow) {
-                        $r.WritableByLowPriv       = $false
+                    if (-not ($r.CanCreateFilesLow -or $r.CanWriteDacOrOwnerLow)) {
+                        $r.WritableByLowPriv = $false
+                    }
+                    if (-not ($r.CanCreateFilesMed -or $r.CanCreateFilesLow -or $r.CanWriteDacOrOwner)) {
                         $r.WritableByMediumILAdmin = $false
                     }
                 } else {
-                    if (-not $r.CanCreateDirsLow) {
-                        $r.WritableByLowPriv       = $false
+                    if (-not ($r.CanCreateDirsLow -or $r.CanWriteDacOrOwnerLow)) {
+                        $r.WritableByLowPriv = $false
+                    }
+                    if (-not ($r.CanCreateDirsMed -or $r.CanCreateDirsLow -or $r.CanWriteDacOrOwner)) {
                         $r.WritableByMediumILAdmin = $false
-                    } elseif (-not (Test-TopLevelProtectedRoot -DirPath $aclTarget)) {
+                    }
+                    if ($r.WritableByLowPriv -or $r.WritableByMediumILAdmin) {
+                        $baseClean = $aclTarget.TrimEnd('\')
+                        $relTail = if ($TargetPath.Length -gt $baseClean.Length) { $TargetPath.Substring($baseClean.Length).TrimStart('\') } else { "" }
+                        $firstSeg = ($relTail -split '\\')[0]
+                        $firstMissingDir = if ($firstSeg) { "$baseClean\$firstSeg" } else { $aclTarget }
                         $r.HasWritableAncestor  = $true
-                        $r.WritableAncestorPath = $aclTarget
+                        $r.WritableAncestorPath = $firstMissingDir
                     }
                 }
             }
         }
 
         # Ancestor-Chain & Parent Delete-Recreate Walk (rev 3.4, 100% read-only):
-        # 1. If the target is an existing file that isn't directly writable, check if its
-        #    immediate parent directory allows FILE_ADD_FILE (CanCreateFilesLow) AND either
-        #    the file grants DELETE or the parent grants FILE_DELETE_CHILD (0x40).
+        # 1. If the target is an existing file or directory that isn't directly writable, check if its
+        #    immediate parent directory allows creating the replacement AND either the target grants
+        #    DELETE (0x10000) or the parent grants FILE_DELETE_CHILD (0x40) or WRITE_DAC/Owner.
         # 2. Walk existing intermediate ancestor directories (below top-level roots) to detect
-        #    whether an existing intermediate directory can be deleted/renamed and replaced.
+        #    whether an existing intermediate directory can be deleted/renamed and recreated (Method A)
+        #    or emptied in-place and converted into an NTFS junction via FSCTL_SET_REPARSE_POINT (Method B).
         if ($immExists -and -not (Test-TopLevelProtectedRoot -DirPath $immediateParent)) {
             $parentEval = Get-DirectoryWritabilityCached -DirPath $immediateParent -UserContext $UserContext
-            if ($treatAsExistingFile -and ($r.CanDeleteSelf -or $parentEval.CanDeleteChild) -and $parentEval.CanCreateFilesLow) {
-                $r.CanDeleteOrReplace = $true
-                if (-not $r.WritableByLowPriv) {
-                    $r.WritableByLowPriv       = $true
-                    $r.WritableByMediumILAdmin = $true
-                    $r.WritableByHighILAdmin   = $true
-                    $r.AclSource               = "parent-delete-recreate"
+            if ($treatAsExistingFile) {
+                if (($r.CanDeleteSelfLow -or $parentEval.CanDeleteChildLow -or $parentEval.CanWriteDacOrOwnerLow) -and ($parentEval.CanCreateFilesLow -or $parentEval.CanWriteDacOrOwnerLow)) {
+                    $r.CanDeleteOrReplace = $true
+                    if (-not $r.WritableByLowPriv) {
+                        $r.WritableByLowPriv       = $true
+                        $r.WritableByMediumILAdmin = $true
+                        $r.WritableByHighILAdmin   = $true
+                        $r.AclSource               = "parent-delete-recreate"
+                    }
+                    if ($parentEval.WritableByAppContainer -and ($r.IntegrityLabel -eq "Low")) {
+                        $r.WritableByAppContainer = $true
+                    }
+                } elseif (($r.CanDeleteSelf -or $parentEval.CanDeleteChild -or $parentEval.CanWriteDacOrOwner) -and ($parentEval.CanCreateFilesMed -or $parentEval.CanCreateFilesLow -or $parentEval.CanWriteDacOrOwner)) {
+                    $r.CanDeleteOrReplace = $true
+                    if (-not $r.WritableByMediumILAdmin) {
+                        $r.WritableByMediumILAdmin = $true
+                        $r.WritableByHighILAdmin   = $true
+                        $r.AclSource               = "parent-delete-recreate"
+                    }
+                }
+            } elseif ($treatAsExistingDir -and -not (Test-TopLevelProtectedRoot -DirPath $TargetPath)) {
+                if (($r.CanDeleteSelfLow -or $parentEval.CanDeleteChildLow -or $parentEval.CanWriteDacOrOwnerLow) -and ($parentEval.CanCreateDirsLow -or $parentEval.CanWriteDacOrOwnerLow)) {
+                    $r.CanDeleteOrReplace   = $true
+                    $r.HasWritableAncestor  = $true
+                    $r.WritableAncestorPath = $TargetPath
+                    if (-not $r.WritableByLowPriv) {
+                        $r.WritableByLowPriv       = $true
+                        $r.WritableByMediumILAdmin = $true
+                        $r.WritableByHighILAdmin   = $true
+                        $r.AclSource               = "dir-delete-recreate"
+                    }
+                } elseif (($r.CanDeleteSelf -or $parentEval.CanDeleteChild -or $parentEval.CanWriteDacOrOwner) -and ($parentEval.CanCreateDirsMed -or $parentEval.CanCreateDirsLow -or $parentEval.CanWriteDacOrOwner)) {
+                    $r.CanDeleteOrReplace   = $true
+                    $r.HasWritableAncestor  = $true
+                    $r.WritableAncestorPath = $TargetPath
+                    if (-not $r.WritableByMediumILAdmin) {
+                        $r.WritableByMediumILAdmin = $true
+                        $r.WritableByHighILAdmin   = $true
+                        $r.AclSource               = "dir-delete-recreate"
+                    }
                 }
             }
         }
@@ -1906,21 +2274,31 @@ function Get-PathWritability {
         while (-not [string]::IsNullOrWhiteSpace($ancDir) -and $ancDepth -lt 16) {
             if (Test-TopLevelProtectedRoot -DirPath $ancDir) { break }
             if ([System.IO.Directory]::Exists($ancDir)) {
+                $ancEval = Get-DirectoryWritabilityCached -DirPath $ancDir -UserContext $UserContext
                 $ancParent = [System.IO.Path]::GetDirectoryName($ancDir)
-                if (-not [string]::IsNullOrWhiteSpace($ancParent) -and [System.IO.Directory]::Exists($ancParent)) {
-                    $ancEval = Get-DirectoryWritabilityCached -DirPath $ancDir -UserContext $UserContext
-                    $ancParentEval = Get-DirectoryWritabilityCached -DirPath $ancParent -UserContext $UserContext
-                    if (($ancEval.CanDeleteSelf -or $ancParentEval.CanDeleteChild) -and $ancParentEval.CanCreateDirsLow) {
-                        $r.HasWritableAncestor  = $true
-                        $r.WritableAncestorPath = $ancDir
-                        if (-not $r.WritableByLowPriv) {
-                            $r.WritableByLowPriv       = $true
-                            $r.WritableByMediumILAdmin = $true
-                            $r.WritableByHighILAdmin   = $true
-                            $r.AclSource               = "ancestor-dir-replaceable"
-                        }
-                        break
+                $ancParentEval = if (-not [string]::IsNullOrWhiteSpace($ancParent) -and [System.IO.Directory]::Exists($ancParent)) {
+                    Get-DirectoryWritabilityCached -DirPath $ancParent -UserContext $UserContext
+                } else { $null }
+
+                $canMethodA = ($null -ne $ancParentEval) -and `
+                              ($ancEval.CanDeleteSelfLow -or $ancEval.CanWriteDacOrOwnerLow -or $ancParentEval.CanDeleteChildLow -or $ancParentEval.CanWriteDacOrOwnerLow) -and `
+                              ($ancParentEval.CanCreateDirsLow -or $ancParentEval.CanWriteDacOrOwnerLow)
+                $canMethodB = ($ancEval.CanDeleteChildLow -or $ancEval.CanWriteDacOrOwnerLow) -and `
+                              ($ancEval.CanCreateFilesLow -or $ancEval.CanWriteDacOrOwnerLow)
+
+                if ($canMethodA -or $canMethodB) {
+                    $r.HasWritableAncestor  = $true
+                    $r.WritableAncestorPath = $ancDir
+                    if (-not $r.WritableByLowPriv) {
+                        $r.WritableByLowPriv       = $true
+                        $r.WritableByMediumILAdmin = $true
+                        $r.WritableByHighILAdmin   = $true
+                        $r.AclSource               = "ancestor-dir-replaceable"
                     }
+                    if ($ancEval.WritableByAppContainer) {
+                        $r.WritableByAppContainer = $true
+                    }
+                    break
                 }
             }
             $ancDir = [System.IO.Path]::GetDirectoryName($ancDir)
@@ -1935,10 +2313,11 @@ function Get-PathWritability {
 }
 
 # Return the lowest-privilege perspective at which the path is writable.
-# That value is what the analyzer maps to LPE / UAC_Bypass / Admin_To_System.
+# That value is what the analyzer maps to LPE / Sandbox_Escape / UAC_Bypass / Admin_To_System.
 function Get-LowestWritablePerspective {
     param([hashtable]$Writability)
     if ($Writability.WritableByLowPriv)       { return "LowPriv" }
+    if ($Writability.WritableByAppContainer)  { return "AppContainer" }
     if ($Writability.WritableByMediumILAdmin) { return "MediumILAdmin" }
     if ($Writability.WritableByHighILAdmin)   { return "HighILAdmin" }
     return "None"
@@ -1968,12 +2347,59 @@ foreach ($canonical in $canonicalPaths) {
 
     $rec = $pathProcessMap[$canonical]
     $displayPath = $rec.Path
+    $bestEvt = $rec.BestEvent
 
-    $writability = Get-PathWritability -TargetPath $displayPath -UserContext $userContext -HasNameNotFound ([bool]$rec.HasNameNotFound)
+    $writability = Get-PathWritability -TargetPath $displayPath -UserContext $userContext -HasNameNotFound ([bool]$rec.HasNameNotFound) -Operation ([string]$bestEvt.Operation)
     $lowestPersp = Get-LowestWritablePerspective -Writability $writability
 
-    # Skip paths writable by NONE of our perspectives (unless they carry a RegistryDataPath reference).
-    if ($lowestPersp -eq "None" -and $rec.RegistryDataPaths.Count -eq 0) { continue }
+    # Evaluate full multi-mechanism writability of any filesystem/UNC target referenced in Registry Data:
+    $regDataTarget                     = ""
+    $regDataTargetExists               = $false
+    $regDataTargetWritableLow          = $false
+    $regDataTargetWritableMed          = $false
+    $regDataTargetWritableHigh         = $false
+    $regDataTargetWritableAC           = $false
+    $regDataTargetWritableFrom         = "None"
+    $regDataTargetAclSource            = "none"
+    $regDataTargetCanDeleteOrReplace   = $false
+    $regDataTargetHasWritableAncestor  = $false
+    $regDataTargetWritableAncestorPath = ""
+    $regDataTargetCanWriteDacOrOwner   = $false
+
+    if ($rec.RegistryDataPaths.Count -gt 0) {
+        $bestRdpRank = 99
+        foreach ($rdp in $rec.RegistryDataPaths) {
+            if ([string]::IsNullOrWhiteSpace($rdp)) { continue }
+            $rdpExists = ([System.IO.File]::Exists($rdp) -or [System.IO.Directory]::Exists($rdp))
+            $rdpW = Get-PathWritability -TargetPath $rdp -UserContext $userContext -HasNameNotFound (-not $rdpExists)
+            $rdpPersp = Get-LowestWritablePerspective -Writability $rdpW
+            $rdpRank = switch ($rdpPersp) {
+                "LowPriv"       { 1 }
+                "AppContainer"  { 2 }
+                "MediumILAdmin" { 3 }
+                "HighILAdmin"   { 4 }
+                default         { 99 }
+            }
+            if ($rdpRank -lt $bestRdpRank -or [string]::IsNullOrEmpty($regDataTarget)) {
+                $bestRdpRank                       = $rdpRank
+                $regDataTarget                     = $rdp
+                $regDataTargetExists               = $rdpExists
+                $regDataTargetWritableLow          = [bool]$rdpW.WritableByLowPriv
+                $regDataTargetWritableMed          = [bool]$rdpW.WritableByMediumILAdmin
+                $regDataTargetWritableHigh         = [bool]$rdpW.WritableByHighILAdmin
+                $regDataTargetWritableAC           = [bool]$rdpW.WritableByAppContainer
+                $regDataTargetWritableFrom         = $rdpPersp
+                $regDataTargetAclSource            = $rdpW.AclSource
+                $regDataTargetCanDeleteOrReplace   = [bool]$rdpW.CanDeleteOrReplace
+                $regDataTargetHasWritableAncestor  = [bool]$rdpW.HasWritableAncestor
+                $regDataTargetWritableAncestorPath = $rdpW.WritableAncestorPath
+                $regDataTargetCanWriteDacOrOwner   = [bool]$rdpW.CanWriteDacOrOwner
+            }
+        }
+    }
+
+    # Skip paths writable by NONE of our perspectives (unless their referenced RegistryDataTarget is writable or a Service SID holds write rights).
+    if ($lowestPersp -eq "None" -and $regDataTargetWritableFrom -eq "None" -and (@($writability.WritableServiceSids).Count -eq 0)) { continue }
 
     # Whether the running token can ACTUALLY write (informational; depends on
     # current process IL + admin status).
@@ -1988,16 +2414,16 @@ foreach ($canonical in $canonicalPaths) {
 
     $relatedProcesses = ($rec.Processes -join ", ")
     $operationsList   = ($rec.Operations -join ", ")
-    $bestEvt = $rec.BestEvent
     $cmdLineEntries = @()
     foreach ($pn in $rec.Processes) {
         if ($null -ne $processLineageMap -and $processLineageMap.ContainsKey($pn)) {
             $cmdLineEntries += "$pn`: $($processLineageMap[$pn])"
         }
     }
-    $processCommandLines = ($cmdLineEntries -join " | ")
-    $regDataPathList     = ($rec.RegistryDataPaths -join "; ")
-    $hasVerifyThenLoad   = ([bool]$rec.HasReadOrCheckOp -and [bool]$rec.HasLoadOrExecOp)
+    $processCommandLines     = ($cmdLineEntries -join " | ")
+    $regDataPathList         = ($rec.RegistryDataPaths -join "; ")
+    $hasVerifyThenLoad       = ([bool]$rec.HasVerifyThenLoad -or ([bool]$rec.HasReadOrCheckOp -and [bool]$rec.HasLoadOrExecOp))
+    $hasReparseCheckThenUse  = [bool]$rec.HasReparseCheckThenUse
 
     # User-only-consumed filter: every observed process is the current user's
     # own session and no privileged actor touches the path. The redirect
@@ -2050,7 +2476,20 @@ foreach ($canonical in $canonicalPaths) {
         HasBufferOverflow       = [bool]$rec.HasBufferOverflow
         HasSharedWriteOrDelete  = [bool]$rec.HasSharedWriteOrDelete
         HasVerifyThenLoad       = [bool]$hasVerifyThenLoad
+        HasReparseCheckThenUse  = [bool]$hasReparseCheckThenUse
         RegistryDataPath        = $regDataPathList
+        RegistryDataTarget                     = $regDataTarget
+        RegistryDataTargetExists               = [bool]$regDataTargetExists
+        RegistryDataTargetWritableByLowPriv    = [bool]$regDataTargetWritableLow
+        RegistryDataTargetWritableByMediumILAdmin = [bool]$regDataTargetWritableMed
+        RegistryDataTargetWritableByHighILAdmin = [bool]$regDataTargetWritableHigh
+        RegistryDataTargetWritableByAppContainer = [bool]$regDataTargetWritableAC
+        RegistryDataTargetWritableFrom         = $regDataTargetWritableFrom
+        RegistryDataTargetAclSource            = $regDataTargetAclSource
+        RegistryDataTargetCanDeleteOrReplace   = [bool]$regDataTargetCanDeleteOrReplace
+        RegistryDataTargetHasWritableAncestor  = [bool]$regDataTargetHasWritableAncestor
+        RegistryDataTargetWritableAncestorPath = $regDataTargetWritableAncestorPath
+        RegistryDataTargetCanWriteDacOrOwner   = [bool]$regDataTargetCanWriteDacOrOwner
         IsUserOnlyConsumer      = $userOnlyConsumer
         # Perspective-aware writability (rev 3 / rev 3.4)
         WritableByLowPriv       = $writability.WritableByLowPriv

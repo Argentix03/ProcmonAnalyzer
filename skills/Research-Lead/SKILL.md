@@ -121,7 +121,8 @@ The script `scripts/Get-ResearchPromptForPrimitive.ps1` returns the right prompt
 
 | Primitive(s) | Prompt |
 |---|---|
-| `SMB_Coercion`, `Oplock_ArbitraryWrite`, `Pipe_Plant_Redirect`, `Pipe_Hijack`, `Registry_Coercion`, `Binary_Plant_*`, `SxS_DotLocal`, `Dependency_Hijack`, `Config_Poison`, `AppExecAlias_Plant`, `PowerShell_Profile`, `Electron_AsarTamper` | `LPE_Research_Prompt.md` |
+| `SMB_Coercion`, `Oplock_ArbitraryWrite`, `Pipe_Plant_Redirect`, `Pipe_Hijack`, `Pipe_Instance_Squat`, `Pipe_Client_IPC_Sink`, `Registry_Coercion`, `Registry_BufferOverflow_TOCTOU`, `Registry_Data_Path_Reference`, `Binary_Plant_*`, `File_DeleteChild_Recreate`, `SxS_DotLocal`, `Dependency_Hijack`, `Config_Poison`, `AppExecAlias_Plant`, `PowerShell_Profile`, `Electron_AsarTamper`, `ACL_WriteDac_WriteOwner`, `Arbitrary_DACL_Overwrite`, `Arbitrary_Delete_ConfigMsi_LPE`, `Arbitrary_Move_FileRename`, `Parent_Directory_Reparse_Bypass`, `BackupSemantics_DACL_Bypass`, `Signature_TOCTOU_Bypass`, `CheckThenUse_Reparse_TOCTOU`, `COM_HKLM_Hijack` | `LPE_Research_Prompt.md` |
+| `AppContainer_Sandbox_Escape` | `SandboxEscape_Research_Prompt.md` |
 | `COM_Hijack_HKCU`, `Env_Hijack_HKCU` | `UAC_Bypass_Research_Prompt.md` |
 | `URL_NTLM_Coerce`, `Theme_NTLM_Coerce`, `DesktopIni_Coerce`, `WebShell_Plant`, `LNK_Hijack`, `Cert_Plant` | `RCE_LateralMovement_Research_Prompt.md` |
 | `LOLBin_Proxy`, `AutoRun_Persistence` | `ProxyExecution_LOLBin_Research_Prompt.md` |

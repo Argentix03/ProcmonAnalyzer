@@ -129,6 +129,9 @@ function Get-EscalationCategory {
     # Primitive overrides — some primitives are inherently a specific category,
     # gated by the writability perspective so HighILAdmin-only paths are never
     # misclassified as low-priv LPEs.
+    if ($primitive -eq 'AppContainer_Sandbox_Escape' -or $writableFrom -eq 'AppContainer') {
+        return 'Sandbox_Escape'
+    }
     if ($primitive -in @('COM_Hijack_HKCU','Env_Hijack_HKCU')) { return 'UAC_Bypass' }
     if ($primitive -in @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant')) {
         if ($writableFrom -eq 'LowPriv')       { return 'LPE' }
@@ -141,9 +144,10 @@ function Get-EscalationCategory {
     if ($primitive -in @('LOLBin_Proxy','AutoRun_Persistence')) {
         return 'Proxy_Execution'
     }
-    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Binary_Plant_HighPriv','Pipe_Hijack','Pipe_Instance_Squat','Pipe_Client_IPC_Sink','Config_Poison','Parent_Directory_Reparse_Bypass','File_DeleteChild_Recreate','Arbitrary_Delete_ConfigMsi_LPE','Arbitrary_DACL_Overwrite','Arbitrary_Move_FileRename','ACL_WriteDac_WriteOwner','Signature_TOCTOU_Bypass','BackupSemantics_DACL_Bypass','Registry_BufferOverflow_TOCTOU','Registry_Data_Path_Reference')) {
+    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Binary_Plant_HighPriv','Pipe_Hijack','Pipe_Instance_Squat','Pipe_Client_IPC_Sink','Config_Poison','Parent_Directory_Reparse_Bypass','File_DeleteChild_Recreate','Arbitrary_Delete_ConfigMsi_LPE','Arbitrary_DACL_Overwrite','Arbitrary_Move_FileRename','ACL_WriteDac_WriteOwner','Signature_TOCTOU_Bypass','CheckThenUse_Reparse_TOCTOU','BackupSemantics_DACL_Bypass','Registry_BufferOverflow_TOCTOU','Registry_Data_Path_Reference','COM_HKLM_Hijack')) {
         switch ($writableFrom) {
             'LowPriv'       { return 'LPE' }
+            'AppContainer'  { return 'Sandbox_Escape' }
             'MediumILAdmin' { return 'UAC_Bypass' }
             'HighILAdmin'   { if ($consumerSystemTI -or $consumerUnknown) { return 'Admin_To_System' } else { return 'Same_Level' } }
             default         { return 'LPE' }
@@ -152,6 +156,7 @@ function Get-EscalationCategory {
 
     switch ($writableFrom) {
         'LowPriv'        { if ($consumerHighIL -or $consumerUnknown) { return 'LPE' }             else { return 'Same_Level' } }
+        'AppContainer'   { return 'Sandbox_Escape' }
         'MediumILAdmin'  { if ($consumerHighIL -or $consumerUnknown) { return 'UAC_Bypass' }      else { return 'Same_Level' } }
         'HighILAdmin'    { if ($consumerSystemTI)                    { return 'Admin_To_System' } else { return 'Same_Level' } }
         default          { return 'Unknown' }
@@ -164,6 +169,7 @@ function Get-ResearchPromptIdForCategory {
     param([string]$category, [string]$primitive)
     switch ($category) {
         'LPE'              { return 'lpe' }
+        'Sandbox_Escape'   { return 'sandbox_escape' }
         'UAC_Bypass'       { return 'uac' }
         'Admin_To_System'  { return 'admin_kernel' }
         'RCE_Lateral'      { return 'rce_lateral' }
@@ -301,6 +307,7 @@ foreach ($entry in $rawData) {
     $hasOpenForBackup = [bool](Get-FieldValue $entry "HasOpenForBackup" $false) -or [bool](Get-FieldValue $entry "OpenForBackup" $false) -or ($detail -match '(?i)Open\s*For\s*Backup')
     $hasBufferOverflow = [bool](Get-FieldValue $entry "HasBufferOverflow" $false) -or ($result -match '(?i)BUFFER OVERFLOW|MORE DATA')
     $hasVerifyThenLoad = [bool](Get-FieldValue $entry "HasVerifyThenLoad" $false)
+    $hasReparseCheckThenUse = [bool](Get-FieldValue $entry "HasReparseCheckThenUse" $false)
     $canWriteDacOrOwner = [bool](Get-FieldValue $entry "CanWriteDacOrOwner" $false)
     $canDeleteOrReplace = [bool](Get-FieldValue $entry "CanDeleteOrReplace" $false)
     $hasWritableAncestor = [bool](Get-FieldValue $entry "HasWritableAncestor" $false)
@@ -308,9 +315,47 @@ foreach ($entry in $rawData) {
     $hasPipeInstField  = ($null -ne (Get-FieldValue $entry "CanCreatePipeInstance" $null))
     $canCreatePipeInst = if ($hasPipeInstField) { [bool](Get-FieldValue $entry "CanCreatePipeInstance" $true) } else { $true }
     $canWritePipeClient = [bool](Get-FieldValue $entry "CanWritePipeClient" $true)
+    $writableAppContainer = [bool](Get-FieldValue $entry "WritableByAppContainer" $false)
+    $writableServiceSids  = @(Get-FieldValue $entry "WritableServiceSids" @() | Where-Object { $_ })
     $regDataPath       = Get-FieldValue $entry "RegistryDataPath" ""
-    if ([string]::IsNullOrWhiteSpace($regDataPath) -and $detail -match '(?i)\bData:\s*"?([a-zA-Z]:\\[^"\r\n,;]+|\\\\[^"\r\n,;]+)') {
+    if ([string]::IsNullOrWhiteSpace($regDataPath) -and $detail -match '(?i)\bData:\s*"?([a-zA-Z]:\\[^"\r\n,;]+|\\\\[^"\r\n,;]+|%[a-zA-Z0-9_()]+%\\[^"\r\n,;]+)') {
         $regDataPath = $matches[1].Trim()
+    }
+    $regDataTarget                     = Get-FieldValue $entry "RegistryDataTarget" ""
+    $regDataTargetExists               = [bool](Get-FieldValue $entry "RegistryDataTargetExists" $false)
+    $regDataTargetWritableLow          = [bool](Get-FieldValue $entry "RegistryDataTargetWritableByLowPriv" $false)
+    $regDataTargetWritableMed          = [bool](Get-FieldValue $entry "RegistryDataTargetWritableByMediumILAdmin" $false)
+    $regDataTargetWritableHigh         = [bool](Get-FieldValue $entry "RegistryDataTargetWritableByHighILAdmin" $false)
+    $regDataTargetWritableAC           = [bool](Get-FieldValue $entry "RegistryDataTargetWritableByAppContainer" $false)
+    $regDataTargetWritableFrom         = Get-FieldValue $entry "RegistryDataTargetWritableFrom" ""
+    $regDataTargetAclSource            = Get-FieldValue $entry "RegistryDataTargetAclSource" "none"
+    $regDataTargetCanDeleteOrReplace   = [bool](Get-FieldValue $entry "RegistryDataTargetCanDeleteOrReplace" $false)
+    $regDataTargetHasWritableAncestor  = [bool](Get-FieldValue $entry "RegistryDataTargetHasWritableAncestor" $false)
+    $regDataTargetWritableAncestorPath = Get-FieldValue $entry "RegistryDataTargetWritableAncestorPath" ""
+    $regDataTargetCanWriteDacOrOwner   = [bool](Get-FieldValue $entry "RegistryDataTargetCanWriteDacOrOwner" $false)
+
+    if ([string]::IsNullOrWhiteSpace($regDataTarget) -and -not [string]::IsNullOrWhiteSpace($regDataPath)) {
+        $candRdp = ($regDataPath -split ';')[0].Trim().Trim('"')
+        if ($candRdp -match '%') {
+            try { $candRdp = [Environment]::ExpandEnvironmentVariables($candRdp) } catch {}
+        }
+        if ($candRdp -match '^(?i)([a-z]:\\.+?\.(?:exe|dll|sys|bat|cmd|ps1|psm1|vbs|js|wsf|hta|msi|msp|ocx|cpl|scr|msc|com|jar|config|xml|json|ini|inf|cer|crt|pfx|lnk|url)|\\\\.+?\.(?:exe|dll|sys|bat|cmd|ps1|psm1|vbs|js|wsf|hta|msi|msp|ocx|cpl|scr|msc|com|jar|config|xml|json|ini|inf|cer|crt|pfx|lnk|url))(?:\s+.*)?$') {
+            $candRdp = $matches[1].Trim()
+        }
+        $regDataTarget = $candRdp
+    }
+    if (-not [string]::IsNullOrWhiteSpace($regDataTarget) -and [string]::IsNullOrWhiteSpace($regDataTargetWritableFrom)) {
+        $isProtectedSysTarget = ($regDataTarget -match '^(?i)[a-z]:\\(Windows\\(System32|SysWOW64|WinSxS|servicing|Boot|Fonts)|Program Files|Program Files \(x86\))\\')
+        if (-not $isProtectedSysTarget) {
+            $regDataTargetWritableLow  = $true
+            $regDataTargetWritableMed  = $true
+            $regDataTargetWritableHigh = $true
+            $regDataTargetWritableFrom = "LowPriv"
+            if ($regDataTargetAclSource -eq "none") { $regDataTargetAclSource = "referenced-target" }
+        } else {
+            $regDataTargetWritableHigh = $true
+            $regDataTargetWritableFrom = "HighILAdmin"
+        }
     }
 
     # Perspective-aware writability fields (rev 3 parser). Backwards compat:
@@ -604,6 +649,26 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
+    # RULE 1.9b: Machine-Wide / HKCR COM Server Hijack (COM_HKLM_Hijack)
+    # ─────────────────────────────────────────────────────────────────────────
+    $isHklmComPath = ($path -match "(?i)^(HKLM\\SOFTWARE\\(Wow6432Node\\)?Classes|HKCR)\\(Wow6432Node\\)?(CLSID|Interface|TypeLib|AppID)\\\{[0-9a-fA-F-]+\}")
+    if (-not $isDirectLead -and $isHklmComPath -and ($isPrivileged -or $isPrivilegedAny -or $anyImpersonating) -and ($writableLow -or $writableMed -or $canDeleteOrReplace -or $hasWritableAncestor -or $regDataTargetWritableLow -or $regDataTargetWritableMed)) {
+        $severity = "Critical"
+        $type = "Machine-Wide COM Registration / Server Hijack"
+        $exploitPrimitive = "COM_HKLM_Hijack"
+        if ($writableLow -or $writableMed -or $canDeleteOrReplace -or $hasWritableAncestor) {
+            $reason = "Privileged process ($effectiveIntegrity) queries a machine-wide COM registration key whose DACL, parent key, or ancestor key is modifiable by a non-admin or medium-IL principal (AclSource=$aclSource). Modifying InprocServer32 / LocalServer32 / TreatAs hijacks COM activation across all sessions without requiring HKCU impersonation. Effective principal: $effectivePrincipal."
+        } else {
+            $reason = "Privileged process ($effectiveIntegrity) queries a read-only HKLM/HKCR COM registration whose server path ('$regDataTarget') is controllable by '$regDataTargetWritableFrom' (TargetAclSource=$regDataTargetAclSource). Replacing or planting the referenced COM server binary hijacks privileged COM activation. Effective principal: $effectivePrincipal."
+            $writableFrom = $regDataTargetWritableFrom
+            $writableLow  = $regDataTargetWritableLow
+            $writableMed  = $regDataTargetWritableMed
+            $writableAppContainer = $regDataTargetWritableAC
+        }
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
     # RULE 1.10: HKCU\Environment hijack (SilentCleanup-class UAC bypass family)
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and ($writableLow -or $writableMed) -and $path -match "(?i)^(HKCU|HKEY_CURRENT_USER|HKU\\[^\\]+)\\Environment(\\|$)") {
@@ -633,22 +698,37 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 2.0a: Signature Verification TOCTOU (Verify-then-Load without Lock)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $hasVerifyThenLoad -and ($isPrivileged -or $isPrivilegedAny) -and ($writableLow -or $writableMed) -and $path -match "\.(exe|dll|sys|msi|msp|ocx|cpl|cab|cat)$") {
+    if (-not $isDirectLead -and $hasVerifyThenLoad -and ($isPrivileged -or $isPrivilegedAny) -and ($writableLow -or $writableMed -or $canDeleteOrReplace -or $hasWritableAncestor -or $canWriteDacOrOwner) -and $isFsPath -and $path -match "\.(exe|dll|sys|msi|msp|ocx|cpl|cab|cat|ps1|vbs|js)$") {
         $severity = "Critical"
         $type = "Signature Verification TOCTOU (Verify-then-Load without Exclusive Lock)"
         $exploitPrimitive = "Signature_TOCTOU_Bypass"
-        $reason = "Trace shows a privileged read/verification event followed by an execution or image load on a writable binary where an open permitted concurrent write/delete sharing. Because the file handle was not locked exclusively across verification and load, the file can be modified between signature check and load. Effective principal: $effectivePrincipal."
+        $reason = "Trace shows a privileged read/verification event followed by an execution or image load on a user-controllable binary (AclSource=$aclSource) where an open permitted concurrent modification or handle closure between check and load. Because the file or parent directory is not locked exclusively across verification and execution, the target can be swapped (via direct write, parent delete+recreate, or ancestor junction) after signature validation succeeds. Effective principal: $effectivePrincipal."
         $isDirectLead = $true
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 2.0b: Read-Only File Replaceable via Parent FILE_DELETE_CHILD
+    # RULE 2.0b: Read-Only Object Replaceable via Parent Delete-Child / Recreate
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $canDeleteOrReplace -and ($isPrivileged -or $isPrivilegedAny) -and $isFsPath) {
+    if (-not $isDirectLead -and $canDeleteOrReplace -and ($isPrivileged -or $isPrivilegedAny)) {
         $severity = "Critical"
-        $type = "Read-Only File Replaceable via Parent Delete-Child"
+        $type = "Read-Only Target Replaceable via Parent Delete-and-Recreate"
         $exploitPrimitive = "File_DeleteChild_Recreate"
-        $reason = "Target file DACL is not directly writable, but its parent directory grants FILE_DELETE_CHILD (0x40) and FILE_ADD_FILE (0x2) to a non-admin principal (AclSource=$aclSource). Under Windows NTFS semantics, POSIX-style unlinking or deletion and recreation replaces the read-only file consumed by a privileged process ($effectiveIntegrity). Effective principal: $effectivePrincipal."
+        if ($isFsPath) {
+            $reason = "Target DACL is not directly writable, but the object grants DELETE (0x10000) or its parent directory grants FILE_DELETE_CHILD (0x40) / WRITE_DAC alongside creation rights (AclSource=$aclSource). Under Windows NTFS semantics, POSIX-style unlinking/renaming and recreation replaces the read-only file or directory consumed by a privileged process ($effectiveIntegrity). Effective principal: $effectivePrincipal."
+        } else {
+            $reason = "Target registry key DACL denies direct value modification, but the key grants DELETE (0x10000) and its parent key grants KEY_CREATE_SUB_KEY (0x4) to a non-admin principal (AclSource=$aclSource). Deleting and recreating the subkey grants Creator Owner FullControl (and REG_LINK creation rights) over a key consumed by a privileged process ($effectiveIntegrity). Effective principal: $effectivePrincipal."
+        }
+        $isDirectLead = $true
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 2.0c: Check-Then-Use Reparse Point TOCTOU Race
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $isPrivileged -and ($hasReparseCheckThenUse -or ($anyOpenRP -and (-not $allOpenRP) -and ($anyPrivWrite -or $hasDeleteOp -or $hasSetSecurityOp))) -and ($writableLow -or $writableMed -or $canDeleteOrReplace -or $hasWritableAncestor) -and $isFsPath) {
+        $severity = "Critical"
+        $type = "Check-Then-Use Reparse Point TOCTOU Race"
+        $exploitPrimitive = "CheckThenUse_Reparse_TOCTOU"
+        $reason = "Privileged process ($effectiveIntegrity) first probes the path with FILE_OPEN_REPARSE_POINT (e.g., GetFileAttributesW / QueryOpen to check for symlinks/junctions) and subsequently opens the same path WITHOUT FILE_OPEN_REPARSE_POINT (AclSource=$aclSource). Placing an opportunistic lock (oplock) and swapping the directory to an NTFS junction between the check and the unprotected open deterministically bypasses the reparse check. Effective principal: $effectivePrincipal."
         $isDirectLead = $true
     }
 
@@ -988,19 +1068,47 @@ foreach ($entry in $rawData) {
 
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 10.2: Registry Value Data References Filesystem / UNC Path
+    # Covers BOTH:
+    #   (a) Read-only HKLM/HKCU registry key read by a privileged process whose
+    #       value data points to a controllable file/directory target (via leaf
+    #       ACL, WRITE_DAC/Owner, parent delete+recreate, missing path creation,
+    #       or replaceable ancestor directory), AND
+    #   (b) Writable registry key whose value data references a file/UNC path.
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and $isPrivileged -and (-not [string]::IsNullOrWhiteSpace($regDataPath)) -and ($writableLow -or $writableMed) -and $path -match "^HK") {
-        $severity = "High"
-        $type = "Writable Registry Value Referencing File/UNC Path"
-        $exploitPrimitive = "Registry_Data_Path_Reference"
-        $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) reads or writes a writable registry value whose data points to '$regDataPath'. Modifying this registry value redirects the privileged consumer to an arbitrary file or UNC path. Effective principal: $effectivePrincipal."
-        $isDirectLead = $true
+    if (-not $isDirectLead -and ($isPrivileged -or $isPrivilegedAny) -and (-not [string]::IsNullOrWhiteSpace($regDataPath)) -and $path -match "^HK") {
+        $targetControllable = ($regDataTargetWritableLow -or $regDataTargetWritableMed -or $regDataTargetWritableAC)
+        $keyControllable    = ($writableLow -or $writableMed -or $writableAppContainer)
+        if ($targetControllable -or $keyControllable) {
+            $severity = if ($regDataPath -match "(?i)\.(dll|exe|sys|drv|ocx|cpl|ps1|psm1|bat|cmd|vbs|js|wsf|hta|msc)$") { "Critical" } else { "High" }
+            $type = if ($targetControllable -and -not $keyControllable) {
+                "Read-Only Registry Value Referencing Controllable File/Directory Target"
+            } else {
+                "Writable Registry Value Referencing File/UNC Path"
+            }
+            $exploitPrimitive = "Registry_Data_Path_Reference"
+            $targetDest = if (-not [string]::IsNullOrWhiteSpace($regDataTarget)) { $regDataTarget } else { $regDataPath }
+            if ($targetControllable -and -not $keyControllable) {
+                $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) reads registry key '$path' whose Data references controllable filesystem path '$targetDest' (writable from '$regDataTargetWritableFrom' via ACL mechanism '$regDataTargetAclSource'; DeleteOrReplace=$regDataTargetCanDeleteOrReplace, ReplaceableAncestor=$regDataTargetHasWritableAncestor '$regDataTargetWritableAncestorPath'). Even though the registry key itself is read-only, an attacker can control or replace the referenced target on disk. Effective principal: $effectivePrincipal."
+                if ($writableFrom -in @('None', 'HighILAdmin') -and $regDataTargetWritableFrom -notin @('None', '')) {
+                    $writableFrom = $regDataTargetWritableFrom
+                    $writableLow  = $regDataTargetWritableLow
+                    $writableMed  = $regDataTargetWritableMed
+                    $writableAppContainer = $regDataTargetWritableAC
+                }
+            } else {
+                $reason = "PRIVILEGED PROCESS ($effectiveIntegrity) reads or writes a controllable registry value (ACL mechanism: '$aclSource') whose data points to '$targetDest'. Modifying the registry value or its referenced target redirects the privileged consumer. Effective principal: $effectivePrincipal."
+                if ($targetControllable) {
+                    $reason += " Target path '$targetDest' is also controllable on disk ($regDataTargetWritableFrom via '$regDataTargetAclSource')."
+                }
+            }
+            $isDirectLead = $true
+        }
     }
 
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 11: DACL Modification Rights (WRITE_DAC / WRITE_OWNER / Owner Rights)
     # ─────────────────────────────────────────────────────────────────────────
-    if (-not $isDirectLead -and ($isPrivileged -or $isPrivilegedAny) -and $canWriteDacOrOwner -and ($writableLow -or $writableMed)) {
+    if (-not $isDirectLead -and ($isPrivileged -or $isPrivilegedAny) -and $canWriteDacOrOwner -and ($writableLow -or $writableMed -or $writableAppContainer)) {
         $severity = "High"
         $type = "DACL / Ownership Modification Rights on Privileged Resource"
         $exploitPrimitive = "ACL_WriteDac_WriteOwner"
@@ -1008,6 +1116,36 @@ foreach ($entry in $rawData) {
         $isDirectLead = $true
     } elseif ($isDirectLead -and $canWriteDacOrOwner) {
         $reason += " [DACL Note: Principal holds WRITE_DAC / WRITE_OWNER or implicit Owner WRITE_DAC rights]"
+    }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RULE 12: AppContainer / Low-IL Sandbox Escape Surface (Rev 3.4)
+    # Fires when a path is controllable from an AppContainer / Low-IL sandbox
+    # perspective (ALL APPLICATION PACKAGES S-1-15-2-1, LPAC S-1-15-2-2,
+    # Capability SIDs S-1-15-3-*, or Low Mandatory Level) and accessed by a
+    # Medium/High/System process outside the sandbox.
+    # ─────────────────────────────────────────────────────────────────────────
+    if (-not $isDirectLead -and $writableAppContainer -and ($isPrivileged -or $isPrivilegedAny -or $effectiveIntegrity -in @("Medium", "High", "System"))) {
+        $severity = if ($isPrivileged -or $isPrivilegedAny) { "Critical" } else { "High" }
+        $type = "AppContainer / Low-IL Sandbox Escape Surface"
+        $exploitPrimitive = "AppContainer_Sandbox_Escape"
+        $reason = "Resource is controllable from an AppContainer / Low-IL sandbox context (ACL mechanism: '$aclSource') and consumed by a higher-integrity process ($effectiveIntegrity). Enables cross-boundary modification or IPC/reparse redirection from a sandboxed process. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    } elseif ($isDirectLead -and $writableAppContainer) {
+        $reason += " [Sandbox Escape Surface: Resource is controllable from AppContainer / Low-IL sandbox context (S-1-15-2-* / Low IL)]"
+    }
+
+    # Multi-mechanism writability & Service-SID annotations on direct leads
+    if ($isDirectLead) {
+        if ($canDeleteOrReplace -and $aclSource -match "delete-recreate") {
+            $reason += " [Access Mechanism: Controllable via parent Delete/Recreate ($aclSource)]"
+        }
+        if ($hasWritableAncestor -and -not [string]::IsNullOrWhiteSpace($writableAncestorPath)) {
+            $reason += " [Ancestor Mechanism: Controllable via ancestor '$writableAncestorPath' ($aclSource)]"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($writableServiceSids)) {
+            $reason += " [Service-SID Grant: Writable by per-service SID(s) '$writableServiceSids' — multi-hop escalation target if a matching service is compromised]"
+        }
     }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -1256,19 +1394,24 @@ foreach ($entry in $rawData) {
             AnyImpersonating = $anyImpersonating
             # Perspective-aware (rev 3)
             WritableByLowPriv       = $writableLow
+            WritableByAppContainer  = $writableAppContainer
             WritableByMediumILAdmin = $writableMed
             WritableByHighILAdmin   = $writableHigh
             WritableFrom            = $writableFrom
             IntegrityLabel          = $intLabel
             # Telemetry & DACL depth (rev 3.4)
-            ProcessCommandLines     = $procCmdLines
-            AclSource               = $aclSource
-            CanWriteDacOrOwner      = $canWriteDacOrOwner
-            CanDeleteOrReplace      = $canDeleteOrReplace
-            HasWritableAncestor     = $hasWritableAncestor
-            WritableAncestorPath    = $writableAncestorPath
-            RegistryDataPath        = $regDataPath
-            WritableByAppContainer  = [bool](Get-FieldValue $entry "WritableByAppContainer" $false)
+            ProcessCommandLines            = $procCmdLines
+            AclSource                      = $aclSource
+            CanWriteDacOrOwner             = $canWriteDacOrOwner
+            CanDeleteOrReplace             = $canDeleteOrReplace
+            HasWritableAncestor            = $hasWritableAncestor
+            WritableAncestorPath           = $writableAncestorPath
+            HasReparseCheckThenUse         = $hasReparseCheckThenUse
+            RegistryDataPath               = $regDataPath
+            RegistryDataTarget             = $regDataTarget
+            RegistryDataTargetWritableFrom = $regDataTargetWritableFrom
+            RegistryDataTargetAclSource    = $regDataTargetAclSource
+            WritableServiceSids            = $writableServiceSids
         })
     }
 }

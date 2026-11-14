@@ -58,6 +58,7 @@ Every high-confidence lead now carries an `EscalationCategory` field that names 
 | `LPE` | LowPriv-writable + High/System consumer (low-priv → SYSTEM) | `LPE_Research_Prompt.md` |
 | `UAC_Bypass` | MediumIL-admin-writable + High consumer; or any `COM_Hijack_HKCU` / `Env_Hijack_HKCU` (auto-elevation surface) | `UAC_Bypass_Research_Prompt.md` |
 | `Admin_To_System` | HighIL-admin-only-writable + System/TI consumer; or any `Service_BinaryPath` / `IFEO_Debugger` / `AeDebug` / `ScheduledTask_Plant` | `AdminToSystemKernel_Research_Prompt.md` |
+| `Sandbox_Escape` | AppContainer-writable (`S-1-15-2-1`, `S-1-15-2-2`, `S-1-15-3-*` / Low IL) + Medium/High/System consumer; or `AppContainer_Sandbox_Escape` | `SandboxEscape_Research_Prompt.md` |
 | `RCE_Lateral` | NTLM-coercion / web-shell / cert-plant family (primitive override) | `RCE_LateralMovement_Research_Prompt.md` |
 | `Proxy_Execution` | LOLBin / autorun family (primitive override) | `ProxyExecution_LOLBin_Research_Prompt.md` |
 | `Same_Level` | Writability and consumer at the same effective IL — not an escalation; routed to cognitive queue with hint |  |
