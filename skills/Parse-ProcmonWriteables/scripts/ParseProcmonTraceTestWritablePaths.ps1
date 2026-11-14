@@ -1,6 +1,6 @@
 ﻿param (
     [Parameter(Mandatory=$false)]
-    [string]$CsvPath = "D:\CyberSec\BootLogProcMonAll.CSV",
+    [string]$CsvPath = ".\NativeWritablePaths.csv",
     [Parameter(Mandatory=$false)]
     [string]$OutputPath,
     [Parameter(Mandatory=$false)]
@@ -219,19 +219,21 @@ namespace Win32DeviceMap {
             "System", "System.exe", "MemCompression", "Registry", "Memory Compression"
         };
         static readonly HashSet<string> KnownSystemDaemons = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
-            "System", "Registry", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
-            "lsass.exe", "lsaiso.exe", "winlogon.exe", "svchost.exe", "spoolsv.exe",
-            "SearchIndexer.exe", "SearchProtocolHost.exe", "MsMpEng.exe", "MpDefenderCoreService.exe",
-            "NisSrv.exe", "SecurityHealthService.exe", "SgrmBroker.exe", "TrustedInstaller.exe",
-            "TiWorker.exe", "WmiPrvSE.exe", "WUDFHost.exe", "dwm.exe", "LogonUI.exe",
-            "audiodg.exe", "dasHost.exe", "vmms.exe", "vmcompute.exe", "vmnat.exe",
-            "vmnetdhcp.exe", "vmware-usbarbitrator64.exe", "vmware-authd.exe", "Sysmon.exe",
-            "Sysmon64.exe", "sqlwriter.exe", "OfficeClickToRun.exe", "expressvpn-service.exe",
-            "armsvc.exe", "ArmouryCrate.Service.exe", "AsusCertService.exe", "AsusFanControlService.exe",
-            "AsusUpdateCheck.exe", "LightingService.exe", "ROGLiveService.exe", "Corsair.Service.exe",
-            "CueLLAccessService.exe", "CueUniwillService.exe", "Everything.exe", "wslservice.exe",
-            "IpOverUsbSvc.exe", "RtkAudUService64.exe", "DTSAPO3Service.exe"
+            "System", "Registry", "MemCompression", "Memory Compression",
+            "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
+            "lsass.exe", "lsaiso.exe", "winlogon.exe", "spoolsv.exe",
+            "SearchIndexer.exe", "MsMpEng.exe", "MpDefenderCoreService.exe",
+            "NisSrv.exe", "SecurityHealthService.exe", "SgrmBroker.exe",
+            "TrustedInstaller.exe", "TiWorker.exe", "WmiPrvSE.exe",
+            "WUDFHost.exe", "dwm.exe", "LogonUI.exe", "audiodg.exe", "dasHost.exe"
         };
+        static readonly HashSet<string> UserSessionDropProcs = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "userinit.exe", "explorer.exe", "sihost.exe", "fontdrvhost.exe",
+            "StartMenuExperienceHost.exe", "SearchHost.exe", "SearchApp.exe",
+            "ShellExperienceHost.exe", "RuntimeBroker.exe", "ApplicationFrameHost.exe",
+            "backgroundTaskHost.exe", "TextInputHost.exe", "smartscreen.exe", "mobsync.exe"
+        };
+        static readonly Regex RxParentPid = new Regex(@"Parent\s*PID:\s*(\d+)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         static readonly HashSet<string> WriteOps = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
             "WriteFile", "SetDispositionInformationFile", "SetRenameInformationFile",
             "SetBasicInformationFile", "SetEndOfFileInformationFile", "SetAllocationInformationFile",
@@ -482,8 +484,26 @@ namespace Win32DeviceMap {
                             if (detStr.IndexOf(@"config\systemprofile", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 detStr.IndexOf(@"ServiceProfiles\LocalService", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 detStr.IndexOf(@"ServiceProfiles\NetworkService", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                detStr.IndexOf("USERNAME=SYSTEM", StringComparison.OrdinalIgnoreCase) >= 0) {
+                                detStr.IndexOf("USERNAME=SYSTEM", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                KnownSystemDaemons.Contains(procName)) {
                                 pidIntMap[pidStr] = "System";
+                            } else {
+                                var mPpid = RxParentPid.Match(detStr);
+                                string ppid = mPpid.Success ? mPpid.Groups[1].Value : "";
+                                string parentInt;
+                                if (!string.IsNullOrEmpty(ppid) && pidIntMap.TryGetValue(ppid, out parentInt) && (parentInt == "System" || parentInt == "High")) {
+                                    if (UserSessionDropProcs.Contains(procName) ||
+                                        detStr.IndexOf("UnistackSvcGroup", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                        detStr.IndexOf("-Embedding", StringComparison.OrdinalIgnoreCase) >= 0) {
+                                        pidIntMap[pidStr] = "Medium";
+                                    } else if (parentInt == "System" && detStr.IndexOf(@"Users\", StringComparison.OrdinalIgnoreCase) < 0) {
+                                        pidIntMap[pidStr] = "System";
+                                    } else {
+                                        pidIntMap[pidStr] = "High";
+                                    }
+                                } else {
+                                    pidIntMap[pidStr] = "Medium";
+                                }
                             }
                         }
                     }
