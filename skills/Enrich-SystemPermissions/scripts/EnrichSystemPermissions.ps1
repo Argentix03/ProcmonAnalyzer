@@ -60,6 +60,22 @@ namespace ProcmonPhase2Auditor {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
 
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern int GetProcessId(IntPtr Process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DuplicateHandle(
+            IntPtr hSourceProcessHandle,
+            IntPtr hSourceHandle,
+            IntPtr hTargetProcessHandle,
+            out IntPtr lpTargetHandle,
+            uint dwDesiredAccess,
+            bool bInheritHandle,
+            uint dwOptions);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
 
@@ -136,6 +152,12 @@ namespace ProcmonPhase2Auditor {
             const uint STATUS_INFO_LENGTH_MISMATCH = 0xC0000004;
             uint size = 0x100000;
             IntPtr buf = IntPtr.Zero;
+            int myPid = System.Diagnostics.Process.GetCurrentProcess().Id;
+            IntPtr hSelfProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, myPid);
+            IntPtr hSelfTok = IntPtr.Zero;
+            if (hSelfProc != IntPtr.Zero) {
+                OpenProcessToken(hSelfProc, 0x0008, out hSelfTok);
+            }
             try {
                 for (int attempt = 0; attempt < 6; attempt++) {
                     buf = Marshal.AllocHGlobal((int)size);
@@ -153,53 +175,110 @@ namespace ProcmonPhase2Auditor {
                     long count = (ptrSize == 8) ? Marshal.ReadInt64(buf, 0) : Marshal.ReadInt32(buf, 0);
                     int offset = ptrSize * 2;
                     int stride = (ptrSize == 8) ? 40 : 28;
+                    int typeOffset = (ptrSize == 8) ? 30 : 18;
 
-                    // Collect kernel object pointers belonging to High/SYSTEM processes (when visible)
+                    // Dynamically discover Process & Token ObjectTypeIndex from our own handles
+                    ushort procTypeIdx = 7;
+                    ushort tokTypeIdx = 5;
+                    ulong selfProcVal = (ulong)hSelfProc.ToInt64();
+                    ulong selfTokVal  = (ulong)hSelfTok.ToInt64();
+                    for (long i = 0; i < count; i++) {
+                        IntPtr entry = IntPtr.Add(buf, offset + (int)(i * stride));
+                        int pid = (ptrSize == 8) ? (int)Marshal.ReadInt64(entry, 8) : Marshal.ReadInt32(entry, 4);
+                        if (pid != myPid) continue;
+                        ulong hVal = (ptrSize == 8) ? (ulong)Marshal.ReadInt64(entry, 16) : (uint)Marshal.ReadInt32(entry, 8);
+                        ushort tIdx = (ushort)Marshal.ReadInt16(entry, typeOffset);
+                        if (selfProcVal != 0 && hVal == selfProcVal) procTypeIdx = tIdx;
+                        if (selfTokVal != 0  && hVal == selfTokVal)  tokTypeIdx  = tIdx;
+                    }
+
+                    // Collect kernel object pointers for Process/Token objects belonging to High/SYSTEM processes
                     Dictionary<ulong, int> privObjects = new Dictionary<ulong, int>();
                     for (long i = 0; i < count; i++) {
                         IntPtr entry = IntPtr.Add(buf, offset + (int)(i * stride));
                         ulong objPtr = (ptrSize == 8) ? (ulong)Marshal.ReadInt64(entry, 0) : (uint)Marshal.ReadInt32(entry, 0);
                         int pid = (ptrSize == 8) ? (int)Marshal.ReadInt64(entry, 8) : Marshal.ReadInt32(entry, 4);
-                        uint access = (uint)Marshal.ReadInt32(entry, (ptrSize == 8) ? 24 : 12);
-                        uint attrs = (uint)Marshal.ReadInt32(entry, (ptrSize == 8) ? 32 : 20);
-                        ushort typeIdx = (ushort)Marshal.ReadInt16(entry, (ptrSize == 8) ? 28 : 16);
+                        ushort typeIdx = (ushort)Marshal.ReadInt16(entry, typeOffset);
+                        if (typeIdx != procTypeIdx && typeIdx != tokTypeIdx) continue;
 
-                        if (privPids.Contains(pid)) {
-                            if (objPtr != 0 && !privObjects.ContainsKey(objPtr)) {
-                                privObjects[objPtr] = pid;
-                            }
-                            // Flag inheritable (OBJ_INHERIT = 0x2) high-access handles inside privileged processes
-                            if ((attrs & 0x2) != 0 && (access & 0x001F0FFF) != 0 && (access & 0x00040062) != 0 && results.Count < 100) {
-                                InheritedOrLeakedHandleInfo info = new InheritedOrLeakedHandleInfo();
-                                info.Pid = pid;
-                                info.ObjectTypeIndex = typeIdx;
-                                info.HandleAttributes = attrs;
-                                info.HandleValue = (ptrSize == 8) ? (ulong)Marshal.ReadInt64(entry, 16) : (uint)Marshal.ReadInt32(entry, 8);
-                                info.ObjectPtr = objPtr;
-                                info.GrantedAccess = access;
-                                results.Add(info);
-                            }
+                        if (privPids.Contains(pid) && objPtr != 0 && !privObjects.ContainsKey(objPtr)) {
+                            privObjects[objPtr] = pid;
                         }
                     }
 
-                    // Second pass: if kernel object pointers are populated, find Medium/Low processes holding write handles to privileged objects
+                    // Second pass: find Medium/Low processes holding write/dup/impersonate handles to privileged Process/Token objects
                     if (privObjects.Count > 0) {
-                        for (long i = 0; i < count; i++) {
-                            IntPtr entry = IntPtr.Add(buf, offset + (int)(i * stride));
-                            ulong objPtr = (ptrSize == 8) ? (ulong)Marshal.ReadInt64(entry, 0) : (uint)Marshal.ReadInt32(entry, 0);
-                            if (objPtr == 0) continue;
-                            int pid = (ptrSize == 8) ? (int)Marshal.ReadInt64(entry, 8) : Marshal.ReadInt32(entry, 4);
-                            if (privPids.Contains(pid)) continue;
-                            uint access = (uint)Marshal.ReadInt32(entry, (ptrSize == 8) ? 24 : 12);
-                            if ((access & 0x00040062) != 0 && privObjects.ContainsKey(objPtr) && results.Count < 200) {
-                                InheritedOrLeakedHandleInfo info = new InheritedOrLeakedHandleInfo();
-                                info.Pid = pid;
-                                info.ObjectTypeIndex = (ushort)Marshal.ReadInt16(entry, (ptrSize == 8) ? 28 : 16);
-                                info.HandleAttributes = (uint)Marshal.ReadInt32(entry, (ptrSize == 8) ? 32 : 20);
-                                info.HandleValue = (ptrSize == 8) ? (ulong)Marshal.ReadInt64(entry, 16) : (uint)Marshal.ReadInt32(entry, 8);
-                                info.ObjectPtr = objPtr;
-                                info.GrantedAccess = access;
-                                results.Add(info);
+                        IntPtr curProc = GetCurrentProcess();
+                        Dictionary<int, IntPtr> holderProcCache = new Dictionary<int, IntPtr>();
+                        try {
+                            for (long i = 0; i < count; i++) {
+                                IntPtr entry = IntPtr.Add(buf, offset + (int)(i * stride));
+                                ulong objPtr = (ptrSize == 8) ? (ulong)Marshal.ReadInt64(entry, 0) : (uint)Marshal.ReadInt32(entry, 0);
+                                if (objPtr == 0) continue;
+                                int pid = (ptrSize == 8) ? (int)Marshal.ReadInt64(entry, 8) : Marshal.ReadInt32(entry, 4);
+                                if (pid == myPid || privPids.Contains(pid)) continue;
+                                ushort typeIdx = (ushort)Marshal.ReadInt16(entry, typeOffset);
+                                if (typeIdx != procTypeIdx && typeIdx != tokTypeIdx) continue;
+                                uint access = (uint)Marshal.ReadInt32(entry, (ptrSize == 8) ? 24 : 12);
+                                uint dangerousMask = (typeIdx == procTypeIdx) ? 0x000C00E2u : 0x000C0027u;
+                                if ((access & dangerousMask) != 0 && privObjects.ContainsKey(objPtr) && results.Count < 200) {
+                                    ulong hVal = (ptrSize == 8) ? (ulong)Marshal.ReadInt64(entry, 16) : (uint)Marshal.ReadInt32(entry, 8);
+                                    // Verify the target object is genuinely High/SYSTEM (filtering out Medium-IL processes also held by csrss.exe)
+                                    IntPtr hHolder;
+                                    if (!holderProcCache.TryGetValue(pid, out hHolder)) {
+                                        hHolder = OpenProcess(0x0040, false, pid); // PROCESS_DUP_HANDLE
+                                        holderProcCache[pid] = hHolder;
+                                    }
+                                    bool confirmedPrivilegedTarget = false;
+                                    if (hHolder != IntPtr.Zero) {
+                                        IntPtr hDup = IntPtr.Zero;
+                                        uint queryRight = (typeIdx == procTypeIdx) ? PROCESS_QUERY_LIMITED_INFORMATION : 0x0008u; // TOKEN_QUERY
+                                        if (DuplicateHandle(hHolder, (IntPtr)(long)hVal, curProc, out hDup, queryRight, false, 0) && hDup != IntPtr.Zero) {
+                                            try {
+                                                if (typeIdx == procTypeIdx) {
+                                                    int targetPid = GetProcessId(hDup);
+                                                    if (targetPid > 0 && privPids.Contains(targetPid)) {
+                                                        confirmedPrivilegedTarget = true;
+                                                    }
+                                                } else {
+                                                    uint retLen2 = 0;
+                                                    GetTokenInformation(hDup, 25, IntPtr.Zero, 0, out retLen2);
+                                                    if (retLen2 > 0) {
+                                                        IntPtr tBuf = Marshal.AllocHGlobal((int)retLen2);
+                                                        try {
+                                                            if (GetTokenInformation(hDup, 25, tBuf, retLen2, out retLen2)) {
+                                                                IntPtr pSid = Marshal.ReadIntPtr(tBuf);
+                                                                if (pSid != IntPtr.Zero) {
+                                                                    byte subCnt = Marshal.ReadByte(GetSidSubAuthorityCount(pSid));
+                                                                    uint rid = (uint)Marshal.ReadInt32(GetSidSubAuthority(pSid, (uint)(subCnt - 1)));
+                                                                    if (rid >= 0x3000) confirmedPrivilegedTarget = true;
+                                                                }
+                                                            }
+                                                        } finally {
+                                                            Marshal.FreeHGlobal(tBuf);
+                                                        }
+                                                    }
+                                                }
+                                            } finally {
+                                                CloseHandle(hDup);
+                                            }
+                                        }
+                                    }
+                                    if (confirmedPrivilegedTarget) {
+                                        InheritedOrLeakedHandleInfo info = new InheritedOrLeakedHandleInfo();
+                                        info.Pid = pid;
+                                        info.ObjectTypeIndex = typeIdx;
+                                        info.HandleAttributes = (uint)Marshal.ReadInt32(entry, (ptrSize == 8) ? 32 : 20);
+                                        info.HandleValue = hVal;
+                                        info.ObjectPtr = objPtr;
+                                        info.GrantedAccess = access;
+                                        results.Add(info);
+                                    }
+                                }
+                            }
+                        } finally {
+                            foreach (IntPtr h in holderProcCache.Values) {
+                                if (h != IntPtr.Zero) CloseHandle(h);
                             }
                         }
                     }
@@ -207,6 +286,8 @@ namespace ProcmonPhase2Auditor {
                 }
             } catch {
             } finally {
+                if (hSelfTok != IntPtr.Zero) CloseHandle(hSelfTok);
+                if (hSelfProc != IntPtr.Zero) CloseHandle(hSelfProc);
                 if (buf != IntPtr.Zero) Marshal.FreeHGlobal(buf);
             }
             return results;
