@@ -152,10 +152,14 @@ if ($Start) {
         "Microsoft-Windows-Kernel-Process 0xffffffffffffffff 0xff"
         "Microsoft-Windows-Security-Auditing 0xffffffffffffffff 0xff"
         "Microsoft-Windows-Kernel-Registry 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-RPC 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-COMRuntime 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-WMI-Activity 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-Kernel-Object 0xffffffffffffffff 0xff"
     )
     $Providers | Out-File $ManifestPath -Encoding ascii
 
-    Write-Host "[+] Binding Kernel Providers..."
+    Write-Host "[+] Binding Kernel & Subsystem Providers..."
     & logman.exe create trace $TraceName -pf "$ManifestPath" -o "$EtlPath" -ets | Out-Null
 
     Write-Host "[+] ETW Trace '$TraceName' is actively running." -ForegroundColor Green
@@ -228,8 +232,12 @@ if ($Stop) {
         exit 1
     }
 
-    Write-Host "[+] Processing raw I/O Stream natively..."
+    Write-Host "[+] Processing raw I/O Stream natively (with RPC/COM/WMI thread correlation)..."
     $ProcmonEvents = New-Object System.Collections.Generic.List[object]
+    $ThreadRpcContext = @{}
+    $ThreadComContext = @{}
+    $ThreadWmiContext = @{}
+    $PidWmiContext    = @{}
     $reader = [System.IO.File]::OpenText($RawCsvPath)
     $MatchCount = 0
 
@@ -251,11 +259,56 @@ if ($Stop) {
             continue
         }
 
+        if ($line.StartsWith("Microsoft-Windows-RPC") -or $line.StartsWith("{6ad52b32-d609-4be9-ae07-ce8dae937e39}")) {
+            $blocks = $line -split ","
+            if ($blocks.Count -gt 10) {
+                try {
+                    $rPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                    $rTid = [Convert]::ToInt32($blocks[10].Trim(), 16).ToString()
+                    $ifUuid = if ($line -match '(\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?)') { $matches[1] } else { "UnknownInterface" }
+                    $opNum  = if ($line -match '(?i)(?:OpNum|ProcNum)[=:\s"]+([0-9xXa-fA-F]+)') { $matches[1] } else { "?" }
+                    $ThreadRpcContext["${rPid}:${rTid}"] = "Interface=$ifUuid OpNum=$opNum"
+                } catch {}
+            }
+            continue
+        }
+
+        if ($line.StartsWith("Microsoft-Windows-COMRuntime") -or $line.StartsWith("{bf406804-6afa-46e7-8a48-6c357e1d6d61}")) {
+            $blocks = $line -split ","
+            if ($blocks.Count -gt 10) {
+                try {
+                    $cPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                    $cTid = [Convert]::ToInt32($blocks[10].Trim(), 16).ToString()
+                    if ($line -match '(\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\})') {
+                        $ThreadComContext["${cPid}:${cTid}"] = "CLSID=$($matches[1])"
+                    }
+                } catch {}
+            }
+            continue
+        }
+
+        if ($line.StartsWith("Microsoft-Windows-WMI-Activity") -or $line.StartsWith("{1418ef04-b0b4-4623-bf7e-d74ab47bbbd3}")) {
+            $blocks = $line -split ","
+            if ($blocks.Count -gt 10) {
+                try {
+                    $wPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                    $wTid = [Convert]::ToInt32($blocks[10].Trim(), 16).ToString()
+                    $ns = if ($line -match '(?i)(ROOT\\[A-Za-z0-9_\\]+)') { $matches[1] } else { "ROOT\CIMV2" }
+                    $prov = if ($line -match '(?i)ProviderName[=:\s"]+([^",\r\n]+)') { $matches[1].Trim() } else { "" }
+                    $wmiTag = if ($prov) { "Namespace=$ns Provider=$prov" } else { "Namespace=$ns" }
+                    $ThreadWmiContext["${wPid}:${wTid}"] = $wmiTag
+                    $PidWmiContext[$wPid] = $wmiTag
+                } catch {}
+            }
+            continue
+        }
+
         $isFileEvent = $line.StartsWith("Microsoft-Windows-Kernel-File")
         $isRegEvent  = $line.StartsWith("Microsoft-Windows-Kernel-Registry")
-        if (-not $isFileEvent -and -not $isRegEvent) { continue }
+        $isObjEvent  = $line.StartsWith("Microsoft-Windows-Kernel-Object") -or $line.StartsWith("{89497f50-effe-4440-8cf2-ce6b1cdcaca7}")
+        if (-not $isFileEvent -and -not $isRegEvent -and -not $isObjEvent) { continue }
 
-        if ($line -match '(\\Device\\HarddiskVolume\d+\\[^",\r\n]+|[A-Za-z]:\\[^",\r\n]+|\\REGISTRY\\[^",\r\n]+)') {
+        if ($line -match '(\\Device\\HarddiskVolume\d+\\[^",\r\n]+|\\Device\\[^",\r\n]+|\\BaseNamedObjects\\[^",\r\n]+|\\Sessions\\\d+\\BaseNamedObjects\\[^",\r\n]+|[A-Za-z]:\\[^",\r\n]+|\\REGISTRY\\[^",\r\n]+)') {
             $RawPath = $matches[1].Trim()
             if ($RawPath.StartsWith("\Device\HarddiskVolume", [System.StringComparison]::OrdinalIgnoreCase)) {
                 if ($RawPath -match "^(\\Device\\HarddiskVolume\d+)(\\.*)?$") {
@@ -277,23 +330,41 @@ if ($Stop) {
             $taskField = if ($blocks.Count -gt 3) { "$($blocks[1]) $($blocks[2]) $($blocks[3])" } else { "" }
             $tsField   = if ($blocks.Count -gt 6 -and $blocks[6].Trim()) { $blocks[6].Trim() } else { (Get-Date).ToString("hh:mm:ss.fffffff tt") }
             $hexPid    = if ($blocks.Count -gt 9) { $blocks[9].Trim() } else { "0" }
+            $hexTid    = if ($blocks.Count -gt 10) { $blocks[10].Trim() } else { "0" }
             $TestPID   = "4"
+            $TestTID   = "0"
             try { $TestPID = [Convert]::ToInt32($hexPid, 16).ToString() } catch {}
+            try { $TestTID = [Convert]::ToInt32($hexTid, 16).ToString() } catch {}
 
             $MappedName      = if ($Snapshot.ContainsKey($TestPID)) { $Snapshot[$TestPID].ProcessName } else { "Unknown.exe" }
             $MappedIntegrity = if ($Snapshot.ContainsKey($TestPID)) { $Snapshot[$TestPID].Integrity } else { "Unknown" }
             $MappedOp        = Resolve-EtwOperation -Provider $blocks[0] -TaskOrOpcode $taskField -Line $line
             $MappedResult    = Resolve-EtwResult -Line $line
 
+            $tidKey = "${TestPID}:${TestTID}"
+            $detailParts = @("Integrity: $MappedIntegrity | Native ETW IO")
+            if ($ThreadRpcContext.ContainsKey($tidKey)) {
+                $detailParts += "RPC_Context: $($ThreadRpcContext[$tidKey])"
+            }
+            if ($ThreadComContext.ContainsKey($tidKey)) {
+                $detailParts += "COM_Context: $($ThreadComContext[$tidKey])"
+            }
+            if ($ThreadWmiContext.ContainsKey($tidKey)) {
+                $detailParts += "WMI_Context: $($ThreadWmiContext[$tidKey])"
+            } elseif ($MappedName -match "(?i)^wmiprvse\.exe$" -and $PidWmiContext.ContainsKey($TestPID)) {
+                $detailParts += "WMI_Context: $($PidWmiContext[$TestPID])"
+            }
+
             $obj = [PSCustomObject]@{
                 "Time of Day"   = $tsField
                 "Process Name"  = $MappedName
                 "PID"           = $TestPID
+                "TID"           = $TestTID
                 "Operation"     = $MappedOp
                 "Path"          = $RawPath
                 "Result"        = $MappedResult
                 "Integrity"     = $MappedIntegrity
-                "Detail"        = "Integrity: $MappedIntegrity | Native ETW IO"
+                "Detail"        = ($detailParts -join " | ")
                 "Impersonating" = "Unknown"
             }
             $ProcmonEvents.Add($obj)

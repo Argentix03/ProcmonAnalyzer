@@ -368,6 +368,137 @@ $mockData = @(
         WritableByMediumILAdmin = $false
         WritableByHighILAdmin = $true
         WritableFrom = "AppContainer"
+    },
+    # --- rev 3.5 (Phase 2) test cases ---
+    [PSCustomObject]@{
+        Path = "C:\ProgramData\VendorRPC\rpc_spool.dat"
+        RelatedProcesses = "VendorRpcSvc.exe"
+        Operation = "CreateFile"
+        Result = "SUCCESS"
+        Detail = "Desired Access: Generic Write | RPC_Context: Interface={12345678-1234-1234-1234-123456789abc} OpNum=4"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AnyPrivWrite = $true
+        AnyImpersonating = $false
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "HKLM\SOFTWARE\Classes\AppID\{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}"
+        RelatedProcesses = "dllhost.exe"
+        Operation = "DCOM_LaunchPermission_Audit"
+        Result = "SUCCESS"
+        Detail = "RunAs=Interactive User"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "dcom-launch-sd"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "WMI:\ROOT\VendorMgmt"
+        RelatedProcesses = "wmiprvse.exe"
+        Operation = "WMI_Namespace_Audit"
+        Result = "SUCCESS"
+        Detail = "WMI_Context: Namespace=ROOT\VendorMgmt Provider=VendorSysProv"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "wmi-namespace-sd"
+        AnyPrivRead = $true
+        AnyImpersonating = $false
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "HKLM\SYSTEM\CurrentControlSet\Services\VendorOnDemandSvc"
+        RelatedProcesses = "services.exe (VendorOnDemandSvc)"
+        Operation = "QueryServiceObjectSecurity"
+        Result = "SUCCESS"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "service-scm-sd"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "C:\Windows\System32\Tasks\VendorOnDemandTask"
+        RelatedProcesses = "svchost.exe (Schedule)"
+        Operation = "TaskCache_SD_Audit"
+        Result = "SUCCESS"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "taskcache-sd"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "Handle://VendorHelper.exe (PID 4420) -> Handle 0x1A4"
+        RelatedProcesses = "VendorHelper.exe"
+        Operation = "SystemExtendedHandleInformation"
+        Result = "SUCCESS"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "system-handle-table"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "\Device\VendorKernelDrv"
+        RelatedProcesses = "System (VendorKernelDrv)"
+        Operation = "DeviceIoControl"
+        Result = "SUCCESS"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "driver-registry-sd"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "\BaseNamedObjects\VendorSharedMemSection"
+        RelatedProcesses = "VendorService.exe"
+        Operation = "CreateFileMapping"
+        Result = "SUCCESS"
+        Integrity = "System"
+        HighestIntegrity = "System"
+        AclSource = "om-shared-section"
+        AnyPrivWrite = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
+    },
+    [PSCustomObject]@{
+        Path = "HWND://VendorTrayElevated.exe/VendorMsgClass (0x1045A)"
+        RelatedProcesses = "VendorTrayElevated.exe"
+        Operation = "EnumWindows"
+        Result = "SUCCESS"
+        Integrity = "High"
+        HighestIntegrity = "High"
+        AclSource = "uipi-session-window"
+        AnyPrivRead = $true
+        WritableByLowPriv = $true
+        WritableByMediumILAdmin = $true
+        WritableByHighILAdmin = $true
+        WritableFrom = "LowPriv"
     }
 )
 
@@ -414,7 +545,16 @@ if (Test-Path $analyzerScript) {
         "CheckThenUse_Reparse_TOCTOU",
         "COM_HKLM_Hijack",
         "Registry_Data_Path_Reference",
-        "AppContainer_Sandbox_Escape"
+        "AppContainer_Sandbox_Escape",
+        "RPC_Unauthenticated_PathSink",
+        "DCOM_Privileged_Activation",
+        "WMI_LocalSystemHost_Sink",
+        "Service_OnDemand_Trigger_Chain",
+        "ScheduledTask_OnDemand_Run",
+        "Leaked_Privileged_Handle",
+        "Kernel_Device_IOCTL_Surface",
+        "SharedSection_MemoryTamper",
+        "UIPI_HighIL_MessageSink"
     )
     $allPassed = $true
     foreach ($ep in $expectedPrimitives) {

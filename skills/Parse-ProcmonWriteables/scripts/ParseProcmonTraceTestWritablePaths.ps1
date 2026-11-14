@@ -527,7 +527,14 @@ namespace Win32DeviceMap {
                     bool isPipe = pathRaw.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase);
                     bool isUnc  = !isPipe && pathRaw.StartsWith(@"\\", StringComparison.Ordinal) && !pathRaw.StartsWith(@"\\.\") && !pathRaw.StartsWith(@"\\?\");
                     bool isDriveFs = (pathRaw.Length >= 3 && char.IsLetter(pathRaw[0]) && pathRaw[1] == ':' && pathRaw[2] == '\\');
-                    bool isFsPath = isDriveFs || isPipe || isUnc;
+                    bool isDeviceObj = pathRaw.StartsWith(@"\Device\", StringComparison.OrdinalIgnoreCase) &&
+                                       !pathRaw.StartsWith(@"\Device\HarddiskVolume", StringComparison.OrdinalIgnoreCase) &&
+                                       !pathRaw.StartsWith(@"\Device\NamedPipe", StringComparison.OrdinalIgnoreCase) &&
+                                       !pathRaw.StartsWith(@"\Device\Mup", StringComparison.OrdinalIgnoreCase);
+                    bool isOmNamespace = pathRaw.StartsWith(@"\BaseNamedObjects\", StringComparison.OrdinalIgnoreCase) ||
+                                         pathRaw.StartsWith(@"\Sessions\", StringComparison.OrdinalIgnoreCase) ||
+                                         pathRaw.StartsWith(@"\RPC Control\", StringComparison.OrdinalIgnoreCase);
+                    bool isFsPath = isDriveFs || isPipe || isUnc || isDeviceObj || isOmNamespace;
                     bool isRegPath = !isFsPath && (
                         pathRaw.StartsWith("HKCU", StringComparison.OrdinalIgnoreCase) ||
                         pathRaw.StartsWith("HKEY_CURRENT_USER", StringComparison.OrdinalIgnoreCase) ||
@@ -1983,6 +1990,49 @@ function Get-PathWritability {
                 $r.WritableByMediumILAdmin = $true
                 $r.AclSource               = "named-pipe-namespace"
             }
+            return $r
+        }
+
+        # Object Manager Shared Sections & Directories (\BaseNamedObjects\*, \Sessions\*\BaseNamedObjects\*, \RPC Control\*)
+        if ($TargetPath -match '(?i)^(\\BaseNamedObjects\\|\\Sessions\\\d+\\BaseNamedObjects\\|\\RPC Control\\)') {
+            $r.WritableByHighILAdmin   = $true
+            $r.WritableByLowPriv       = $true
+            $r.WritableByMediumILAdmin = $true
+            $r.AclSource               = if ($HasNameNotFound) { "om-namespace-unbound" } else { "om-shared-section" }
+            return $r
+        }
+
+        # Kernel Device Objects (\Device\<DriverName>): passive registry Security check + GLOBALROOT ACL check
+        if ($TargetPath -match '(?i)^\\Device\\([^\\]+)') {
+            $devName = $matches[1]
+            $r.WritableByHighILAdmin = $true
+            $r.AclSource = "device-object"
+            try {
+                $drvSecKey = Get-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$devName\Security" -ErrorAction SilentlyContinue
+                if ($null -ne $drvSecKey) {
+                    $sdBytes = $drvSecKey.GetValue("Security")
+                    if ($sdBytes -is [byte[]] -and $sdBytes.Length -ge 20) {
+                        $csd = New-Object System.Security.AccessControl.CommonSecurityDescriptor($false, $false, $sdBytes, 0)
+                        foreach ($ace in $csd.DiscretionaryAcl) {
+                            if ($ace -is [System.Security.AccessControl.KnownAce] -and $ace.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed) {
+                                $sidVal = $ace.SecurityIdentifier.Value
+                                $maskVal = [int]$ace.AccessMask
+                                if (($maskVal -band 0x500C0006) -ne 0) {
+                                    if ($script:_lowPrivSids -contains $sidVal) {
+                                        $r.WritableByLowPriv = $true
+                                        $r.WritableByMediumILAdmin = $true
+                                        $r.AclSource = "device-registry-sd"
+                                    }
+                                    if (($script:_appContainerSids -contains $sidVal) -or $sidVal.StartsWith("S-1-15-3-")) {
+                                        $r.WritableByAppContainer = $true
+                                        $r.AclSource = "device-registry-sd"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {}
             return $r
         }
 

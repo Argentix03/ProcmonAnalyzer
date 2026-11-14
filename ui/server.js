@@ -536,7 +536,9 @@ const RESEARCH_PROMPTS = [
             'PowerShell_Profile', 'Electron_AsarTamper', 'ACL_WriteDac_WriteOwner',
             'Arbitrary_DACL_Overwrite', 'Arbitrary_Delete_ConfigMsi_LPE', 'Arbitrary_Move_FileRename',
             'Parent_Directory_Reparse_Bypass', 'BackupSemantics_DACL_Bypass', 'Signature_TOCTOU_Bypass',
-            'CheckThenUse_Reparse_TOCTOU', 'COM_HKLM_Hijack'
+            'CheckThenUse_Reparse_TOCTOU', 'COM_HKLM_Hijack', 'RPC_Unauthenticated_PathSink',
+            'DCOM_Privileged_Activation', 'WMI_LocalSystemHost_Sink', 'Service_OnDemand_Trigger_Chain',
+            'ScheduledTask_OnDemand_Run', 'Leaked_Privileged_Handle', 'SharedSection_MemoryTamper'
         ]
     },
     {
@@ -550,8 +552,8 @@ const RESEARCH_PROMPTS = [
         id: 'uac',
         title: 'UAC Bypass',
         file: 'UAC_Bypass_Research_Prompt.md',
-        description: 'Auto-elevating Microsoft binaries that consume user-controllable HKCU keys / env vars / per-user COM registrations. Medium IL → High IL.',
-        primitives: ['COM_Hijack_HKCU', 'Env_Hijack_HKCU']
+        description: 'Auto-elevating Microsoft binaries that consume user-controllable HKCU keys / env vars / per-user COM registrations, plus UIPI High-IL interactive window sinks.',
+        primitives: ['COM_Hijack_HKCU', 'Env_Hijack_HKCU', 'UIPI_HighIL_MessageSink']
     },
     {
         id: 'rce_lateral',
@@ -571,8 +573,8 @@ const RESEARCH_PROMPTS = [
         id: 'admin_kernel',
         title: 'Admin → SYSTEM / Kernel',
         file: 'AdminToSystemKernel_Research_Prompt.md',
-        description: 'High-IL admin → SYSTEM token, and SYSTEM → kernel primitives. Service hijacks, IFEO/AeDebug, scheduled-task plant, BYOVD.',
-        primitives: ['Service_BinaryPath', 'IFEO_Debugger', 'AeDebug', 'ScheduledTask_Plant']
+        description: 'High-IL admin → SYSTEM token, and SYSTEM → kernel primitives. Service hijacks, IFEO/AeDebug, scheduled-task plant, BYOVD, kernel device IOCTL surfaces.',
+        primitives: ['Service_BinaryPath', 'IFEO_Debugger', 'AeDebug', 'ScheduledTask_Plant', 'Kernel_Device_IOCTL_Surface']
     }
 ];
 

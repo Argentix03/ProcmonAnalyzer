@@ -5,6 +5,9 @@
     [Parameter(Mandatory=$false)]
     [string]$OutputPath,
 
+    [Parameter(Mandatory=$false)]
+    [string]$SystemPermissionsPath,
+
     [switch]$Silent
 )
 
@@ -132,9 +135,10 @@ function Get-EscalationCategory {
     if ($primitive -eq 'AppContainer_Sandbox_Escape' -or $writableFrom -eq 'AppContainer') {
         return 'Sandbox_Escape'
     }
-    if ($primitive -in @('COM_Hijack_HKCU','Env_Hijack_HKCU')) { return 'UAC_Bypass' }
-    if ($primitive -in @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant')) {
+    if ($primitive -in @('COM_Hijack_HKCU','Env_Hijack_HKCU','UIPI_HighIL_MessageSink')) { return 'UAC_Bypass' }
+    if ($primitive -in @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant','Kernel_Device_IOCTL_Surface')) {
         if ($writableFrom -eq 'LowPriv')       { return 'LPE' }
+        if ($writableFrom -eq 'AppContainer')  { return 'Sandbox_Escape' }
         if ($writableFrom -eq 'MediumILAdmin') { return 'UAC_Bypass' }
         return 'Admin_To_System'
     }
@@ -144,7 +148,7 @@ function Get-EscalationCategory {
     if ($primitive -in @('LOLBin_Proxy','AutoRun_Persistence')) {
         return 'Proxy_Execution'
     }
-    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Binary_Plant_HighPriv','Pipe_Hijack','Pipe_Instance_Squat','Pipe_Client_IPC_Sink','Config_Poison','Parent_Directory_Reparse_Bypass','File_DeleteChild_Recreate','Arbitrary_Delete_ConfigMsi_LPE','Arbitrary_DACL_Overwrite','Arbitrary_Move_FileRename','ACL_WriteDac_WriteOwner','Signature_TOCTOU_Bypass','CheckThenUse_Reparse_TOCTOU','BackupSemantics_DACL_Bypass','Registry_BufferOverflow_TOCTOU','Registry_Data_Path_Reference','COM_HKLM_Hijack')) {
+    if ($primitive -in @('AppExecAlias_Plant','PowerShell_Profile','Electron_AsarTamper','SxS_DotLocal','Dependency_Hijack','Binary_Plant_HighPriv','Pipe_Hijack','Pipe_Instance_Squat','Pipe_Client_IPC_Sink','Config_Poison','Parent_Directory_Reparse_Bypass','File_DeleteChild_Recreate','Arbitrary_Delete_ConfigMsi_LPE','Arbitrary_DACL_Overwrite','Arbitrary_Move_FileRename','ACL_WriteDac_WriteOwner','Signature_TOCTOU_Bypass','CheckThenUse_Reparse_TOCTOU','BackupSemantics_DACL_Bypass','Registry_BufferOverflow_TOCTOU','Registry_Data_Path_Reference','COM_HKLM_Hijack','RPC_Unauthenticated_PathSink','DCOM_Privileged_Activation','WMI_LocalSystemHost_Sink','Service_OnDemand_Trigger_Chain','ScheduledTask_OnDemand_Run','Leaked_Privileged_Handle','SharedSection_MemoryTamper')) {
         switch ($writableFrom) {
             'LowPriv'       { return 'LPE' }
             'AppContainer'  { return 'Sandbox_Escape' }
@@ -258,6 +262,41 @@ $benignReaders = @(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# OPTIONAL PHASE 2 SUBSYSTEM PERMISSIONS ENRICHMENT (Rev 3.5)
+# ═══════════════════════════════════════════════════════════════════════════════
+$sysAudit = $null
+$sysServicesByBinary = @{}
+$sysServicesByName   = @{}
+$sysScheduledTasks   = @{}
+if ([string]::IsNullOrWhiteSpace($SystemPermissionsPath)) {
+    $autoSysPath = Join-Path $feedDir "system_permissions_audit.json"
+    if (Test-Path $autoSysPath) { $SystemPermissionsPath = $autoSysPath }
+}
+if (-not [string]::IsNullOrWhiteSpace($SystemPermissionsPath) -and (Test-Path $SystemPermissionsPath)) {
+    try {
+        Write-Host "[*] Loading Phase 2 Subsystem Permissions Audit: $SystemPermissionsPath" -ForegroundColor Cyan
+        $sysAudit = Get-Content $SystemPermissionsPath -Raw | ConvertFrom-Json
+        if ($null -ne $sysAudit.ServicesByBinary) {
+            foreach ($prop in $sysAudit.ServicesByBinary.PSObject.Properties) {
+                $sysServicesByBinary[$prop.Name.ToLowerInvariant()] = @($prop.Value)
+            }
+        }
+        if ($null -ne $sysAudit.ServicesByName) {
+            foreach ($prop in $sysAudit.ServicesByName.PSObject.Properties) {
+                $sysServicesByName[$prop.Name.ToLowerInvariant()] = $prop.Value
+            }
+        }
+        if ($null -ne $sysAudit.ScheduledTasks) {
+            foreach ($prop in $sysAudit.ScheduledTasks.PSObject.Properties) {
+                $sysScheduledTasks[$prop.Name.ToLowerInvariant()] = $prop.Value
+            }
+        }
+    } catch {
+        Write-Warning "Failed to parse SystemPermissionsPath '$SystemPermissionsPath': $($_.Exception.Message)"
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # RULE BODY
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -333,6 +372,20 @@ foreach ($entry in $rawData) {
     $regDataTargetHasWritableAncestor  = [bool](Get-FieldValue $entry "RegistryDataTargetHasWritableAncestor" $false)
     $regDataTargetWritableAncestorPath = Get-FieldValue $entry "RegistryDataTargetWritableAncestorPath" ""
     $regDataTargetCanWriteDacOrOwner   = [bool](Get-FieldValue $entry "RegistryDataTargetCanWriteDacOrOwner" $false)
+
+    # Phase 2 (Rev 3.5) ETW & Subsystem Correlation Fields
+    $rpcContext = Get-FieldValue $entry "RpcContext" ""
+    if ([string]::IsNullOrWhiteSpace($rpcContext) -and $detail -match '(?i)RPC_Context:\s*([^|\r\n]+)') {
+        $rpcContext = $matches[1].Trim()
+    }
+    $comContext = Get-FieldValue $entry "ComContext" ""
+    if ([string]::IsNullOrWhiteSpace($comContext) -and $detail -match '(?i)COM_Context:\s*([^|\r\n]+)') {
+        $comContext = $matches[1].Trim()
+    }
+    $wmiContext = Get-FieldValue $entry "WmiContext" ""
+    if ([string]::IsNullOrWhiteSpace($wmiContext) -and $detail -match '(?i)WMI_Context:\s*([^|\r\n]+)') {
+        $wmiContext = $matches[1].Trim()
+    }
 
     if ([string]::IsNullOrWhiteSpace($regDataTarget) -and -not [string]::IsNullOrWhiteSpace($regDataPath)) {
         $candRdp = ($regDataPath -split ';')[0].Trim().Trim('"')
@@ -588,7 +641,7 @@ foreach ($entry in $rawData) {
     #                              to AdminToSystemKernel_Research_Prompt.
     # ─────────────────────────────────────────────────────────────────────────
     $isSvcValuePath = ($path -match "(?i)^HKLM\\SYSTEM\\(CurrentControlSet|ControlSet\d+)\\Services\\.+\\(ImagePath|ServiceDll|FailureCommand)$")
-    $isSvcKeyAnomaly = (($writableLow -or $writableMed) -and ($path -match "(?i)^HKLM\\SYSTEM\\(CurrentControlSet|ControlSet\d+)\\Services\\[^\\]+(\\Parameters)?$"))
+    $isSvcKeyAnomaly = (($writableLow -or $writableMed) -and ($aclSource -ne "service-scm-sd") -and ($path -match "(?i)^HKLM\\SYSTEM\\(CurrentControlSet|ControlSet\d+)\\Services\\[^\\]+(\\Parameters)?$"))
     if (-not $isDirectLead -and ($isSvcValuePath -or $isSvcKeyAnomaly)) {
         $exploitPrimitive = "Service_BinaryPath"
         if ($writableLow) {
@@ -651,7 +704,7 @@ foreach ($entry in $rawData) {
     # ─────────────────────────────────────────────────────────────────────────
     # RULE 1.9b: Machine-Wide / HKCR COM Server Hijack (COM_HKLM_Hijack)
     # ─────────────────────────────────────────────────────────────────────────
-    $isHklmComPath = ($path -match "(?i)^(HKLM\\SOFTWARE\\(Wow6432Node\\)?Classes|HKCR)\\(Wow6432Node\\)?(CLSID|Interface|TypeLib|AppID)\\\{[0-9a-fA-F-]+\}")
+    $isHklmComPath = ($aclSource -ne "dcom-launch-sd") -and ($path -match "(?i)^(HKLM\\SOFTWARE\\(Wow6432Node\\)?Classes|HKCR)\\(Wow6432Node\\)?(CLSID|Interface|TypeLib|AppID)\\\{[0-9a-fA-F-]+\}")
     if (-not $isDirectLead -and $isHklmComPath -and ($isPrivileged -or $isPrivilegedAny -or $anyImpersonating) -and ($writableLow -or $writableMed -or $canDeleteOrReplace -or $hasWritableAncestor -or $regDataTargetWritableLow -or $regDataTargetWritableMed)) {
         $severity = "Critical"
         $type = "Machine-Wide COM Registration / Server Hijack"
@@ -839,19 +892,26 @@ foreach ($entry in $rawData) {
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # RULE 4: Scheduled Task XML (placed BEFORE Rule 3 so \System32\Tasks\...
-    # is not shadowed by Rule 3's generic Tasks\ pattern)
+    # RULE 4: Scheduled Task XML & TaskCache SD (placed BEFORE Rule 3/5 so
+    # \System32\Tasks\... is not shadowed by generic Tasks\ or SMB_Coercion)
     # ─────────────────────────────────────────────────────────────────────────
     if (-not $isDirectLead -and $path -match "(?i)\\(System32|SysWOW64)\\Tasks\\.+$|\\schedule\\taskcache\\tree\\") {
-        $exploitPrimitive = "ScheduledTask_Plant"
-        if ($writableLow) {
-            $severity = "Critical"
-            $type = "Scheduled Task Definition Hijack (ACL anomaly)"
-            $reason = "Scheduled-task definition writable by a NON-ADMIN user. Default ACL is Admins/SYSTEM only. Non-default ACL; rewriting the XML's '<Command>' lets you piggy-back on the trigger and run as whichever principal the task is configured to run as."
-        } else {
+        if ($aclSource -eq "taskcache-sd" -or $operation -eq "TaskCache_SD_Audit") {
+            $exploitPrimitive = "ScheduledTask_OnDemand_Run"
             $severity = "High"
-            $type = "Scheduled Task Definition Hijack (admin -> SYSTEM)"
-            $reason = "Scheduled-task definition. As admin you can rewrite the XML's '<Command>' to run as the task's principal (often SYSTEM). Standard admin -> SYSTEM persistence + execution surface; not an anomaly."
+            $type = "Privileged Scheduled Task On-Demand Run / Modification Surface"
+            $reason = "Privileged scheduled task '$path' grants on-demand execution (TASK_EXECUTE) or DACL/task modification rights in TaskCache\Tree\SD to '$writableFrom'."
+        } else {
+            $exploitPrimitive = "ScheduledTask_Plant"
+            if ($writableLow) {
+                $severity = "Critical"
+                $type = "Scheduled Task Definition Hijack (ACL anomaly)"
+                $reason = "Scheduled-task definition writable by a NON-ADMIN user. Default ACL is Admins/SYSTEM only. Non-default ACL; rewriting the XML's '<Command>' lets you piggy-back on the trigger and run as whichever principal the task is configured to run as."
+            } else {
+                $severity = "High"
+                $type = "Scheduled Task Definition Hijack (admin -> SYSTEM)"
+                $reason = "Scheduled-task definition. As admin you can rewrite the XML's '<Command>' to run as the task's principal (often SYSTEM). Standard admin -> SYSTEM persistence + execution surface; not an anomaly."
+            }
         }
         $isDirectLead = $true
     }
@@ -1135,7 +1195,112 @@ foreach ($entry in $rawData) {
         $reason += " [Sandbox Escape Surface: Resource is controllable from AppContainer / Low-IL sandbox context (S-1-15-2-* / Low IL)]"
     }
 
-    # Multi-mechanism writability & Service-SID annotations on direct leads
+    # ─────────────────────────────────────────────────────────────────────────
+    # PHASE 2 (Rev 3.5) SUBSYSTEM & ETW CORRELATION RULES (Rules 13 – 20)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # RULE 13: RPC Unauthenticated / Non-Impersonating Path Sink (RPC_Unauthenticated_PathSink)
+    if ((-not [string]::IsNullOrWhiteSpace($rpcContext)) -and ($isPrivileged -or $isPrivilegedAny) -and ($writableLow -or $writableMed -or $canDeleteOrReplace -or $hasWritableAncestor)) {
+        if (-not $isDirectLead -or (-not $anyImpersonating)) {
+            $severity = "Critical"
+            $type = "RPC Server Handler Accessing Controllable Path ($rpcContext)"
+            $exploitPrimitive = "RPC_Unauthenticated_PathSink"
+            $impStatus = if ($anyImpersonating) { "impersonating caller ($impersonating)" } else { "WITHOUT impersonating caller (Pure $effectiveIntegrity execution!)" }
+            $reason = "Privileged process ($effectiveIntegrity) accessed a user-controllable path during an active RPC call [$rpcContext] $impStatus. An attacker invoking this RPC interface/OpNum can trigger privileged I/O on demand. Effective principal: $effectivePrincipal."
+            $isDirectLead = $true
+        } else {
+            $reason += " [RPC Correlation: Triggered via $rpcContext]"
+        }
+    }
+
+    # RULE 14: WMI LocalSystemHost Provider Path Sink (WMI_LocalSystemHost_Sink)
+    $isWmiHost = ($procs -match '(?i)\bwmiprvse\.exe\b') -or (-not [string]::IsNullOrWhiteSpace($wmiContext)) -or ($path -match '^WMI:\\')
+    if ($isWmiHost -and ($isPrivileged -or $isPrivilegedAny) -and ($writableLow -or $writableMed -or $canDeleteOrReplace -or $hasWritableAncestor) -and (-not $anyImpersonating)) {
+        if (-not $isDirectLead -or $path -match '^WMI:\\' -or (-not [string]::IsNullOrWhiteSpace($wmiContext))) {
+            $severity = "Critical"
+            $type = "WMI Provider Accessing Controllable Resource as Pure SYSTEM"
+            $exploitPrimitive = "WMI_LocalSystemHost_Sink"
+            $wmiInfo = if (-not [string]::IsNullOrWhiteSpace($wmiContext)) { " [$wmiContext]" } else { "" }
+            $reason = "WMI provider host ($procs)$wmiInfo accesses controllable resource '$path' as $effectiveIntegrity WITHOUT impersonating the caller (LocalSystemHost pattern). Any user with WBEM_METHOD_EXECUTE in the namespace can trigger this SYSTEM operation. Effective principal: $effectivePrincipal."
+            $isDirectLead = $true
+        } else {
+            $reason += " [WMI LocalSystemHost Surface: Non-impersonating wmiprvse.exe $wmiContext]"
+        }
+    }
+
+    # RULE 15: DCOM Privileged Activation Surface (DCOM_Privileged_Activation)
+    if (-not $isDirectLead -and ($path -match '(?i)^HKLM\\SOFTWARE\\(Wow6432Node\\)?Classes\\AppID\\\{[0-9a-fA-F-]+\}' -or (-not [string]::IsNullOrWhiteSpace($comContext))) -and ($isPrivileged -or $isPrivilegedAny) -and ($writableLow -or $writableMed -or $aclSource -eq "dcom-launch-sd")) {
+        $severity = "High"
+        $type = "Privileged DCOM AppID Activation / Access Surface"
+        $exploitPrimitive = "DCOM_Privileged_Activation"
+        $reason = "Privileged DCOM activation surface ('$path' $comContext) grants local launch/activation or modification rights to '$writableFrom' ($aclSource). Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    } elseif ($isDirectLead -and (-not [string]::IsNullOrWhiteSpace($comContext))) {
+        $reason += " [COM Correlation: $comContext]"
+    }
+
+    # RULE 16: Object Manager Shared Section Tamper (SharedSection_MemoryTamper)
+    if (-not $isDirectLead -and $path -match '(?i)^(\\BaseNamedObjects\\|\\Sessions\\\d+\\BaseNamedObjects\\)' -and ($isPrivileged -or $isPrivilegedAny) -and ($writableLow -or $writableMed -or $writableAppContainer)) {
+        $severity = "High"
+        $type = "Privileged Shared Memory Section Writable by Lower-IL Principal"
+        $exploitPrimitive = "SharedSection_MemoryTamper"
+        $reason = "Privileged process ($effectiveIntegrity) opens or maps named shared memory section '$path' ($aclSource) that is writable/creatable by '$writableFrom'. Shared-memory pointer/structure modification can corrupt the privileged consumer. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # RULE 17: Kernel Device IOCTL Surface (Kernel_Device_IOCTL_Surface)
+    if (-not $isDirectLead -and $path -match '(?i)^\\Device\\[^\\]+' -and ($writableLow -or $writableMed -or $writableAppContainer -or $aclSource -in @("device-registry-sd", "driver-registry-sd"))) {
+        $severity = "High"
+        $type = "Kernel Driver Device Object Accessible to Non-Admin"
+        $exploitPrimitive = "Kernel_Device_IOCTL_Surface"
+        $reason = "Kernel driver device object '$path' is accessible or modifiable by '$writableFrom' ($aclSource). Any valid device handle permits sending FILE_ANY_ACCESS IOCTLs or direct device writes. Effective principal: $effectivePrincipal."
+        $isDirectLead = $true
+    }
+
+    # RULE 18: Scheduled Task On-Demand Trigger / TaskCache SD (ScheduledTask_OnDemand_Run)
+    if (-not $isDirectLead -and ($aclSource -eq "taskcache-sd" -or ($path -match '(?i)\\(System32|SysWOW64)\\Tasks\\(.+)$' -and $sysScheduledTasks.Count -gt 0))) {
+        $matchedTask = $null
+        if ($path -match '(?i)\\(System32|SysWOW64)\\Tasks(\\.+)$') {
+            $tKey = $matches[2].ToLowerInvariant()
+            if ($sysScheduledTasks.ContainsKey($tKey)) { $matchedTask = $sysScheduledTasks[$tKey] }
+        }
+        if ($aclSource -eq "taskcache-sd" -or ($null -ne $matchedTask -and $matchedTask.RunsAsPrivileged -and ($matchedTask.WritableLow -or $matchedTask.ExecutableLow))) {
+            $severity = "High"
+            $type = "Privileged Scheduled Task On-Demand Run / Modification Surface"
+            $exploitPrimitive = "ScheduledTask_OnDemand_Run"
+            $reason = "Privileged scheduled task '$path' grants on-demand execution (TASK_EXECUTE) or DACL/task modification rights in TaskCache\Tree\SD to '$writableFrom'."
+            $isDirectLead = $true
+        }
+    }
+
+    # RULE 19: Leaked Privileged Handle / Permissive Process DACL (Leaked_Privileged_Handle)
+    if (-not $isDirectLead -and ($path -match '^(Process|Handle)://' -or $aclSource -in @("process-dacl", "system-handle-table"))) {
+        $severity = "Critical"
+        $type = "Leaked Privileged Handle or Permissive Process DACL"
+        $exploitPrimitive = "Leaked_Privileged_Handle"
+        $reason = (Get-FieldValue $entry "DetailedReason" "Privileged process handle or Process DACL is accessible to a lower-integrity process ($aclSource).")
+        $isDirectLead = $true
+    }
+
+    # RULE 20: UIPI High-IL Interactive Window Message Sink (UIPI_HighIL_MessageSink)
+    if (-not $isDirectLead -and ($path -match '^HWND://' -or $aclSource -eq "uipi-session-window")) {
+        $severity = "Medium"
+        $type = "High/SYSTEM Window in Interactive Session (UIPI Message Sink Candidate)"
+        $exploitPrimitive = "UIPI_HighIL_MessageSink"
+        $reason = (Get-FieldValue $entry "DetailedReason" "Privileged process owns a window in the interactive user desktop ($path). Check for ChangeWindowMessageFilterEx(MSGFLT_ALLOW) or uiAccess=true.")
+        $isDirectLead = $true
+    }
+
+    # RULE 21: Service On-Demand Trigger Chain Enrichment & Standalone Service SD Lead (Service_OnDemand_Trigger_Chain)
+    if (-not $isDirectLead -and $aclSource -eq "service-scm-sd") {
+        $severity = "Critical"
+        $type = "Privileged Service Security Descriptor Allows Reconfiguration / Takeover"
+        $exploitPrimitive = "Service_OnDemand_Trigger_Chain"
+        $reason = (Get-FieldValue $entry "DetailedReason" "Privileged service Security Descriptor grants SERVICE_CHANGE_CONFIG, WRITE_DAC, or WRITE_OWNER to '$writableFrom'.")
+        $isDirectLead = $true
+    }
+
+    # Multi-mechanism writability, Service On-Demand Trigger Chain & Service-SID annotations on direct leads
     if ($isDirectLead) {
         if ($canDeleteOrReplace -and $aclSource -match "delete-recreate") {
             $reason += " [Access Mechanism: Controllable via parent Delete/Recreate ($aclSource)]"
@@ -1145,6 +1310,29 @@ foreach ($entry in $rawData) {
         }
         if (-not [string]::IsNullOrWhiteSpace($writableServiceSids)) {
             $reason += " [Service-SID Grant: Writable by per-service SID(s) '$writableServiceSids' — multi-hop escalation target if a matching service is compromised]"
+        }
+        # Enrich with Service On-Demand Start/Stop/Trigger metadata when available
+        $entrySvcTrigger = [bool](Get-FieldValue $entry "ServiceOnDemandTrigger" $false)
+        $entrySvcName    = Get-FieldValue $entry "ServiceName" ""
+        if ($entrySvcTrigger) {
+            $severity = "Critical"
+            if ($exploitPrimitive -in @("Binary_Plant_HighPriv", "Config_Poison", "File_DeleteChild_Recreate", "Service_BinaryPath")) {
+                $exploitPrimitive = "Service_OnDemand_Trigger_Chain"
+            }
+            $reason += " [On-Demand Service Trigger: Service '$entrySvcName' grants SERVICE_START/STOP or has a low-priv ETW/WNF/RPC trigger — instant on-demand LPE without reboot!]"
+        } elseif ($sysServicesByBinary.Count -gt 0 -or $sysServicesByName.Count -gt 0) {
+            foreach ($pItem in $procList) {
+                $pLower = $pItem.ToLowerInvariant()
+                if ($sysServicesByBinary.ContainsKey($pLower)) {
+                    foreach ($svcMeta in $sysServicesByBinary[$pLower]) {
+                        if ($svcMeta.CanStartStopLow -or $svcMeta.HasLowPrivTrigger -or $svcMeta.CanChangeConfigLow) {
+                            $severity = "Critical"
+                            $reason += " [On-Demand Service Trigger: Service '$($svcMeta.ServiceName)' can be started/triggered on demand by a standard user (StartStop=$($svcMeta.CanStartStopLow), Triggers='$($svcMeta.Triggers)')]"
+                            break
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1412,7 +1600,22 @@ foreach ($entry in $rawData) {
             RegistryDataTargetWritableFrom = $regDataTargetWritableFrom
             RegistryDataTargetAclSource    = $regDataTargetAclSource
             WritableServiceSids            = $writableServiceSids
+            RpcContext                     = $rpcContext
+            ComContext                     = $comContext
+            WmiContext                     = $wmiContext
         })
+    }
+}
+
+# Merge standalone Phase 2 Subsystem DirectLeads from system_permissions_audit.json if present
+if ($null -ne $sysAudit -and $null -ne $sysAudit.DirectLeads) {
+    $existingPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($hl in $hardcodedLeads) { [void]$existingPaths.Add([string]$hl.Path) }
+    foreach ($dl in @($sysAudit.DirectLeads)) {
+        if ($null -ne $dl -and -not $existingPaths.Contains([string]$dl.Path)) {
+            [void]$existingPaths.Add([string]$dl.Path)
+            $hardcodedLeads.Add($dl)
+        }
     }
 }
 

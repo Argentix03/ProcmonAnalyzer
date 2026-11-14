@@ -102,9 +102,13 @@ function Resolve-EtwResult {
     return "SUCCESS"
 }
 
-# Step 3: Parse the CSV sequentially
-Write-Host "[+] Commencing deep telemetry normalization phase..." -ForegroundColor Cyan
+# Step 3: Parse the CSV sequentially (with per-PID/TID RPC, COM, WMI & Kernel-Object correlation)
+Write-Host "[+] Commencing deep telemetry normalization & RPC/COM/WMI thread correlation phase..." -ForegroundColor Cyan
 $ProcmonEvents = New-Object System.Collections.Generic.List[object]
+$ThreadRpcContext = @{}
+$ThreadComContext = @{}
+$ThreadWmiContext = @{}
+$PidWmiContext    = @{}
 $reader = [System.IO.File]::OpenText($CsvPath)
 $LineCount = 0
 $MatchCount = 0
@@ -128,9 +132,59 @@ while ($null -ne ($line = $reader.ReadLine())) {
         continue
     }
 
-    if (-not $line.StartsWith("Microsoft-Windows-Kernel-File") -and -not $line.StartsWith("Microsoft-Windows-Kernel-Registry")) { continue }
+    # Track per-(PID,TID) RPC server call context
+    if ($line.StartsWith("Microsoft-Windows-RPC") -or $line.StartsWith("{6ad52b32-d609-4be9-ae07-ce8dae937e39}")) {
+        $blocks = $line -split ","
+        if ($blocks.Count -gt 10) {
+            try {
+                $rPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                $rTid = [Convert]::ToInt32($blocks[10].Trim(), 16).ToString()
+                $ifUuid = if ($line -match '(\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?)') { $matches[1] } else { "UnknownInterface" }
+                $opNum  = if ($line -match '(?i)(?:OpNum|ProcNum)[=:\s"]+([0-9xXa-fA-F]+)') { $matches[1] } else { "?" }
+                $ThreadRpcContext["${rPid}:${rTid}"] = "Interface=$ifUuid OpNum=$opNum"
+            } catch {}
+        }
+        continue
+    }
 
-    if ($line -match '(\\Device\\HarddiskVolume\d+\\[^",\r\n]+|[A-Za-z]:\\[^",\r\n]+|\\REGISTRY\\[^",\r\n]+)') {
+    # Track per-(PID,TID) COM runtime activation / call context
+    if ($line.StartsWith("Microsoft-Windows-COMRuntime") -or $line.StartsWith("{bf406804-6afa-46e7-8a48-6c357e1d6d61}")) {
+        $blocks = $line -split ","
+        if ($blocks.Count -gt 10) {
+            try {
+                $cPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                $cTid = [Convert]::ToInt32($blocks[10].Trim(), 16).ToString()
+                if ($line -match '(\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\})') {
+                    $ThreadComContext["${cPid}:${cTid}"] = "CLSID=$($matches[1])"
+                }
+            } catch {}
+        }
+        continue
+    }
+
+    # Track WMI-Activity namespace / provider context
+    if ($line.StartsWith("Microsoft-Windows-WMI-Activity") -or $line.StartsWith("{1418ef04-b0b4-4623-bf7e-d74ab47bbbd3}")) {
+        $blocks = $line -split ","
+        if ($blocks.Count -gt 10) {
+            try {
+                $wPid = [Convert]::ToInt32($blocks[9].Trim(), 16).ToString()
+                $wTid = [Convert]::ToInt32($blocks[10].Trim(), 16).ToString()
+                $ns = if ($line -match '(?i)(ROOT\\[A-Za-z0-9_\\]+)') { $matches[1] } else { "ROOT\CIMV2" }
+                $prov = if ($line -match '(?i)ProviderName[=:\s"]+([^",\r\n]+)') { $matches[1].Trim() } else { "" }
+                $wmiTag = if ($prov) { "Namespace=$ns Provider=$prov" } else { "Namespace=$ns" }
+                $ThreadWmiContext["${wPid}:${wTid}"] = $wmiTag
+                $PidWmiContext[$wPid] = $wmiTag
+            } catch {}
+        }
+        continue
+    }
+
+    $isFile   = $line.StartsWith("Microsoft-Windows-Kernel-File")
+    $isReg    = $line.StartsWith("Microsoft-Windows-Kernel-Registry")
+    $isObj    = $line.StartsWith("Microsoft-Windows-Kernel-Object") -or $line.StartsWith("{89497f50-effe-4440-8cf2-ce6b1cdcaca7}")
+    if (-not $isFile -and -not $isReg -and -not $isObj) { continue }
+
+    if ($line -match '(\\Device\\HarddiskVolume\d+\\[^",\r\n]+|\\Device\\[^",\r\n]+|\\BaseNamedObjects\\[^",\r\n]+|\\Sessions\\\d+\\BaseNamedObjects\\[^",\r\n]+|[A-Za-z]:\\[^",\r\n]+|\\REGISTRY\\[^",\r\n]+)') {
         $RawPath = $matches[1].Trim()
         if ($RawPath.StartsWith("\Device\HarddiskVolume", [System.StringComparison]::OrdinalIgnoreCase)) {
             if ($RawPath -match "^(\\Device\\HarddiskVolume\d+)(\\.*)?$") {
@@ -152,23 +206,41 @@ while ($null -ne ($line = $reader.ReadLine())) {
         $taskField = if ($blocks.Count -gt 3) { "$($blocks[1]) $($blocks[2]) $($blocks[3])" } else { "" }
         $tsField   = if ($blocks.Count -gt 6 -and $blocks[6].Trim()) { $blocks[6].Trim() } else { (Get-Date).ToString("hh:mm:ss.fffffff tt") }
         $hexPid    = if ($blocks.Count -gt 9) { $blocks[9].Trim() } else { "0" }
+        $hexTid    = if ($blocks.Count -gt 10) { $blocks[10].Trim() } else { "0" }
         $TestPID   = "4"
+        $TestTID   = "0"
         try { $TestPID = [Convert]::ToInt32($hexPid, 16).ToString() } catch {}
+        try { $TestTID = [Convert]::ToInt32($hexTid, 16).ToString() } catch {}
 
         $MappedName      = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].ProcessName } else { "Unknown.exe" }
         $MappedIntegrity = if ($ProcessMap.ContainsKey($TestPID)) { $ProcessMap[$TestPID].Integrity } else { "Unknown" }
         $SimOp           = Resolve-EtwOperation -Provider $blocks[0] -TaskOrOpcode $taskField -Line $line
         $SimResult       = Resolve-EtwResult -Line $line
 
+        $tidKey = "${TestPID}:${TestTID}"
+        $detailParts = @("Integrity: $MappedIntegrity | Native ETW IO")
+        if ($ThreadRpcContext.ContainsKey($tidKey)) {
+            $detailParts += "RPC_Context: $($ThreadRpcContext[$tidKey])"
+        }
+        if ($ThreadComContext.ContainsKey($tidKey)) {
+            $detailParts += "COM_Context: $($ThreadComContext[$tidKey])"
+        }
+        if ($ThreadWmiContext.ContainsKey($tidKey)) {
+            $detailParts += "WMI_Context: $($ThreadWmiContext[$tidKey])"
+        } elseif ($MappedName -match "(?i)^wmiprvse\.exe$" -and $PidWmiContext.ContainsKey($TestPID)) {
+            $detailParts += "WMI_Context: $($PidWmiContext[$TestPID])"
+        }
+
         $obj = [PSCustomObject]@{
             "Time of Day"   = $tsField
             "Process Name"  = $MappedName
             "PID"           = $TestPID
+            "TID"           = $TestTID
             "Operation"     = $SimOp
             "Path"          = $RawPath
             "Result"        = $SimResult
             "Integrity"     = $MappedIntegrity
-            "Detail"        = "Integrity: $MappedIntegrity | Native ETW IO"
+            "Detail"        = ($detailParts -join " | ")
             "Impersonating" = "Unknown"
         }
         $ProcmonEvents.Add($obj)

@@ -129,10 +129,14 @@ if ($Start) {
         "Microsoft-Windows-Kernel-Process 0xffffffffffffffff 0xff"
         "Microsoft-Windows-Security-Auditing 0xffffffffffffffff 0xff"
         "Microsoft-Windows-Kernel-Registry 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-RPC 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-COMRuntime 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-WMI-Activity 0xffffffffffffffff 0xff"
+        "Microsoft-Windows-Kernel-Object 0xffffffffffffffff 0xff"
     )
     $Providers | Out-File $ManifestPath -Encoding ascii
 
-    Write-Host "[+] Binding Kernel Providers: File, Process, Auditing, Registry..."
+    Write-Host "[+] Binding Kernel & Subsystem Providers: File, Process, Auditing, Registry, RPC, COM, WMI, Object..."
     & logman.exe create trace $TraceName -pf "$ManifestPath" -o "$OutputPath" -ets | Out-Null
 
     Write-Host "[+] ETW Trace '$TraceName' is actively running and locked securely to OS." -ForegroundColor Green

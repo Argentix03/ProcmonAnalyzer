@@ -49,7 +49,9 @@ $ResearchPromptCatalog = @(
             'PowerShell_Profile','Electron_AsarTamper','ACL_WriteDac_WriteOwner',
             'Arbitrary_DACL_Overwrite','Arbitrary_Delete_ConfigMsi_LPE','Arbitrary_Move_FileRename',
             'Parent_Directory_Reparse_Bypass','BackupSemantics_DACL_Bypass','Signature_TOCTOU_Bypass',
-            'CheckThenUse_Reparse_TOCTOU','COM_HKLM_Hijack'
+            'CheckThenUse_Reparse_TOCTOU','COM_HKLM_Hijack','RPC_Unauthenticated_PathSink',
+            'DCOM_Privileged_Activation','WMI_LocalSystemHost_Sink','Service_OnDemand_Trigger_Chain',
+            'ScheduledTask_OnDemand_Run','Leaked_Privileged_Handle','SharedSection_MemoryTamper'
         )
     },
     [PSCustomObject]@{
@@ -62,7 +64,7 @@ $ResearchPromptCatalog = @(
         Id = 'uac'
         Title = 'UAC Bypass'
         File = 'UAC_Bypass_Research_Prompt.md'
-        Primitives = @('COM_Hijack_HKCU','Env_Hijack_HKCU')
+        Primitives = @('COM_Hijack_HKCU','Env_Hijack_HKCU','UIPI_HighIL_MessageSink')
     },
     [PSCustomObject]@{
         Id = 'rce_lateral'
@@ -80,7 +82,7 @@ $ResearchPromptCatalog = @(
         Id = 'admin_kernel'
         Title = 'Admin -> SYSTEM / Kernel'
         File = 'AdminToSystemKernel_Research_Prompt.md'
-        Primitives = @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant')
+        Primitives = @('Service_BinaryPath','IFEO_Debugger','AeDebug','ScheduledTask_Plant','Kernel_Device_IOCTL_Surface')
     }
 )
 

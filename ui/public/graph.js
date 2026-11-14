@@ -113,7 +113,12 @@
         'arbitrary_delete_configmsi_lpe':'#f03e3e', 'arbitrary_move_filerename':'#ff6b6b',
         'parent_directory_reparse_bypass':'#fa5252', 'backupsemantics_dacl_bypass':'#c92a2a',
         'signature_toctou_bypass':'#e67700', 'checkthenuse_reparse_toctou':'#f76707',
-        'com_hklm_hijack':'#fd7e14', 'appcontainer_sandbox_escape':'#bd93f9'
+        'com_hklm_hijack':'#fd7e14', 'appcontainer_sandbox_escape':'#bd93f9',
+        'rpc_unauthenticated_pathsink':'#e03131', 'dcom_privileged_activation':'#f08c00',
+        'wmi_localsystemhost_sink':'#d9480f', 'service_ondemand_trigger_chain':'#c92a2a',
+        'scheduledtask_ondemand_run':'#e8590c', 'leaked_privileged_handle':'#f03e3e',
+        'kernel_device_ioctl_surface':'#ae3ec9', 'sharedsection_memorytamper':'#7950f2',
+        'uipi_highil_messagesink':'#fab005'
     };
 
     function getNodeColor(field, value) {
