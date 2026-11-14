@@ -73,6 +73,7 @@ param(
     [int]$MaxLeads = 10,
     [string]$Snapshot,
     [string]$GuiDriver,
+    [string]$StaticVerificationJson = '',
     [switch]$Confirmed
 )
 
@@ -176,6 +177,29 @@ if ([string]::IsNullOrWhiteSpace($GuiDriver)) {
     exit 1
 }
 
+# ── Pre-Stage Static Verification (Phase 3 Verify-LeadStatically) ─────────────
+$staticVerifyMap = @{}
+$verifyScript = Join-Path $projectRoot 'skills\Verify-LeadStatically\scripts\VerifyLeadStatically.ps1'
+if ([string]::IsNullOrWhiteSpace($StaticVerificationJson)) {
+    $StaticVerificationJson = Join-Path $OutputRoot 'static_verification_results.json'
+}
+if ((Test-Path $verifyScript) -and (-not (Test-Path $StaticVerificationJson))) {
+    try {
+        & $verifyScript -LeadsJson $LeadsJson -OutputPath $StaticVerificationJson -MinSeverity $MinSeverity -MaxLeads $MaxLeads -Silent | Out-Null
+    } catch {}
+}
+if (Test-Path $StaticVerificationJson) {
+    try {
+        $svRaw = Get-Content $StaticVerificationJson -Raw | ConvertFrom-Json
+        foreach ($svItem in $svRaw) {
+            if ($null -ne $svItem) {
+                $svKey = "$($svItem.ExploitPrimitive)|$($svItem.Path)"
+                $staticVerifyMap[$svKey] = $svItem
+            }
+        }
+    } catch {}
+}
+
 # ── Stage workspace ───────────────────────────────────────────────────────────
 
 $state = [ordered]@{
@@ -197,6 +221,7 @@ foreach ($lead in $filtered) {
 
     $promptFile = Get-ResearchPromptForPrimitive -Primitive $lead.ExploitPrimitive
     $promptAbs  = Join-Path $projectRoot $promptFile
+    $svMatch    = $staticVerifyMap["$($lead.ExploitPrimitive)|$($lead.Path)"]
 
     $manifest = [ordered]@{
         LeadIndex          = $idx
@@ -217,6 +242,7 @@ foreach ($lead in $filtered) {
         DetailedReason     = $lead.DetailedReason
         TraceFile          = $lead.TraceFile
         Timestamp          = $lead.Timestamp
+        StaticVerification = $svMatch
         ResearchPrompt     = @{
             File         = $promptFile
             AbsolutePath = $promptAbs
@@ -228,7 +254,21 @@ foreach ($lead in $filtered) {
     }
 
     $manifestPath = Join-Path $leadDir 'manifest.json'
-    $manifest | ConvertTo-Json -Depth 6 | Out-File $manifestPath -Encoding UTF8
+    $manifest | ConvertTo-Json -Depth 7 | Out-File $manifestPath -Encoding UTF8
+
+    $staticMdSection = if ($null -ne $svMatch) {
+@"
+
+## Phase 3 Pre-VM Static Verification (`Verify-LeadStatically`)
+
+- **Resolved Target Binary:** ``$($svMatch.TargetBinaryPath)`` *(via $($svMatch.ResolutionMethod))*
+- **Static Triage Status:** ``$($svMatch.StaticTriageStatus)``
+- **Q1 (Flags):** $($svMatch.Q1_FlagCheck)
+- **Q2 (Impersonation):** $($svMatch.Q2_ImpersonationCheck)
+- **Q3 (Sink):** $($svMatch.Q3_SinkIdentification)
+- **Q4 (Trigger):** $($svMatch.Q4_TriggerReachability)
+"@
+    } else { "" }
 
     $readme = @"
 # Execution_Lead_$idx
@@ -237,6 +277,7 @@ foreach ($lead in $filtered) {
 **Exploit Primitive:** ``$($lead.ExploitPrimitive)``
 **Path:** ``$($lead.Path)``
 **Effective Principal:** $($lead.EffectivePrincipal)
+$staticMdSection
 
 ## Research instructions
 

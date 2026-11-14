@@ -21,7 +21,10 @@ You have full permission to configure the VM, install tools, disable
 AV/firewall, attach debuggers/tracers (incl. `kd.exe -k net`), snapshot/
 revert, drive the GUI through MCP, load test-signed kernel drivers
 (after enabling `bcdedit /set testsigning on`), and trigger Bug Checks
-deliberately.
+deliberately:
+- **Pre-VM Static Verification (`Verify-LeadStatically` + IDA MCP):** Check the lead's `StaticVerification` record (or run `skills/Verify-LeadStatically/scripts/VerifyLeadStatically.ps1`) and use **Official Hex-Rays IDA MCP (`HexRaysSA/ida-mcp`)** or **`mrexodia/ida-pro-mcp`** to decompile `DriverEntry` (`IoCreateDevice` vs `WdmlibIoCreateDeviceSecure`, `FILE_DEVICE_SECURE_OPEN = 0x100`), locate `DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL]` (`0x0E`), and audit IOCTL dispatch handlers (`MethodNeither` user pointers, `MmMapIoSpace`, MSR writes, or unvalidated `Irp->RequestorMode`) statically before booting the kernel test VM.
+- **Official WinDbg MCP (Kernel & Time-Travel Debugging):** Connect WinDbg MCP (`1.2610+` / `glslang/windbg-mcp`) to `kd -k net` or local TTD sessions to inspect `_DEVICE_OBJECT` security descriptors (`!devobj`, `!sd`), verify `_EPROCESS.Token` transitions, and capture instruction-level kernel evidence.
+- **Tier 1 (`Windows-MCP` / `uiautomation-mcp`) & Tier 2 (`SystemAccessMCP` `HostHyperV`):** Drive usermode service/management UIs via Tier 1 UIA and manage Hyper-V VM snapshots / Secure Desktop via `SystemAccessMCP`.
 
 Subagents are allowed for parallelizable subtasks (driver-survey sweeps,
 parallel symbol-server downloads, structured kernel-pool layouts probes),

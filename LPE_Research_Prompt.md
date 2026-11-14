@@ -11,9 +11,12 @@ own dedicated research like a real security researcher would do.
 
 You have full permission to configure the VM, install tools, disable
 AV/firewall, attach debuggers/tracers, snapshot/revert, and drive the GUI
-through MCP. Use `GuestDesktop` for in-guest desktop work and
-`HostHyperV` for the lock screen, UAC secure desktop, Winlogon, or any
-surface not visible to the in-guest agent.
+through MCP:
+- **Pre-VM Static Verification (`Verify-LeadStatically` + IDA MCP):** Check the lead's `StaticVerification` block (or run `skills/Verify-LeadStatically/scripts/VerifyLeadStatically.ps1`) and use **Official Hex-Rays IDA MCP (`HexRaysSA/ida-mcp`)** or **`mrexodia/ida-pro-mcp`** to verify `CreateFileW`/`NtCreateFile`/`RegOpenKeyExW` flags, `RpcImpersonateClient`/`CoImpersonateClient` return-value checks, downstream sinks, and RPC/COM/Task/Service triggers statically before mutating the VM.
+- **Tier 1 Usermode UIA MCP (`Windows-MCP` / `uiautomation-mcp`):** Default for driving usermode desktop applications via the Windows UI Automation control tree (`AutomationId`, `InvokePattern`, `ValuePattern`) and performing automated UI surface fuzzing.
+- **Tier 2 Secure Desktop & Hyper-V MCP (`SystemAccessMCP`):** Use `GuestDesktop` for in-guest desktop work and `HostHyperV` for the lock screen, UAC secure desktop (`consent.exe`), Winlogon, and VM snapshot management.
+- **Tier 3 Electron & WebView2 MCP (`Chrome DevTools MCP`):** Attach via `--remote-debugging-port=9222` (`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222"`) to inspect `window.chrome.webview.postMessage` / `ipcRenderer` bridges for `Electron_AsarTamper` and `Config_Poison` leads.
+- **Dynamic & Time-Travel Debugging MCP (`WinDbg MCP` / `x64dbg-mcp-server`):** Use Official Microsoft WinDbg MCP (WinDbg `1.2610+` / `ttd.exe -attach <PID>`) to record Time-Travel Debugging (TTD) traces of the target service, query every `ntdll!NtCreateFile` / `ntdll!NtOpenKeyEx` call backward/forward in time, inspect `OBJECT_ATTRIBUTES.Attributes` (`OBJ_DONT_REPARSE` = `0x1000`), and verify the active thread token (`!token`) at the exact instruction pointer.
 
 Prefer built-in tooling first (PowerShell, Procmon/ProcExp,
 ETW/`logman`/WPR, RegEdit/`reg`, `wevtutil`, `icacls`, `sc.exe`,

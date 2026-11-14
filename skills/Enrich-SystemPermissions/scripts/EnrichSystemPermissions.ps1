@@ -914,6 +914,20 @@ while ($taskStack.Count -gt 0) {
                     }
                     if ($xmlText -match '(?i)<Command>([^<]+)</Command>') {
                         $actionCmd = $matches[1].Trim()
+                    } elseif ($xmlText -match '(?i)<ClassId>(\{[0-9a-fA-F-]+\})</ClassId>') {
+                        $comClsid = $matches[1].Trim()
+                        $comTarget = ""
+                        foreach ($srvSub in @("InprocServer32", "LocalServer32")) {
+                            try {
+                                $ck = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Classes\CLSID\$comClsid\$srvSub")
+                                if ($null -ne $ck) {
+                                    $comTarget = [string]$ck.GetValue("", "")
+                                    $ck.Close()
+                                    if (-not [string]::IsNullOrWhiteSpace($comTarget)) { break }
+                                }
+                            } catch {}
+                        }
+                        $actionCmd = if (-not [string]::IsNullOrWhiteSpace($comTarget)) { "COM:$comClsid -> $comTarget" } else { "COM:$comClsid" }
                     }
                     if ($xmlText -match '\$\(Arg\d+\)') {
                         $hasUserArgs = $true
@@ -986,6 +1000,21 @@ if ($tasksAudit.Count -eq 0) {
                     $xmlText     = [string]$taskItem.Xml
                     $runsAsPriv  = ($xmlText -match '(?i)<UserId>(S-1-5-18|S-1-5-19|S-1-5-20|SYSTEM|LOCAL SERVICE|NETWORK SERVICE)</UserId>' -or $xmlText -match '(?i)<RunLevel>HighestAvailable</RunLevel>')
                     $actionCmd   = if ($xmlText -match '(?i)<Command>([^<]+)</Command>') { $matches[1].Trim() } else { "" }
+                    if ([string]::IsNullOrWhiteSpace($actionCmd) -and $xmlText -match '(?i)<ClassId>(\{[0-9a-fA-F-]+\})</ClassId>') {
+                        $comClsid = $matches[1].Trim()
+                        $comTarget = ""
+                        foreach ($srvSub in @("InprocServer32", "LocalServer32")) {
+                            try {
+                                $ck = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Classes\CLSID\$comClsid\$srvSub")
+                                if ($null -ne $ck) {
+                                    $comTarget = [string]$ck.GetValue("", "")
+                                    $ck.Close()
+                                    if (-not [string]::IsNullOrWhiteSpace($comTarget)) { break }
+                                }
+                            } catch {}
+                        }
+                        $actionCmd = if (-not [string]::IsNullOrWhiteSpace($comTarget)) { "COM:$comClsid -> $comTarget" } else { "COM:$comClsid" }
+                    }
                     $hasUserArgs = ($xmlText -match '\$\(Arg\d+\)')
                     $embSddl     = ""
                     try { $embSddl = [string]$taskItem.SecurityDescriptor } catch {}

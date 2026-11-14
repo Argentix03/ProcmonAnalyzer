@@ -9,9 +9,11 @@ under primitives such as `Env_Hijack_HKCU`, `COM_Hijack_HKCU`,
 
 You have full permission to configure the VM, install tools, disable
 AV/firewall, attach debuggers/tracers, snapshot/revert, and drive the GUI
-through MCP. Use `GuestDesktop` for in-guest desktop work and `HostHyperV`
-for the lock screen, UAC secure desktop, Winlogon, or any surface not
-visible to the in-guest agent.
+through MCP:
+- **Pre-VM Static Verification (`Verify-LeadStatically` + IDA MCP):** Check the lead's `StaticVerification` record (or run `skills/Verify-LeadStatically/scripts/VerifyLeadStatically.ps1`) to confirm `AutoElevate=True` / `UiAccess=True` in the embedded manifest, inspect imported registry/process sinks, and use **Official Hex-Rays IDA MCP (`HexRaysSA/ida-mcp`)** or **`mrexodia/ida-pro-mcp`** to verify `RegOpenKeyExW` flags (`REG_OPTION_OPEN_LINK`), `ShellExecuteExW` / `CreateProcessW` arguments, or `ChangeWindowMessageFilterEx` UIPI message sinks statically.
+- **Tier 1 Usermode UIA MCP (`Windows-MCP` / `uiautomation-mcp`):** Drive usermode MMC snap-ins, settings dialogs, and UIPI window message targets via the Windows UI Automation control tree.
+- **Tier 2 Secure Desktop & Hyper-V MCP (`SystemAccessMCP`):** Use `GuestDesktop` for in-guest desktop work and `HostHyperV` for the lock screen, UAC secure desktop (`consent.exe`), Winlogon, or any surface not visible to the in-guest agent.
+- **Dynamic & Time-Travel Debugging MCP (`WinDbg MCP` / `x64dbg-mcp-server`):** Use Official WinDbg MCP (`ttd.exe`) to trace auto-elevating process startup and verify HKCU registry resolution and child process creation under High IL.
 
 Subagents are allowed for parallelizable subtasks (CLSID enumeration sweeps,
 manifest harvesting, scheduled-task surface inventories), but the chain of

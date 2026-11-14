@@ -41,7 +41,15 @@ Check which mechanism flagged `WritableByAppContainer = $true`:
 
 Always run `icacls "<TargetPath>"` to check for `Mandatory Label\Low Mandatory Level` before confirming write reachability from a Low-IL AppContainer.
 
-### Step 3 — Inspect the Out-of-Sandbox Consumer Behavior
+### Step 3 — Static Decompilation & Dynamic MCP Verification (`Verify-LeadStatically` + IDA / WinDbg / DevTools MCP)
+Before and during sandbox testing, leverage the Phase 3 MCP toolchain:
+- **Static Verification (`Verify-LeadStatically` + IDA MCP):** Run `skills/Verify-LeadStatically/scripts/VerifyLeadStatically.ps1` and use **Official Hex-Rays IDA MCP (`HexRaysSA/ida-mcp`)** or **`mrexodia/ida-pro-mcp`** on the broker binary/DLL (or DCOM server / kernel driver) to verify:
+  1. Whether the broker calls `RpcImpersonateClient` / `CoImpersonateClient` / `ImpersonateNamedPipeClient` and checks its return value before opening the path.
+  2. Whether the broker passes `FILE_FLAG_OPEN_REPARSE_POINT` / `OBJ_DONT_REPARSE` or validates paths against `%LOCALAPPDATA%\Packages\<PackageFamilyName>`.
+- **Tier 3 Chrome DevTools MCP (`chrome-devtools-plugin`):** For WebView2 / Electron sandbox targets, attach via `--remote-debugging-port=9222` to inspect `window.chrome.webview.postMessage` / `ipcRenderer` IPC payloads sent from the sandboxed renderer to the Medium/High/SYSTEM broker.
+- **Official WinDbg MCP (TTD):** Attach Time-Travel Debugging (`ttd.exe -attach <BrokerPID>`) to the out-of-sandbox broker while exercising the IPC/file surface to inspect caller token checks (`!token`) and `NtCreateFile` parameters across time.
+
+### Step 4 — Inspect the Out-of-Sandbox Consumer Behavior
 Check how the Medium/High/System consumer interacts with the resource in the Procmon trace:
 1. **Binary / Library Load (`Load Image`, `CreateFile` on `.dll`/`.exe`):** Does the broker or host process load a DLL or execute a helper from a directory writable by `ALL APPLICATION PACKAGES`?
 2. **Configuration / State Deserialization:** Does a broker service or desktop process parse JSON/XML/INI/config data written by the AppContainer without schema or path validation?

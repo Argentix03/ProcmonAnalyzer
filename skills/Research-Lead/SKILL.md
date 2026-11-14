@@ -45,18 +45,30 @@ Running this on the trace-source workstation can:
 
 ---
 
-## 2. GUI-driver MCP (recommended, optional)
+## 2. MCP Tooling Architecture (Static Reversing, 3-Tier GUI & Time-Travel Debugging)
 
-Several research tasks need to drive surfaces that aren't reachable from a normal automation session — the **secure desktop** (consent.exe / UAC prompt), **Winlogon**, the **lock screen**, and any window the in-guest agent's screenshot tooling can't see. Without a GUI driver the agent has to fall back to "ask the user to click Y".
+Before touching a test VM (and while driving reproduction inside the VM), `Research-Lead` integrates three categories of MCP servers:
 
-| Option | Reaches secure desktop? | Notes |
+### 2.1 Pre-VM Static Reversing MCP (`Verify-LeadStatically`)
+Always run `skills/Verify-LeadStatically/scripts/VerifyLeadStatically.ps1` (and/or attach **IDA MCP**) before booting the test VM to answer the 4 static questions (Open/Reparse flags, Impersonation check, Downstream sink, and Trigger reachability):
+- **Official Hex-Rays IDA MCP (`HexRaysSA/ida-mcp`):** Headless `idalib` (IDA Pro 9.0+) MCP server (`uvx ida-hcli mcp install`) capable of decompiling target `.exe`/`.dll`/`.sys` binaries in the background with Microsoft Symbol Server PDB auto-loading.
+- **Community `mrexodia/ida-pro-mcp`:** Connects to an interactive IDA Pro instance (`check_connection`, `list_strings_filter`, `list_imports`, `get_xrefs_to`, `decompile_function`, `get_callers`, `set_comment`) to verify sink code paths and annotate `.i64` databases live.
+
+### 2.2 Three-Tier GUI & Application Automation MCPs
+Several research tasks need to drive either complex multi-tab usermode desktop apps, Electron/WebView2 IPC clients, or the **Secure Desktop** (`consent.exe` / UAC prompt, **Winlogon**, **Lock Screen**).
+
+| Tier / Option | Reaches Secure Desktop? | Primary Role in `Research-Lead` |
 |---|---|---|
-| **[`SystemAccessMCP`](https://github.com/Argentix03/SystemAccessMCP)** | **Yes** — via `HostHyperV` profile that drives the guest VM through VMConnect from the host | The right choice for this workflow. Two profiles: `GuestDesktop` for in-guest work, `HostHyperV` for the lock screen / UAC / Winlogon. Tools: `screenshot`, `mouse_move`, `mouse_click`, `keyboard_type`, `keyboard_key`, `cursor_state`, `window_foreground`, `window_hover`, `window_from_point`, `window_list`, `screen_state`, `system_status`, plus `hyperv_status` / `hyperv_list_vms` / `hyperv_start_vm` and 8 VM-console tools. 3 transports: stdio, HTTP web server (`Start-WebServer.ps1`), MCP-over-HTTP (`Start-McpHttpServer.ps1`). The `LPE_Research_Prompt.md` already references its `GuestDesktop` / `HostHyperV` profiles by name. |
-| [Windows-MCP (CursorTouch)](https://github.com/CursorTouch/Windows-MCP) | No — user session only | Solid fallback for in-guest work; exposes the UI Automation (A11y) tree which is more reliable than blind screenshot+vision for many tasks. |
-| Claude Code Desktop **Computer Use** (built-in, 2026, Pro/Max) | No — user session only | Lowest friction (no MCP install). Toggle in **Settings → General → Desktop app → Computer use**. Useful when the lead doesn't need the secure desktop. |
-| [MCPControl](https://github.com/claude-did-this/MCPControl) / [PyMCPAutoGUI](https://creati.ai/mcp/pymcpautogui/) / [Helix Pilot](https://mcpmarket.com/server/helix-pilot) / [Mario Andreschak's Windows Desktop Automation](https://github.com/mario-andreschak/mcp-windows-desktop-automation) | No — user session only | Generic productivity automation. Functional, but none of these are offensive-security-aware. |
+| **Tier 1 — Usermode UIA MCP:**<br/>[`CursorTouch/Windows-MCP`](https://github.com/CursorTouch/Windows-MCP) (`uvx windows-mcp`) or [`locomorange/uiautomation-mcp`](https://github.com/locomorange/uiautomation-mcp) | No — user session only | **Default for usermode desktop apps.** Exposes the Windows UI Automation (UIA) control tree (`AutomationId`, `Name`, `ControlType`, `InvokePattern`, `ValuePattern`) for fast, deterministic clicking/typing without coordinate guessing, plus automated "UI Surface Fuzzing" during trace capture. |
+| **Tier 2 — Secure Desktop & Hyper-V MCP:**<br/>[**`SystemAccessMCP`**](https://github.com/Argentix03/SystemAccessMCP) | **Yes** — via `HostHyperV` profile driving the guest VM through VMConnect from the host | **Required for Secure Desktop (`consent.exe`, Winlogon, Lock Screen) & VM snapshot orchestration.** Two profiles: `GuestDesktop` for in-guest work, `HostHyperV` for crossing session/desktop boundaries and managing Hyper-V snapshots (`hyperv_status`, `hyperv_list_vms`, `hyperv_start_vm`). |
+| **Tier 3 — Electron & WebView2 MCP:**<br/>**Chrome DevTools MCP** (`chrome-devtools-plugin`) | No — renderer/DOM | **Default for Electron & WebView2 apps.** Attach via `--remote-debugging-port=9222` (`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222"`) to inspect `window.chrome.webview.postMessage` / `ipcRenderer` bridges and test `Electron_AsarTamper` & `Config_Poison` leads live. |
+| Claude Code Desktop **Computer Use** (built-in, 2026, Pro/Max) | No — user session only | Zero-install fallback when the lead does not require the secure desktop. |
 
-**Recommendation:** install SystemAccessMCP on a separate Hyper-V host, run the test VM as a guest, and use `HostHyperV` to drive secure-desktop interactions while `GuestDesktop` handles in-guest work. If a Hyper-V host isn't available, fall back to the in-guest user-session path (Windows-MCP or Claude Code Computer Use) and explicitly note in the verdict file that the secure desktop was not reachable.
+### 2.3 Dynamic & Time-Travel Debugging (TTD) MCPs
+- **Official Microsoft WinDbg MCP (WinDbg `1.2610+` / `glslang/windbg-mcp`):** Attach to user-mode services, kernel targets (`kd -k net`), or record a 5-second **Time-Travel Debugging (TTD)** trace (`ttd.exe -attach <PID>`) while triggering the lead. Query every `ntdll!NtCreateFile` / `ntdll!NtOpenKeyEx` call backward and forward in time, inspect `OBJECT_ATTRIBUTES.Attributes` (`OBJ_DONT_REPARSE` / `0x1000`), and verify the active thread token (`!token`) at the exact instruction pointer.
+- **`x64dbg-mcp-server` (`duty1g/x64dbg-mcp-server`):** Rapid conditional breakpoint scripting and memory inspection for stripped 3rd-party user-mode binaries inside the guest VM.
+
+**Recommendation:** Run `Verify-LeadStatically` + IDA MCP first on the analysis host; then on the test VM use **Tier 1 (`Windows-MCP` / `uiautomation-mcp`)** for usermode UI driving, **Tier 2 (`SystemAccessMCP` `HostHyperV`)** for UAC/Winlogon/snapshot control, **Tier 3 (`Chrome DevTools MCP`)** for WebView2/Electron targets, and **WinDbg MCP (TTD)** to capture instruction-level proof.
 
 The agent should **ask the user once** which option they have available and accept "none — I'll click the secure-desktop steps myself" as a valid answer; in that case, mark every secure-desktop step in `Reproduce_LeadN.ps1` with a `# MANUAL: <instruction>` comment and pause execution at those points.
 
@@ -121,12 +133,12 @@ The script `scripts/Get-ResearchPromptForPrimitive.ps1` returns the right prompt
 
 | Primitive(s) | Prompt |
 |---|---|
-| `SMB_Coercion`, `Oplock_ArbitraryWrite`, `Pipe_Plant_Redirect`, `Pipe_Hijack`, `Pipe_Instance_Squat`, `Pipe_Client_IPC_Sink`, `Registry_Coercion`, `Registry_BufferOverflow_TOCTOU`, `Registry_Data_Path_Reference`, `Binary_Plant_*`, `File_DeleteChild_Recreate`, `SxS_DotLocal`, `Dependency_Hijack`, `Config_Poison`, `AppExecAlias_Plant`, `PowerShell_Profile`, `Electron_AsarTamper`, `ACL_WriteDac_WriteOwner`, `Arbitrary_DACL_Overwrite`, `Arbitrary_Delete_ConfigMsi_LPE`, `Arbitrary_Move_FileRename`, `Parent_Directory_Reparse_Bypass`, `BackupSemantics_DACL_Bypass`, `Signature_TOCTOU_Bypass`, `CheckThenUse_Reparse_TOCTOU`, `COM_HKLM_Hijack` | `LPE_Research_Prompt.md` |
+| `SMB_Coercion`, `Oplock_ArbitraryWrite`, `Pipe_Plant_Redirect`, `Pipe_Hijack`, `Pipe_Instance_Squat`, `Pipe_Client_IPC_Sink`, `Registry_Coercion`, `Registry_BufferOverflow_TOCTOU`, `Registry_Data_Path_Reference`, `Binary_Plant_*`, `File_DeleteChild_Recreate`, `SxS_DotLocal`, `Dependency_Hijack`, `Config_Poison`, `AppExecAlias_Plant`, `PowerShell_Profile`, `Electron_AsarTamper`, `ACL_WriteDac_WriteOwner`, `Arbitrary_DACL_Overwrite`, `Arbitrary_Delete_ConfigMsi_LPE`, `Arbitrary_Move_FileRename`, `Parent_Directory_Reparse_Bypass`, `BackupSemantics_DACL_Bypass`, `Signature_TOCTOU_Bypass`, `CheckThenUse_Reparse_TOCTOU`, `COM_HKLM_Hijack`, `RPC_Unauthenticated_PathSink`, `DCOM_Privileged_Activation`, `WMI_LocalSystemHost_Sink`, `Service_OnDemand_Trigger_Chain`, `ScheduledTask_OnDemand_Run`, `Leaked_Privileged_Handle`, `SharedSection_MemoryTamper` | `LPE_Research_Prompt.md` |
 | `AppContainer_Sandbox_Escape` | `SandboxEscape_Research_Prompt.md` |
-| `COM_Hijack_HKCU`, `Env_Hijack_HKCU` | `UAC_Bypass_Research_Prompt.md` |
+| `COM_Hijack_HKCU`, `Env_Hijack_HKCU`, `UIPI_HighIL_MessageSink` | `UAC_Bypass_Research_Prompt.md` |
 | `URL_NTLM_Coerce`, `Theme_NTLM_Coerce`, `DesktopIni_Coerce`, `WebShell_Plant`, `LNK_Hijack`, `Cert_Plant` | `RCE_LateralMovement_Research_Prompt.md` |
 | `LOLBin_Proxy`, `AutoRun_Persistence` | `ProxyExecution_LOLBin_Research_Prompt.md` |
-| `Service_BinaryPath`, `IFEO_Debugger`, `AeDebug`, `ScheduledTask_Plant` | `AdminToSystemKernel_Research_Prompt.md` |
+| `Service_BinaryPath`, `IFEO_Debugger`, `AeDebug`, `ScheduledTask_Plant`, `Kernel_Device_IOCTL_Surface` | `AdminToSystemKernel_Research_Prompt.md` |
 | (anything else) | `LPE_Research_Prompt.md` (universal default) |
 
 ---

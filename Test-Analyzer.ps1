@@ -583,8 +583,36 @@ if (Test-Path $analyzerScript) {
         $allPassed = $false
     }
 
+    # Phase 3 (Rev 3.6) Verify-LeadStatically Test
+    $verifyScript = Join-Path $PSScriptRoot "skills\Verify-LeadStatically\scripts\VerifyLeadStatically.ps1"
+    $staticOutJson = Join-Path $PSScriptRoot "static_verification_results.json"
+    $idaQueueJson  = Join-Path $PSScriptRoot "ida_mcp_verification_queue.json"
+    $staticRepMd   = Join-Path $PSScriptRoot "Static_Verification_Report.md"
+
+    if (Test-Path $verifyScript) {
+        & $verifyScript -LeadsJson $hardcodedJson -OutputPath $staticOutJson -MinSeverity Medium -MaxLeads 40 -Silent
+        if ((Test-Path $staticOutJson) -and (Test-Path $idaQueueJson) -and (Test-Path $staticRepMd)) {
+            $svParsed = Get-Content $staticOutJson -Raw | ConvertFrom-Json
+            $svItems  = New-Object System.Collections.Generic.List[PSCustomObject]
+            foreach ($s in $svParsed) { if ($null -ne $s) { $svItems.Add($s) } }
+            $resolvedCount = @($svItems | Where-Object { $_.BinaryExists -eq $true -and -not [string]::IsNullOrWhiteSpace($_.Q1_FlagCheck) }).Count
+            if ($svItems.Count -ge 20 -and $resolvedCount -ge 1) {
+                Write-Host "  [PASS] Phase 3 Verify-LeadStatically verified $($svItems.Count) leads ($resolvedCount host binaries statically analyzed with IDA MCP playbooks)" -ForegroundColor Green
+            } else {
+                Write-Host "  [FAIL] Phase 3 Verify-LeadStatically returned insufficient verified items ($($svItems.Count))" -ForegroundColor Red
+                $allPassed = $false
+            }
+        } else {
+            Write-Host "  [FAIL] Phase 3 Verify-LeadStatically did not emit expected output files" -ForegroundColor Red
+            $allPassed = $false
+        }
+    } else {
+        Write-Host "  [FAIL] VerifyLeadStatically.ps1 not found at $verifyScript" -ForegroundColor Red
+        $allPassed = $false
+    }
+
     # Cleanup temporary test outputs
-    Remove-Item -Path $jsonPath, $hardcodedJson, $cognitiveJson -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $jsonPath, $hardcodedJson, $cognitiveJson, $staticOutJson, $idaQueueJson, $staticRepMd -Force -ErrorAction SilentlyContinue
 
     if (-not $allPassed) {
         exit 1
