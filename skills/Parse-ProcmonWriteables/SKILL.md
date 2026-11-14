@@ -4,7 +4,15 @@ description: Parses Procmon / ETW traces for writable paths and classifies each 
 ---
 # Parse-ProcmonWriteables
 
-This skill parses raw CSV outputs from ProcMon (`BootLogProcMonAllHighPrivFiles.CSV` or similar — including the `NativeWritablePaths.csv` produced by the bundled `NativeTrace.ps1` ETW capture) to identify mathematically verifiable writable paths for the current execution user without dropping telemetry-heavy test strings.
+This skill parses raw CSV outputs from Sysinternals Process Monitor (or the `NativeWritablePaths.csv` produced by the bundled `NativeTrace.ps1` / `Capture-NativeTrace` ETW capture) to identify verifiable writable paths across three attacker perspectives (`LowPriv`, `MediumILAdmin`, `HighILAdmin`) without modifying or touching any files on disk.
+
+## Required / Recommended Procmon CSV Columns
+
+When exporting a `.PML` capture to `.CSV` in Process Monitor, instruct the user to enable (`Options → Select Columns...`):
+- **Time of Day**, **Process Name**, **PID**, **Operation**, **Path**, **Result**, **Detail** (enabled by default)
+- **Integrity** (*Process Integrity*), **Impersonating**, and **Command Line** (optional Procmon columns that provide exact per-event token integrity and command-line lineage)
+
+If a user supplies a default 7-column Procmon CSV without the `Integrity`, `Impersonating`, or `Command Line` columns, the parser warns the user and extracts `Impersonating:` and `Command line:` directly from the `Detail` column while inferring process integrity from in-trace `Process Start` OS environment (`\config\systemprofile`, `ServiceProfiles`, `USERNAME=SYSTEM`) and parent-PID lineage.
 
 ## What It Captures
 

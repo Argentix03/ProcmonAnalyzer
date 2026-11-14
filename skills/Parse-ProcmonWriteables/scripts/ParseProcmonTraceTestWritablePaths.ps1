@@ -210,6 +210,7 @@ namespace Win32DeviceMap {
         public int TotalLines;
         public int SkippedSelfTrace;
         public int SkippedPagingIO;
+        public bool MissingIntegrityColumn;
         public Dictionary<string, Hashtable> PathMap = new Dictionary<string, Hashtable>(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, string> ProcessLineage = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     }
@@ -317,43 +318,6 @@ namespace Win32DeviceMap {
             return fields;
         }
 
-        static Dictionary<string, string> LoadCompanionIntegrityMap(string csvPath, out bool hasCompanion) {
-            hasCompanion = false;
-            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            try {
-                string dir = Path.GetDirectoryName(csvPath);
-                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return map;
-                string selfName = Path.GetFileName(csvPath);
-                foreach (var f in Directory.GetFiles(dir, "*HighPriv*.CSV")) {
-                    if (string.Equals(Path.GetFileName(f), selfName, StringComparison.OrdinalIgnoreCase)) continue;
-                    using (var sr = new StreamReader(f)) {
-                        string hdr = sr.ReadLine();
-                        if (hdr == null || hdr.IndexOf("\"Integrity\"", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                        hasCompanion = true;
-                        string line;
-                        while ((line = sr.ReadLine()) != null) {
-                            if (line.Length < 10 || line[0] != '"') continue;
-                            int p1 = line.IndexOf("\",\"", 1); if (p1 < 0) continue;
-                            int p2 = line.IndexOf("\",\"", p1 + 3); if (p2 < 0) continue;
-                            int p3 = line.IndexOf("\",\"", p2 + 3); if (p3 < 0) continue;
-                            string proc = line.Substring(p1 + 3, p2 - (p1 + 3));
-                            string pid = line.Substring(p2 + 3, p3 - (p2 + 3));
-                            int lq = line.LastIndexOf("\",\"");
-                            if (lq > 0 && line.EndsWith("\"")) {
-                                string val = line.Substring(lq + 3, line.Length - lq - 4);
-                                string key = proc + ":" + pid;
-                                if (!map.ContainsKey(key) && (val == "System" || val == "High" || val == "Medium" || val == "Medium Plus" || val == "Low" || val == "Protected Process")) {
-                                    map[key] = val;
-                                }
-                            }
-                        }
-                    }
-                    if (hasCompanion) break;
-                }
-            } catch {}
-            return map;
-        }
-
         static string NormalizePath(string raw, IDictionary driveMap) {
             if (string.IsNullOrWhiteSpace(raw)) return "";
             string p = raw.Trim();
@@ -433,8 +397,6 @@ namespace Win32DeviceMap {
                 foreach (var ep in excludeProcs) if (!string.IsNullOrEmpty(ep)) excludeSet.Add(ep.Trim());
             }
 
-            bool hasCompanion = false;
-            Dictionary<string, string> companionIntMap = null;
             var pidIntMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             pidIntMap["4"] = "System";
 
@@ -458,7 +420,7 @@ namespace Win32DeviceMap {
                 int idxCmd  = hMap.ContainsKey("command line") ? hMap["command line"] : -1;
 
                 if (idxInt < 0) {
-                    companionIntMap = LoadCompanionIntegrityMap(csvPath, out hasCompanion);
+                    summary.MissingIntegrityColumn = true;
                 }
 
                 List<string> fields;
@@ -559,11 +521,6 @@ namespace Win32DeviceMap {
                         if (detStr.IndexOf("Integrity:", StringComparison.OrdinalIgnoreCase) >= 0) {
                             var mInt = RxIntegrityDetail.Match(detStr);
                             if (mInt.Success) integStr = mInt.Groups[1].Value;
-                        }
-                        if ((string.IsNullOrEmpty(integStr) || integStr.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) && hasCompanion && companionIntMap != null) {
-                            string cVal;
-                            if (companionIntMap.TryGetValue(procName + ":" + pidStr, out cVal)) integStr = cVal;
-                            else integStr = "Medium";
                         }
                         if (string.IsNullOrEmpty(integStr) || integStr.Equals("Unknown", StringComparison.OrdinalIgnoreCase)) {
                             string pInt;
@@ -1237,6 +1194,11 @@ $script:skippedPagingIO  = $parseSummary.SkippedPagingIO
 
 $canonicalPaths = [string[]]$pathProcessMap.Keys
 $totalCount = $canonicalPaths.Count
+if ($parseSummary.MissingIntegrityColumn) {
+    Write-Host "[!] WARNING: The supplied CSV is missing the 'Integrity' column (exported with default 7 columns)." -ForegroundColor Yellow
+    Write-Host "    For 100% exact process integrity telemetry, enable 'Options -> Select Columns -> Process Integrity' in Procmon before saving to CSV, or use the bundled NativeTrace.ps1 / Capture-NativeTrace skill." -ForegroundColor Yellow
+    Write-Host "    Falling back to OS-native in-trace Process Start environment and parent-PID tree inference." -ForegroundColor DarkYellow
+}
 Write-Host "Parsed $lineCount lines in $($sw.Elapsed.TotalSeconds.ToString('0.00'))s. $totalCount candidate canonical paths retained for deep ACL inspection." -ForegroundColor Cyan
 Write-Host "  - Skipped self-trace contamination rows: $script:skippedSelfTrace" -ForegroundColor DarkGray
 Write-Host "  - Paging-I/O attributions detected (kept, marked): $script:skippedPagingIO" -ForegroundColor DarkGray
