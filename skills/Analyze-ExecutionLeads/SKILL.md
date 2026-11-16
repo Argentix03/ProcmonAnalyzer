@@ -6,15 +6,17 @@ description: Triages writable-path feeds via hybrid heuristic + cognitive model,
 
 This skill processes ProcMon/ETW path dumps using a hybrid Script + Agent model. The analysis is framed from the perspective of a **standard low-privilege user with no special privileges** (no `SeImpersonatePrivilege`, no admin rights).
 
-## Workflow
+## Workflow (Agent-Driven)
 
-1. **Invoke the heuristic triage script:** Execute `scripts/AnalyzeExecutionLeads.ps1 -JsonFeed writable_paths.json` to evaluate structurally obvious primitives.
-2. **Review high-confidence baseline:** `high_confidence_leads.json` — each finding includes `ExploitPrimitive`, `OperationDirection`, `SqosLevel`, `EffectivePrincipal`, `OpenReparsePoint`, `AllOpenReparsePoint`, `OpenLink`, `AllOpenLink`, `HighestIntegrity`, `AnyPrivRead`, `AnyPrivWrite`, `Severity`, `Type`, `DetailedReason`.
-3. **Cognitive agent evaluation:** ambiguous items go to `cognitive_review_queue.json`. **YOUR JOB AS THE AGENT:**
+1. **Run Subsystem Permission Enrichment (if not already generated):** Execute `skills/Enrich-SystemPermissions/scripts/EnrichSystemPermissions.ps1 -OutputPath system_permissions_audit.json` (100% read-only; automatically uses `\\.\ProcmonSecDrv` if running inside a test-signed VM).
+2. **Invoke the heuristic triage script:** Execute `scripts/AnalyzeExecutionLeads.ps1 -JsonFeed writable_paths.json -SubsystemAuditJson system_permissions_audit.json` to evaluate structurally obvious primitives across all 31 rules.
+3. **Run Static Binary & IDA MCP Verification (`Verify-LeadStatically`):** Execute `skills/Verify-LeadStatically/scripts/VerifyLeadStatically.ps1 -LeadsJson high_confidence_leads.json -OutputPath static_verification_results.json` to resolve backing `.exe`/`.dll`/`.sys` binaries, extract PE imports/manifests/string RVAs, and generate `ida_mcp_verification_queue.json` + `Static_Verification_Report.md`. If `ida-pro-mcp` or `HexRaysSA/ida-mcp` is connected, run the generated IDA MCP steps on top leads to verify flags, impersonation, and sinks statically.
+4. **Review high-confidence baseline:** `high_confidence_leads.json` — each finding includes `ExploitPrimitive`, `OperationDirection`, `SqosLevel`, `EffectivePrincipal`, `OpenReparsePoint`, `AllOpenReparsePoint`, `OpenLink`, `AllOpenLink`, `HighestIntegrity`, `AnyPrivRead`, `AnyPrivWrite`, `Severity`, `Type`, `DetailedReason`.
+5. **Cognitive agent evaluation:** ambiguous items go to `cognitive_review_queue.json`. **YOUR JOB AS THE AGENT:**
    - Read `cognitive_review_queue.json` in chunks (≤500 lines).
    - Evaluate each entry against the **Exploitation Primitive Taxonomy** below.
    - Pay special attention to `OperationDirection`, `SqosLevel`, `EffectivePrincipal`, `OpenReparsePoint`, and `OpenLink`.
-4. **Formulate the report.** Combine `high_confidence_leads.json` and your cognitive findings into `Execution_Leads_Report.md`. Every finding MUST be formatted as an unchecked Markdown task list item. Example:
+6. **Formulate the report.** Combine `high_confidence_leads.json`, `Static_Verification_Report.md`, and your cognitive findings into `Execution_Leads_Report.md`. Every finding MUST be formatted as an unchecked Markdown task list item. Example:
 
    ```markdown
    - [ ] [Critical] **Path:** `C:\Program Files\App\Core.dll`

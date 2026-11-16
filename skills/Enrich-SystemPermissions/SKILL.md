@@ -23,12 +23,24 @@ This skill audits live Windows subsystem security descriptors that Procmon CSV t
 | **UIPI & Window Stations** | Top-level and `HWND_MESSAGE` windows owned by High/SYSTEM processes in the interactive session (`WinSta0\Default`) + Desktop DACLs (`DESKTOP_HOOKCONTROL`, `DESKTOP_JOURNALPLAYBACK`) | `UIPI_HighIL_MessageSink` |
 | **Kernel Devices, Sections & WNF** | `\Device\*` DACLs (`\\.\GLOBALROOT\Device\*`), `\BaseNamedObjects\*` shared sections (`SECTION_MAP_WRITE`), and WNF `Notifications` SDs | `Kernel_Device_IOCTL_Surface`, `SharedSection_MemoryTamper` |
 
-## Usage
+## Phase 4 Kernel Driver Bridge (`ProcmonSecDrv.sys` — Optional, Auto-Detected in Test VMs)
+
+When running inside a snapshotted Windows test VM with Test Signing enabled (`bcdedit /set testsigning on`), the agent can load the bundled Phase 4 research driver before running `EnrichSystemPermissions.ps1`:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\driver\ProcmonSecDrv\Install-ProcmonSecDrvInVM.ps1
+```
+`EnrichSystemPermissions.ps1` automatically detects `\\.\ProcmonSecDrv` via `driver/ProcmonSecDrv/Invoke-ProcmonSecDrvClient.ps1` and upgrades its audit with:
+- **Module 1 (`IOCTL_PROCMONSEC_QUERY_OBJECT_SD`):** Kernel-mode Security Descriptor reading for PPL processes (`lsass.exe`, `services.exe`, `csrss.exe`) and `READ_CONTROL`-denied objects.
+- **Module 2 (`IOCTL_PROCMONSEC_QUERY_DRIVER_DEVICES`):** Live `_DRIVER_OBJECT` / `_DEVICE_OBJECT` walking across `\Driver\*`, flagging missing `FILE_DEVICE_SECURE_OPEN` (`0x100`) and extracting exact `MajorFunction[IRP_MJ_CREATE / IRP_MJ_DEVICE_CONTROL]` kernel addresses.
+- **Module 3 (`IOCTL_PROCMONSEC_READ_PPL_MEM`):** Read-only `MmCopyVirtualMemory` bridge for inspecting PPL process memory.
+- **Module 4 (`IOCTL_PROCMONSEC_DRAIN_HANDLE_EVENTS`):** Drains cross-IL process handle creation/duplication events captured by `ObRegisterCallbacks`.
+
+## Usage (Executed by the Agent)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\skills\Enrich-SystemPermissions\scripts\EnrichSystemPermissions.ps1 -OutputPath .\system_permissions_audit.json
 ```
 
-When `system_permissions_audit.json` is placed in the same directory as `writable_paths.json` (or passed via `-SystemPermissionsPath` to `AnalyzeExecutionLeads.ps1`), `AnalyzeExecutionLeads.ps1` automatically:
+When `system_permissions_audit.json` is placed in the same directory as `writable_paths.json` (or passed via `-SubsystemAuditJson` to `AnalyzeExecutionLeads.ps1`), `AnalyzeExecutionLeads.ps1` automatically:
 1. Correlates every service process (`svchost.exe`, vendor service `.exe`, `ServiceDll`) and scheduled task in `writable_paths.json` with its on-demand start/stop/trigger permissions (`Service_OnDemand_Trigger_Chain`).
 2. Merges standalone subsystem findings (`DCOM_Privileged_Activation`, `WMI_LocalSystemHost_Sink`, `ScheduledTask_OnDemand_Run`, `Leaked_Privileged_Handle`, `UIPI_HighIL_MessageSink`, `Kernel_Device_IOCTL_Surface`, `SharedSection_MemoryTamper`) directly into `high_confidence_leads.json`.
