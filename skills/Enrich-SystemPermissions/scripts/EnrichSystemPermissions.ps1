@@ -648,6 +648,22 @@ try {
 # ═══════════════════════════════════════════════════════════════════════════════
 #  2. SERVICES (SCM SDs, TriggerInfo, ServiceDll & Kernel Device Drivers)
 # ═══════════════════════════════════════════════════════════════════════════════
+$drvClientScript = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))) "driver\ProcmonSecDrv\Invoke-ProcmonSecDrvClient.ps1"
+if (-not (Test-Path $drvClientScript)) {
+    $drvClientScript = Join-Path $PSScriptRoot "..\..\..\driver\ProcmonSecDrv\Invoke-ProcmonSecDrvClient.ps1"
+}
+$hasKernelDriverBridge = $false
+if (Test-Path $drvClientScript) {
+    try {
+        . $drvClientScript
+        $drvPing = Test-ProcmonSecDrvConnection
+        if ($null -ne $drvPing -and $drvPing.Connected) {
+            $hasKernelDriverBridge = $true
+            if (-not $Silent) { Write-Host "[+] Phase 4 ProcmonSecDrv.sys Kernel Bridge ACTIVE (v$($drvPing.VersionMajor).$($drvPing.VersionMinor), ObCallbacks=$($drvPing.ObCallbacksActive))" -ForegroundColor Green }
+        }
+    } catch {}
+}
+
 if (-not $Silent) { Write-Host "[*] Auditing SCM Service Security Descriptors, Triggers & Driver Objects..." -ForegroundColor Cyan }
 
 $svcRegRoot = "HKLM:\SYSTEM\CurrentControlSet\Services"
@@ -663,41 +679,92 @@ foreach ($svcKey in $svcItems) {
     # Kernel driver (Type 1 = Kernel Driver, Type 2 = File System Driver)
     if ($svcType -in @(1, 2)) {
         try {
-            $secSubKey = $svcKey.OpenSubKey("Security")
-            if ($null -ne $secSubKey) {
-                $drvSdBytes = $secSubKey.GetValue("Security")
-                $secSubKey.Close()
-                if ($drvSdBytes -is [byte[]] -and $drvSdBytes.Length -ge 20) {
-                    # FILE_WRITE_DATA (0x2) | FILE_READ_DATA (0x1) | GENERIC_WRITE (0x40000000) | GENERIC_ALL (0x10000000) | WRITE_DAC (0x40000)
-                    $drvEval = Evaluate-RawSecurityDescriptor -RawBytes $drvSdBytes -TargetMask 0x500C0003
-                    if ($drvEval.LowPriv -or $drvEval.AppContainer) {
-                        $devLead = [PSCustomObject]@{
-                            ServiceName  = $svcName
-                            ImagePath    = $imgPath
-                            WritableFrom = $drvEval.WritableFrom
-                            Sddl         = $drvEval.Sddl
+            $emittedDriverLead = $false
+            if ($hasKernelDriverBridge) {
+                $liveDevs = Get-KernelDriverLiveDevices -DriverName $svcName
+                if ($liveDevs.Success -and $liveDevs.Devices.Count -gt 0) {
+                    foreach ($ld in $liveDevs.Devices) {
+                        if ([string]::IsNullOrWhiteSpace($ld.DeviceName)) { continue }
+                        $ldEval = if ($null -ne $ld.SdBytes -and $ld.SdBytes.Length -ge 20) {
+                            Evaluate-RawSecurityDescriptor -RawBytes $ld.SdBytes -TargetMask 0x500C0003
+                        } else { $null }
+                        $lowOrAcAccess = ($null -ne $ldEval -and ($ldEval.LowPriv -or $ldEval.AppContainer))
+                        if ($lowOrAcAccess -or (-not $ld.HasSecureOpen)) {
+                            $wFrom = if ($lowOrAcAccess) { $ldEval.WritableFrom } else { "LowPriv" }
+                            $ioctlHex = ("0x{0:X16}" -f $ld.IrpMjDeviceControlAddr)
+                            $createHex = ("0x{0:X16}" -f $ld.IrpMjCreateAddr)
+                            $deviceAudit.Add([PSCustomObject]@{
+                                ServiceName            = $svcName
+                                DeviceName             = $ld.DeviceName
+                                ImagePath              = $imgPath
+                                HasSecureOpen          = $ld.HasSecureOpen
+                                IrpMjCreateAddr        = $createHex
+                                IrpMjDeviceControlAddr = $ioctlHex
+                                WritableFrom           = $wFrom
+                                Sddl                   = $ld.Sddl
+                            })
+                            $directLeads.Add([PSCustomObject]@{
+                                Severity           = if ($lowOrAcAccess -and (-not $ld.HasSecureOpen)) { "Critical" } else { "High" }
+                                Type               = "Live Kernel _DEVICE_OBJECT Exposes IOCTL Surface or Lacks FILE_DEVICE_SECURE_OPEN"
+                                ExploitPrimitive   = "Kernel_Device_IOCTL_Surface"
+                                EscalationCategory = if ($wFrom -eq "AppContainer") { "Sandbox_Escape" } else { "LPE" }
+                                ResearchPromptId   = if ($wFrom -eq "AppContainer") { "sandbox_escape" } else { "admin_kernel" }
+                                Path               = $ld.DeviceName
+                                Processes          = "System ($svcName)"
+                                Operations         = "DeviceIoControl / CreateFile"
+                                DetailedReason     = "Live kernel _DEVICE_OBJECT '$($ld.DeviceName)' (Driver: '$svcName', ImagePath: '$imgPath', HasSecureOpen=$($ld.HasSecureOpen), IRP_MJ_CREATE=$createHex, IRP_MJ_DEVICE_CONTROL=$ioctlHex) $(if (-not $ld.HasSecureOpen) { 'lacks FILE_DEVICE_SECURE_OPEN (0x100), allowing relative sub-path traversal bypasses' } else { '' })$(if ($lowOrAcAccess) { " and grants device access to '$wFrom' (SDDL: $($ld.Sddl))" } else { '' })."
+                                EffectivePrincipal = "System"
+                                Integrity          = "System"
+                                HighestIntegrity   = "System"
+                                WritableByLowPriv  = ($wFrom -eq "LowPriv")
+                                WritableByAppContainer = ($wFrom -eq "AppContainer")
+                                WritableByMediumILAdmin = $true
+                                WritableByHighILAdmin = $true
+                                WritableFrom       = $wFrom
+                                AclSource          = "kernel-driver-live-device"
+                            })
+                            $emittedDriverLead = $true
                         }
-                        $deviceAudit.Add($devLead)
-                        $directLeads.Add([PSCustomObject]@{
-                            Severity           = "High"
-                            Type               = "Kernel Driver Registry Security Descriptor Grants User Access"
-                            ExploitPrimitive   = "Kernel_Device_IOCTL_Surface"
-                            EscalationCategory = if ($drvEval.WritableFrom -eq "AppContainer") { "Sandbox_Escape" } else { "LPE" }
-                            ResearchPromptId   = if ($drvEval.WritableFrom -eq "AppContainer") { "sandbox_escape" } else { "admin_kernel" }
-                            Path               = "\Device\$svcName"
-                            Processes          = "System ($svcName)"
-                            Operations         = "DeviceIoControl / CreateFile"
-                            DetailedReason     = "Kernel driver '$svcName' ($imgPath) defines an explicit Security Descriptor under Services\$svcName\Security that grants device access or DACL modification rights to '$($drvEval.WritableFrom)' (SDDL: $($drvEval.Sddl)). Any valid handle to this device allows sending FILE_ANY_ACCESS IOCTLs."
-                            EffectivePrincipal = "System"
-                            Integrity          = "System"
-                            HighestIntegrity   = "System"
-                            WritableByLowPriv  = $drvEval.LowPriv
-                            WritableByAppContainer = $drvEval.AppContainer
-                            WritableByMediumILAdmin = $drvEval.MediumILAdmin
-                            WritableByHighILAdmin = $true
-                            WritableFrom       = $drvEval.WritableFrom
-                            AclSource          = "driver-registry-sd"
-                        })
+                    }
+                }
+            }
+            if (-not $emittedDriverLead) {
+                $secSubKey = $svcKey.OpenSubKey("Security")
+                if ($null -ne $secSubKey) {
+                    $drvSdBytes = $secSubKey.GetValue("Security")
+                    $secSubKey.Close()
+                    if ($drvSdBytes -is [byte[]] -and $drvSdBytes.Length -ge 20) {
+                        # FILE_WRITE_DATA (0x2) | FILE_READ_DATA (0x1) | GENERIC_WRITE (0x40000000) | GENERIC_ALL (0x10000000) | WRITE_DAC (0x40000)
+                        $drvEval = Evaluate-RawSecurityDescriptor -RawBytes $drvSdBytes -TargetMask 0x500C0003
+                        if ($drvEval.LowPriv -or $drvEval.AppContainer) {
+                            $devLead = [PSCustomObject]@{
+                                ServiceName  = $svcName
+                                ImagePath    = $imgPath
+                                WritableFrom = $drvEval.WritableFrom
+                                Sddl         = $drvEval.Sddl
+                            }
+                            $deviceAudit.Add($devLead)
+                            $directLeads.Add([PSCustomObject]@{
+                                Severity           = "High"
+                                Type               = "Kernel Driver Registry Security Descriptor Grants User Access"
+                                ExploitPrimitive   = "Kernel_Device_IOCTL_Surface"
+                                EscalationCategory = if ($drvEval.WritableFrom -eq "AppContainer") { "Sandbox_Escape" } else { "LPE" }
+                                ResearchPromptId   = if ($drvEval.WritableFrom -eq "AppContainer") { "sandbox_escape" } else { "admin_kernel" }
+                                Path               = "\Device\$svcName"
+                                Processes          = "System ($svcName)"
+                                Operations         = "DeviceIoControl / CreateFile"
+                                DetailedReason     = "Kernel driver '$svcName' ($imgPath) defines an explicit Security Descriptor under Services\$svcName\Security that grants device access or DACL modification rights to '$($drvEval.WritableFrom)' (SDDL: $($drvEval.Sddl)). Any valid handle to this device allows sending FILE_ANY_ACCESS IOCTLs."
+                                EffectivePrincipal = "System"
+                                Integrity          = "System"
+                                HighestIntegrity   = "System"
+                                WritableByLowPriv  = $drvEval.LowPriv
+                                WritableByAppContainer = $drvEval.AppContainer
+                                WritableByMediumILAdmin = $drvEval.MediumILAdmin
+                                WritableByHighILAdmin = $true
+                                WritableFrom       = $drvEval.WritableFrom
+                                AclSource          = "driver-registry-sd"
+                            })
+                        }
                     }
                 }
             }
@@ -1289,6 +1356,10 @@ foreach ($p in (Get-Process -ErrorAction SilentlyContinue)) {
     if (-not $SkipHandles -and $il -in @("High", "System")) {
         try {
             $procSddl = [ProcmonPhase2Auditor.SubsystemNativeAuditor]::GetProcessSddl($p.Id)
+            if ([string]::IsNullOrWhiteSpace($procSddl) -and $hasKernelDriverBridge) {
+                $kSd = Get-KernelObjectSecurityDescriptor -ObjectKind ProcessPid -TargetPid ([uint32]$p.Id)
+                if ($kSd.Success) { $procSddl = $kSd.Sddl }
+            }
             if (-not [string]::IsNullOrWhiteSpace($procSddl)) {
                 # PROCESS_CREATE_THREAD (0x2) | PROCESS_VM_OPERATION (0x8) | PROCESS_VM_WRITE (0x20) | PROCESS_DUP_HANDLE (0x40) | PROCESS_CREATE_PROCESS (0x80) | WRITE_DAC (0x40000) | WRITE_OWNER (0x80000)
                 $pEval = Evaluate-RawSecurityDescriptor -Sddl $procSddl -TargetMask 0x500C00EA
@@ -1409,6 +1480,37 @@ if (-not $SkipHandles) {
                     WritableFrom       = "LowPriv"
                     AclSource          = "system-handle-table"
                 })
+            }
+        }
+        if ($hasKernelDriverBridge) {
+            foreach ($kev in (Receive-KernelHandleEvents)) {
+                $cPid = [int]$kev.CallerPid
+                $tPid = [int]$kev.TargetPid
+                if ((-not $privPidSet.Contains($cPid)) -and $privPidSet.Contains($tPid)) {
+                    $cName = if ($pidNameCache.ContainsKey($cPid)) { $pidNameCache[$cPid] } else { "PID_$cPid" }
+                    $tName = if ($pidNameCache.ContainsKey($tPid)) { $pidNameCache[$tPid] } else { "PID_$tPid" }
+                    $accHex = ("0x{0:X8}" -f $kev.DesiredAccess)
+                    $directLeads.Add([PSCustomObject]@{
+                        Severity           = "Critical"
+                        Type               = "ObRegisterCallbacks Observed Cross-IL Process Handle Request"
+                        ExploitPrimitive   = "Leaked_Privileged_Handle"
+                        EscalationCategory = "LPE"
+                        ResearchPromptId   = "lpe"
+                        Path               = "ObCallback://$cName (PID $cPid) -> $tName (PID $tPid)"
+                        Processes          = $cName
+                        Operations         = "ObRegisterCallbacks"
+                        DetailedReason     = "ProcmonSecDrv.sys ObRegisterCallbacks observed lower-IL process '$cName' (PID $cPid, TID $($kev.CallerTid)) requesting dangerous handle access ($accHex, Op=$($kev.Operation)) to High/SYSTEM process '$tName' (PID $tPid)."
+                        EffectivePrincipal = "System"
+                        Integrity          = "System"
+                        HighestIntegrity   = "System"
+                        WritableByLowPriv  = $true
+                        WritableByAppContainer = $false
+                        WritableByMediumILAdmin = $true
+                        WritableByHighILAdmin = $true
+                        WritableFrom       = "LowPriv"
+                        AclSource          = "kernel-ob-callback"
+                    })
+                }
             }
         }
     } catch {}

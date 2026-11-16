@@ -611,6 +611,23 @@ if (Test-Path $analyzerScript) {
         $allPassed = $false
     }
 
+    # Phase 4 (Rev 4.0) ProcmonSecDrv.sys Kernel Driver & Client Verification
+    $drvSysPath    = Join-Path $PSScriptRoot "driver\ProcmonSecDrv\bin\x64\ProcmonSecDrv.sys"
+    $drvClientPath = Join-Path $PSScriptRoot "driver\ProcmonSecDrv\Invoke-ProcmonSecDrvClient.ps1"
+    if ((Test-Path $drvSysPath) -and (Test-Path $drvClientPath)) {
+        . $drvClientPath
+        $drvPe = [ProcmonPhase3Verifier.StaticPeAnalyzer]::AnalyzePeFile($drvSysPath, @("\Device\ProcmonSecDrv", "\DosDevices\ProcmonSecDrv"))
+        if ($drvPe.IsValidPe -and $drvPe.IsKernelDriver -and $drvPe.HasForceIntegrity -and ($drvPe.ImportedFunctions -contains "ObRegisterCallbacks") -and ($drvPe.ImportedFunctions -contains "MmCopyVirtualMemory")) {
+            Write-Host "  [PASS] Phase 4 ProcmonSecDrv.sys verified (x64 Kernel Driver, ForceIntegrity=True, ObRegisterCallbacks + MmCopyVirtualMemory + ObGetObjectSecurity imported)" -ForegroundColor Green
+        } else {
+            Write-Host "  [FAIL] Phase 4 ProcmonSecDrv.sys PE validation failed" -ForegroundColor Red
+            $allPassed = $false
+        }
+    } else {
+        Write-Host "  [FAIL] Phase 4 ProcmonSecDrv.sys or Invoke-ProcmonSecDrvClient.ps1 missing" -ForegroundColor Red
+        $allPassed = $false
+    }
+
     # Cleanup temporary test outputs
     Remove-Item -Path $jsonPath, $hardcodedJson, $cognitiveJson, $staticOutJson, $idaQueueJson, $staticRepMd -Force -ErrorAction SilentlyContinue
 

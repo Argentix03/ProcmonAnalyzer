@@ -27,3 +27,6 @@ _research_state.json
 research/
 ui_uploads/
 *.etl
+*.obj
+*.pdb
+*.cer
